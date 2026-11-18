@@ -24,13 +24,33 @@ function unitAt(units, p, radius) {
   return best;
 }
 function unitsInRect(units, r) {
-  return units.filter((u) => pointInRect(u, r));
+  return units.filter((u) => pointInRect(u, r)).sort((a, b) => a.id - b.id);
 }
 function selectUnits(units, picked, additive) {
   if (!additive) for (const u of units) u.selected = false;
   if (picked === null) return;
   const list = Array.isArray(picked) ? picked : [picked];
   for (const u of list) u.selected = true;
+}
+function kindOf(u) {
+  const k = u.kind;
+  return k !== void 0 ? k : u.speed;
+}
+function selectSameKind(units, sample) {
+  const kind = kindOf(sample);
+  let n = 0;
+  for (const u of units) {
+    u.selected = kindOf(u) === kind;
+    if (u.selected) n++;
+  }
+  return n;
+}
+function selectAll(units) {
+  for (const u of units) u.selected = true;
+  return units.length;
+}
+function toggleSelect(u) {
+  u.selected = !u.selected;
 }
 
 // src/game/selection.test.ts
@@ -67,4 +87,44 @@ test("selectUnits replaces selection unless additive", () => {
   assert.deepEqual(units.map((u) => u.selected), [false, true, true]);
   selectUnits(units, null, false);
   assert.deepEqual(units.map((u) => u.selected), [false, false, false]);
+});
+function mkKindUnit(id, speed) {
+  return { id, x: 0, y: 0, angle: 0, speed, path: [], selected: false };
+}
+test("selectSameKind selects all units of the same kind", () => {
+  const units = [mkKindUnit(1, 70), mkKindUnit(2, 120), mkKindUnit(3, 70)];
+  const n = selectSameKind(units, units[0]);
+  assert.equal(n, 2);
+  assert.deepEqual(units.map((u) => u.selected), [true, false, true]);
+});
+test("selectSameKind clears previously selected units of other kinds", () => {
+  const units = [mkKindUnit(1, 70), mkKindUnit(2, 120), mkKindUnit(3, 70)];
+  units[1].selected = true;
+  const n = selectSameKind(units, units[0]);
+  assert.equal(n, 2);
+  assert.equal(units[1].selected, false);
+});
+test("selectSameKind with a different kind sample selects only that kind", () => {
+  const units = [mkKindUnit(1, 70), mkKindUnit(2, 120), mkKindUnit(3, 70)];
+  const n = selectSameKind(units, units[1]);
+  assert.equal(n, 1);
+  assert.deepEqual(units.map((u) => u.selected), [false, true, false]);
+});
+test("selectAll selects every unit and returns the count", () => {
+  const units = [mkKindUnit(1, 70), mkKindUnit(2, 120), mkKindUnit(3, 70)];
+  assert.equal(selectAll(units), 3);
+  assert.ok(units.every((u) => u.selected));
+  assert.equal(selectAll([]), 0);
+});
+test("toggleSelect flips selected state both ways", () => {
+  const u = mkKindUnit(1, 70);
+  toggleSelect(u);
+  assert.equal(u.selected, true);
+  toggleSelect(u);
+  assert.equal(u.selected, false);
+});
+test("unitsInRect returns ids sorted ascending regardless of input order", () => {
+  const units = [mkUnit(3, 5, 5), mkUnit(1, 10, 10), mkUnit(2, 15, 15)];
+  const inside = unitsInRect(units, { x: 0, y: 0, w: 20, h: 20 });
+  assert.deepEqual(inside.map((u) => u.id), [1, 2, 3]);
 });
