@@ -760,6 +760,25 @@ function losBlocked(a, t, occluders) {
   }
   return false;
 }
+var SUPPRESSION_MAX = 1;
+var SUPPRESSION_GAIN = 2.5;
+var SUPPRESSION_RECOVERY = 0.25;
+var SUPPRESSION_MIN_ACCURACY = 0.25;
+var SUPPRESSION_MIN_SPEED = 0.4;
+function applySuppression(t, amount) {
+  t.suppression = Math.min(
+    SUPPRESSION_MAX,
+    Math.max(0, (t.suppression ?? 0) + Math.max(0, amount))
+  );
+  return t.suppression;
+}
+function suppressionModifiers(c) {
+  const s = Math.min(SUPPRESSION_MAX, Math.max(0, c.suppression ?? 0));
+  return {
+    accuracy: 1 - s * (1 - SUPPRESSION_MIN_ACCURACY),
+    speed: 1 - s * (1 - SUPPRESSION_MIN_SPEED)
+  };
+}
 function applyDamage(t, dmg) {
   t.hp = Math.max(0, t.hp - dmg);
   return t.hp === 0;
@@ -768,6 +787,7 @@ function stepCombat(all, dt, opts = {}) {
   const counters = opts.counters === true;
   const splash = opts.splash === true;
   const focusFire = opts.focusFire === true;
+  const suppression = opts.suppression === true;
   const occluders = opts.occluders;
   const events = [];
   for (const c of all) c.cooldown -= dt;
@@ -776,11 +796,9 @@ function stepCombat(all, dt, opts = {}) {
     let target = null;
     if (focusFire && a.targetId != null) {
       const locked = all.find((c) => c.id === a.targetId);
-      if (locked !== void 0 && locked !== a && locked.team !== a.team && locked.hp > 0) {
+      if (locked !== void 0 && locked !== a && locked.team !== a.team && locked.hp > 0 && dist(a, locked) <= a.range) {
+        if (occluders !== void 0 && losBlocked(a, locked, occluders)) continue;
         target = locked;
-        if (dist(a, target) > a.range || occluders !== void 0 && losBlocked(a, target, occluders)) {
-          continue;
-        }
       } else {
         a.targetId = null;
       }
@@ -800,12 +818,24 @@ function stepCombat(all, dt, opts = {}) {
       if (!target) continue;
       if (focusFire) a.targetId = target.id;
     }
+    if (suppression) {
+      a.accDebt = (a.accDebt ?? 0) + (1 - suppressionModifiers(a).accuracy);
+      if (a.accDebt >= 1) {
+        a.accDebt -= 1;
+        a.cooldown = a.cooldownMax;
+        continue;
+      }
+    }
     const dmg = effectiveDamage(a, target, counters);
     events.push({ type: "hit", from: a.id, to: target.id, damage: dmg });
     if (applyDamage(target, dmg)) {
       events.push({ type: "death", id: target.id });
       if (a.targetId === target.id) a.targetId = null;
       creditKill(a);
+    }
+    if (suppression) {
+      applySuppression(target, dmg / Math.max(1, target.maxHp) * SUPPRESSION_GAIN);
+      target.underFire = true;
     }
     const r = a.splashRadius ?? 0;
     if (splash && r > 0) {
@@ -820,9 +850,22 @@ function stepCombat(all, dt, opts = {}) {
           events.push({ type: "death", id: v.id });
           creditKill(a);
         }
+        if (suppression) {
+          applySuppression(v, vd / Math.max(1, v.maxHp) * SUPPRESSION_GAIN);
+          v.underFire = true;
+        }
       }
     }
     a.cooldown = a.cooldownMax;
+  }
+  if (suppression) {
+    for (const c of all) {
+      if (c.underFire) {
+        c.underFire = false;
+      } else if ((c.suppression ?? 0) > 0) {
+        c.suppression = Math.max(0, (c.suppression ?? 0) - SUPPRESSION_RECOVERY * dt);
+      }
+    }
   }
   return events;
 }

@@ -2,11 +2,17 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   applyDamage,
+  applySuppression,
   canAttack,
   dist,
   effectiveDamage,
   losBlocked,
   stepCombat,
+  suppressionModifiers,
+  SUPPRESSION_MAX,
+  SUPPRESSION_MIN_ACCURACY,
+  SUPPRESSION_MIN_SPEED,
+  SUPPRESSION_RECOVERY,
   type Combatant,
 } from './combat.js';
 import type { Building } from './buildings.js';
@@ -188,13 +194,133 @@ test('focus fire keeps the lock, then re-picks the nearest threat on death', () 
   ]);
   assert.equal(a.targetId, 11);
 
-  // An out-of-range lock holds fire instead of switching targets.
+  // A lock that leaves range is released: the attacker switches to the
+  // nearest enemy in range and locks it instead of holding fire forever.
   const c = combatant({ id: 20, range: 50, targetId: 30 });
   const unreachable = combatant({ id: 30, x: 100, team: 'enemy', cooldown: 100 });
   const inRange = combatant({ id: 31, x: 20, team: 'enemy', cooldown: 100 });
-  assert.deepEqual(stepCombat([c, unreachable, inRange], 0.1, { focusFire: true }), []);
-  assert.equal(c.targetId, 30);
-  assert.equal(inRange.hp, 100);
+  assert.deepEqual(stepCombat([c, unreachable, inRange], 0.1, { focusFire: true }), [
+    { type: 'hit', from: 20, to: 31, damage: 10 },
+  ]);
+  assert.equal(c.targetId, 31);
+  assert.equal(inRange.hp, 90);
+
+  // With nothing in range the released lock just holds fire, unlocked.
+  const d = combatant({ id: 21, range: 50, targetId: 30 });
+  assert.deepEqual(stepCombat([d, unreachable], 0.1, { focusFire: true }), []);
+  assert.equal(d.targetId, null);
+  assert.equal(unreachable.hp, 100);
+});
+
+test('splash falloff reaches exactly zero at the radius edge', () => {
+  // Impact at (300,0): victim at x=400 sits exactly on the 100px rim and
+  // takes nothing; the one 1px inside takes the remaining sliver.
+  const s = combatant({ id: 1, range: 400, damage: 40, splashRadius: 100 });
+  const primary = combatant({ id: 2, x: 300, team: 'enemy', hp: 400, maxHp: 400, cooldown: 100 });
+  const edge = combatant({ id: 3, x: 400, team: 'enemy', hp: 400, maxHp: 400, cooldown: 100 });
+  const inside = combatant({ id: 4, x: 350, team: 'enemy', hp: 400, maxHp: 400, cooldown: 100 }); // d=50 -> half
+  const ev = stepCombat([s, primary, edge, inside], 0.1, { splash: true });
+  assert.deepEqual(ev, [
+    { type: 'hit', from: 1, to: 2, damage: 40 },
+    { type: 'hit', from: 1, to: 4, damage: 20 },
+  ]);
+  assert.equal(primary.hp, 360); // impact point still eats the full hit
+  assert.equal(edge.hp, 400); // on the rim -> decayed to 0
+  assert.equal(inside.hp, 380);
+});
+
+test('weapon weights: rockets punish vehicles/buildings but scatter vs infantry', () => {
+  const rocket = combatant({ id: 1, damage: 60, weapon: 'rocket' });
+  const inf = combatant({ id: 2, armor: 'infantry', x: 30, team: 'enemy', cooldown: 100 });
+  const veh = combatant({ id: 3, armor: 'vehicle', x: 30, team: 'enemy', hp: 400, maxHp: 400, cooldown: 100 });
+  const bld = combatant({ id: 4, armor: 'building', x: 30, team: 'enemy', hp: 400, maxHp: 400, cooldown: 100 });
+  assert.equal(effectiveDamage(rocket, veh, true), 120); // ×2.0 anti-vehicle bonus
+  assert.equal(effectiveDamage(rocket, bld, true), 150); // ×2.5 anti-building bonus
+  assert.equal(effectiveDamage(rocket, inf, true), 30); // ×0.5 anti-infantry decay
+
+  // The same class weighting inverted for bullets: full vs infantry.
+  const gunner = combatant({ id: 5, damage: 10, weapon: 'bullet' });
+  assert.equal(effectiveDamage(gunner, inf, true), 10);
+  assert.equal(effectiveDamage(gunner, veh, true), 5);
+});
+
+test('suppression: applySuppression stacks and clamps, modifiers scale linearly', () => {
+  const t = combatant({ id: 1 });
+  assert.equal(applySuppression(t, 0.4), 0.4);
+  assert.equal(applySuppression(t, 0.9), SUPPRESSION_MAX); // clamps at the cap
+  assert.equal(t.suppression, 1);
+  assert.equal(applySuppression(t, -5), 1); // negative amounts never reduce
+
+  assert.equal(suppressionModifiers(combatant()).accuracy, 1);
+  assert.equal(suppressionModifiers(combatant()).speed, 1);
+  assert.equal(suppressionModifiers(t).accuracy, SUPPRESSION_MIN_ACCURACY);
+  assert.equal(suppressionModifiers(t).speed, SUPPRESSION_MIN_SPEED);
+  const half = suppressionModifiers({ suppression: 0.5 });
+  assert.ok(Math.abs(half.accuracy - 0.625) < 1e-9); // 1 - 0.5 * (1 - 0.25)
+  assert.ok(Math.abs(half.speed - 0.7) < 1e-9); // 1 - 0.5 * (1 - 0.4)
+});
+
+test('suppression: sustained hits build it up in combat', () => {
+  const a = combatant({ id: 1, damage: 25, cooldownMax: 0 });
+  const t = combatant({ id: 2, x: 10, team: 'enemy', hp: 100, maxHp: 100, cooldown: 100 });
+
+  stepCombat([a, t], 0.1, { suppression: true });
+  // 25 dmg on 100 maxHp -> 0.25 of a max-hp hit -> +0.625 suppression.
+  assert.equal(t.suppression, 0.625);
+  assert.equal(t.underFire, false); // flag consumed at end of the tick
+
+  stepCombat([a, t], 0.1, { suppression: true });
+  assert.equal(t.suppression, SUPPRESSION_MAX); // pinned by continuous fire
+
+  // Two more hits kill the target; suppression stays latched while it lived.
+  stepCombat([a, t], 0.1, { suppression: true });
+  stepCombat([a, t], 0.1, { suppression: true });
+  assert.equal(t.hp, 0);
+
+  // Without the option a hit leaves no suppression trace at all.
+  const t2 = combatant({ id: 3, x: 10, team: 'enemy', hp: 400, maxHp: 400, cooldown: 100 });
+  stepCombat([a, t2], 0.1);
+  assert.equal(t2.suppression, undefined);
+});
+
+test('suppression: recovers per tick only when no fire lands', () => {
+  const a = combatant({ id: 1, range: 50 });
+  const t = combatant({ id: 2, x: 1000, team: 'enemy', suppression: 1 });
+  // Out of range, nobody fires: -SUPPRESSION_RECOVERY per second each tick.
+  stepCombat([a, t], 1, { suppression: true });
+  assert.equal(t.suppression, 1 - SUPPRESSION_RECOVERY);
+  stepCombat([a, t], 1, { suppression: true });
+  assert.equal(t.suppression, 1 - 2 * SUPPRESSION_RECOVERY);
+
+  // Back under fire on the very next tick: gains, no recovery.
+  const b = combatant({ id: 3, x: 950, damage: 100, cooldownMax: 0 });
+  stepCombat([b, t], 1, { suppression: true });
+  assert.equal(t.suppression, 1); // 100 dmg on 100 maxHp * 2.5 -> pinned
+  // And suppression off the option leaves a stale value untouched.
+  stepCombat([a, t], 1);
+  assert.equal(t.suppression, 1);
+});
+
+test('suppression: suppressed shooters miss a deterministic share of shots', () => {
+  const a = combatant({ id: 1, damage: 10, cooldownMax: 0 });
+  const t = combatant({ id: 2, x: 10, team: 'enemy', hp: 400, maxHp: 400, cooldown: 100 });
+  const fired: number[] = [];
+  for (let i = 0; i < 5; i++) {
+    a.suppression = 1; // kept pinned by incoming fire
+    fired.push(stepCombat([a, t], 0.1, { suppression: true }).length);
+  }
+  // 25% accuracy -> exactly one hit in every four shots, evenly spread.
+  assert.deepEqual(fired, [1, 0, 0, 0, 1]);
+  assert.equal(t.hp, 380); // only two of five shots landed
+
+  // A clean shooter with the same setup still lands every shot.
+  const a2 = combatant({ id: 3, damage: 10, cooldownMax: 0 });
+  const t2 = combatant({ id: 4, x: 10, team: 'enemy', hp: 400, maxHp: 400, cooldown: 100 });
+  const f2 = Array.from(
+    { length: 5 },
+    () => stepCombat([a2, t2], 0.1, { suppression: true }).length,
+  );
+  assert.deepEqual(f2, [1, 1, 1, 1, 1]);
 });
 
 test('veterancy: elite out-damages rookie and shrugs off more hits', () => {

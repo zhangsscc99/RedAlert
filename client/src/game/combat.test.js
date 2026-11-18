@@ -132,6 +132,25 @@ function losBlocked(a, t, occluders) {
   }
   return false;
 }
+var SUPPRESSION_MAX = 1;
+var SUPPRESSION_GAIN = 2.5;
+var SUPPRESSION_RECOVERY = 0.25;
+var SUPPRESSION_MIN_ACCURACY = 0.25;
+var SUPPRESSION_MIN_SPEED = 0.4;
+function applySuppression(t, amount) {
+  t.suppression = Math.min(
+    SUPPRESSION_MAX,
+    Math.max(0, (t.suppression ?? 0) + Math.max(0, amount))
+  );
+  return t.suppression;
+}
+function suppressionModifiers(c) {
+  const s = Math.min(SUPPRESSION_MAX, Math.max(0, c.suppression ?? 0));
+  return {
+    accuracy: 1 - s * (1 - SUPPRESSION_MIN_ACCURACY),
+    speed: 1 - s * (1 - SUPPRESSION_MIN_SPEED)
+  };
+}
 function canAttack(a, t, occluders) {
   return a.team !== t.team && t.hp > 0 && dist(a, t) <= a.range && a.cooldown <= 0 && (occluders === void 0 || !losBlocked(a, t, occluders));
 }
@@ -143,6 +162,7 @@ function stepCombat(all, dt, opts = {}) {
   const counters = opts.counters === true;
   const splash = opts.splash === true;
   const focusFire = opts.focusFire === true;
+  const suppression = opts.suppression === true;
   const occluders = opts.occluders;
   const events = [];
   for (const c of all) c.cooldown -= dt;
@@ -151,11 +171,9 @@ function stepCombat(all, dt, opts = {}) {
     let target = null;
     if (focusFire && a.targetId != null) {
       const locked = all.find((c) => c.id === a.targetId);
-      if (locked !== void 0 && locked !== a && locked.team !== a.team && locked.hp > 0) {
+      if (locked !== void 0 && locked !== a && locked.team !== a.team && locked.hp > 0 && dist(a, locked) <= a.range) {
+        if (occluders !== void 0 && losBlocked(a, locked, occluders)) continue;
         target = locked;
-        if (dist(a, target) > a.range || occluders !== void 0 && losBlocked(a, target, occluders)) {
-          continue;
-        }
       } else {
         a.targetId = null;
       }
@@ -175,12 +193,24 @@ function stepCombat(all, dt, opts = {}) {
       if (!target) continue;
       if (focusFire) a.targetId = target.id;
     }
+    if (suppression) {
+      a.accDebt = (a.accDebt ?? 0) + (1 - suppressionModifiers(a).accuracy);
+      if (a.accDebt >= 1) {
+        a.accDebt -= 1;
+        a.cooldown = a.cooldownMax;
+        continue;
+      }
+    }
     const dmg = effectiveDamage(a, target, counters);
     events.push({ type: "hit", from: a.id, to: target.id, damage: dmg });
     if (applyDamage(target, dmg)) {
       events.push({ type: "death", id: target.id });
       if (a.targetId === target.id) a.targetId = null;
       creditKill(a);
+    }
+    if (suppression) {
+      applySuppression(target, dmg / Math.max(1, target.maxHp) * SUPPRESSION_GAIN);
+      target.underFire = true;
     }
     const r = a.splashRadius ?? 0;
     if (splash && r > 0) {
@@ -195,9 +225,22 @@ function stepCombat(all, dt, opts = {}) {
           events.push({ type: "death", id: v.id });
           creditKill(a);
         }
+        if (suppression) {
+          applySuppression(v, vd / Math.max(1, v.maxHp) * SUPPRESSION_GAIN);
+          v.underFire = true;
+        }
       }
     }
     a.cooldown = a.cooldownMax;
+  }
+  if (suppression) {
+    for (const c of all) {
+      if (c.underFire) {
+        c.underFire = false;
+      } else if ((c.suppression ?? 0) > 0) {
+        c.suppression = Math.max(0, (c.suppression ?? 0) - SUPPRESSION_RECOVERY * dt);
+      }
+    }
   }
   return events;
 }
@@ -356,9 +399,101 @@ test("focus fire keeps the lock, then re-picks the nearest threat on death", () 
   const c = combatant({ id: 20, range: 50, targetId: 30 });
   const unreachable = combatant({ id: 30, x: 100, team: "enemy", cooldown: 100 });
   const inRange = combatant({ id: 31, x: 20, team: "enemy", cooldown: 100 });
-  assert.deepEqual(stepCombat([c, unreachable, inRange], 0.1, { focusFire: true }), []);
-  assert.equal(c.targetId, 30);
-  assert.equal(inRange.hp, 100);
+  assert.deepEqual(stepCombat([c, unreachable, inRange], 0.1, { focusFire: true }), [
+    { type: "hit", from: 20, to: 31, damage: 10 }
+  ]);
+  assert.equal(c.targetId, 31);
+  assert.equal(inRange.hp, 90);
+  const d = combatant({ id: 21, range: 50, targetId: 30 });
+  assert.deepEqual(stepCombat([d, unreachable], 0.1, { focusFire: true }), []);
+  assert.equal(d.targetId, null);
+  assert.equal(unreachable.hp, 100);
+});
+test("splash falloff reaches exactly zero at the radius edge", () => {
+  const s = combatant({ id: 1, range: 400, damage: 40, splashRadius: 100 });
+  const primary = combatant({ id: 2, x: 300, team: "enemy", hp: 400, maxHp: 400, cooldown: 100 });
+  const edge = combatant({ id: 3, x: 400, team: "enemy", hp: 400, maxHp: 400, cooldown: 100 });
+  const inside = combatant({ id: 4, x: 350, team: "enemy", hp: 400, maxHp: 400, cooldown: 100 });
+  const ev = stepCombat([s, primary, edge, inside], 0.1, { splash: true });
+  assert.deepEqual(ev, [
+    { type: "hit", from: 1, to: 2, damage: 40 },
+    { type: "hit", from: 1, to: 4, damage: 20 }
+  ]);
+  assert.equal(primary.hp, 360);
+  assert.equal(edge.hp, 400);
+  assert.equal(inside.hp, 380);
+});
+test("weapon weights: rockets punish vehicles/buildings but scatter vs infantry", () => {
+  const rocket = combatant({ id: 1, damage: 60, weapon: "rocket" });
+  const inf = combatant({ id: 2, armor: "infantry", x: 30, team: "enemy", cooldown: 100 });
+  const veh = combatant({ id: 3, armor: "vehicle", x: 30, team: "enemy", hp: 400, maxHp: 400, cooldown: 100 });
+  const bld = combatant({ id: 4, armor: "building", x: 30, team: "enemy", hp: 400, maxHp: 400, cooldown: 100 });
+  assert.equal(effectiveDamage(rocket, veh, true), 120);
+  assert.equal(effectiveDamage(rocket, bld, true), 150);
+  assert.equal(effectiveDamage(rocket, inf, true), 30);
+  const gunner = combatant({ id: 5, damage: 10, weapon: "bullet" });
+  assert.equal(effectiveDamage(gunner, inf, true), 10);
+  assert.equal(effectiveDamage(gunner, veh, true), 5);
+});
+test("suppression: applySuppression stacks and clamps, modifiers scale linearly", () => {
+  const t = combatant({ id: 1 });
+  assert.equal(applySuppression(t, 0.4), 0.4);
+  assert.equal(applySuppression(t, 0.9), SUPPRESSION_MAX);
+  assert.equal(t.suppression, 1);
+  assert.equal(applySuppression(t, -5), 1);
+  assert.equal(suppressionModifiers(combatant()).accuracy, 1);
+  assert.equal(suppressionModifiers(combatant()).speed, 1);
+  assert.equal(suppressionModifiers(t).accuracy, SUPPRESSION_MIN_ACCURACY);
+  assert.equal(suppressionModifiers(t).speed, SUPPRESSION_MIN_SPEED);
+  const half = suppressionModifiers({ suppression: 0.5 });
+  assert.ok(Math.abs(half.accuracy - 0.625) < 1e-9);
+  assert.ok(Math.abs(half.speed - 0.7) < 1e-9);
+});
+test("suppression: sustained hits build it up in combat", () => {
+  const a = combatant({ id: 1, damage: 25, cooldownMax: 0 });
+  const t = combatant({ id: 2, x: 10, team: "enemy", hp: 100, maxHp: 100, cooldown: 100 });
+  stepCombat([a, t], 0.1, { suppression: true });
+  assert.equal(t.suppression, 0.625);
+  assert.equal(t.underFire, false);
+  stepCombat([a, t], 0.1, { suppression: true });
+  assert.equal(t.suppression, SUPPRESSION_MAX);
+  stepCombat([a, t], 0.1, { suppression: true });
+  stepCombat([a, t], 0.1, { suppression: true });
+  assert.equal(t.hp, 0);
+  const t2 = combatant({ id: 3, x: 10, team: "enemy", hp: 400, maxHp: 400, cooldown: 100 });
+  stepCombat([a, t2], 0.1);
+  assert.equal(t2.suppression, void 0);
+});
+test("suppression: recovers per tick only when no fire lands", () => {
+  const a = combatant({ id: 1, range: 50 });
+  const t = combatant({ id: 2, x: 1e3, team: "enemy", suppression: 1 });
+  stepCombat([a, t], 1, { suppression: true });
+  assert.equal(t.suppression, 1 - SUPPRESSION_RECOVERY);
+  stepCombat([a, t], 1, { suppression: true });
+  assert.equal(t.suppression, 1 - 2 * SUPPRESSION_RECOVERY);
+  const b = combatant({ id: 3, x: 950, damage: 100, cooldownMax: 0 });
+  stepCombat([b, t], 1, { suppression: true });
+  assert.equal(t.suppression, 1);
+  stepCombat([a, t], 1);
+  assert.equal(t.suppression, 1);
+});
+test("suppression: suppressed shooters miss a deterministic share of shots", () => {
+  const a = combatant({ id: 1, damage: 10, cooldownMax: 0 });
+  const t = combatant({ id: 2, x: 10, team: "enemy", hp: 400, maxHp: 400, cooldown: 100 });
+  const fired = [];
+  for (let i = 0; i < 5; i++) {
+    a.suppression = 1;
+    fired.push(stepCombat([a, t], 0.1, { suppression: true }).length);
+  }
+  assert.deepEqual(fired, [1, 0, 0, 0, 1]);
+  assert.equal(t.hp, 380);
+  const a2 = combatant({ id: 3, damage: 10, cooldownMax: 0 });
+  const t2 = combatant({ id: 4, x: 10, team: "enemy", hp: 400, maxHp: 400, cooldown: 100 });
+  const f2 = Array.from(
+    { length: 5 },
+    () => stepCombat([a2, t2], 0.1, { suppression: true }).length
+  );
+  assert.deepEqual(f2, [1, 1, 1, 1, 1]);
 });
 test("veterancy: elite out-damages rookie and shrugs off more hits", () => {
   const target = () => combatant({ id: 2, x: 30, team: "enemy", hp: 400, maxHp: 400, cooldown: 100 });
