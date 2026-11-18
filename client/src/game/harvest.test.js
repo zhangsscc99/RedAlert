@@ -93,7 +93,7 @@ var Heap = class {
     return top;
   }
 };
-function astar(map, sx, sy, gx, gy, passable, stepClear) {
+function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget) {
   const n = map.w * map.h;
   const g = new Float64Array(n).fill(Infinity);
   const f = new Float64Array(n).fill(Infinity);
@@ -106,10 +106,12 @@ function astar(map, sx, sy, gx, gy, passable, stepClear) {
   const open = new Heap(f);
   open.push(start);
   while (open.size > 0) {
+    if (budget && budget.left <= 0) return null;
     const cur = open.pop();
     if (cur === goal) return reconstruct(map, came, start, goal);
     if (closed[cur]) continue;
     closed[cur] = 1;
+    if (budget) budget.left--;
     const cx = cur % map.w;
     const cy = cur / map.w | 0;
     for (const [dx, dy, cost] of DIRS) {
@@ -121,7 +123,7 @@ function astar(map, sx, sy, gx, gy, passable, stepClear) {
       }
       if (stepClear && !stepClear(cx, cy, nx, ny)) continue;
       const ni = idx(map, nx, ny);
-      const ng = g[cur] + cost;
+      const ng = g[cur] + cost + (enterCost ? enterCost(nx, ny) : 0);
       if (ng < g[ni]) {
         g[ni] = ng;
         f[ni] = ng + octile(nx, ny, gx, gy);

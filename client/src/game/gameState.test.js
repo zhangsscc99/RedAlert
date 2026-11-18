@@ -190,7 +190,7 @@ var Heap = class {
 function terrainPassable(map) {
   return (x, y) => isPassable(map, x, y);
 }
-function astar(map, sx, sy, gx, gy, passable, stepClear) {
+function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget) {
   const n = map.w * map.h;
   const g = new Float64Array(n).fill(Infinity);
   const f = new Float64Array(n).fill(Infinity);
@@ -203,10 +203,12 @@ function astar(map, sx, sy, gx, gy, passable, stepClear) {
   const open = new Heap(f);
   open.push(start);
   while (open.size > 0) {
+    if (budget && budget.left <= 0) return null;
     const cur = open.pop();
     if (cur === goal) return reconstruct(map, came, start, goal);
     if (closed[cur]) continue;
     closed[cur] = 1;
+    if (budget) budget.left--;
     const cx = cur % map.w;
     const cy = cur / map.w | 0;
     for (const [dx, dy, cost] of DIRS) {
@@ -218,7 +220,7 @@ function astar(map, sx, sy, gx, gy, passable, stepClear) {
       }
       if (stepClear && !stepClear(cx, cy, nx, ny)) continue;
       const ni = idx(map, nx, ny);
-      const ng = g[cur] + cost;
+      const ng = g[cur] + cost + (enterCost ? enterCost(nx, ny) : 0);
       if (ng < g[ni]) {
         g[ni] = ng;
         f[ni] = ng + octile(nx, ny, gx, gy);
@@ -284,14 +286,28 @@ function findPathSmooth(map, sx, sy, gx, gy, opts = {}) {
   if (!inBounds(map, sx, sy) || !inBounds(map, gx, gy)) return null;
   if (sx === gx && sy === gy) return [];
   const blocked = blockedMask(map, opts.blockers ?? []);
-  const radius = opts.radius ?? 0;
-  const clear = radius > 0 ? (x, y) => inBounds(map, x, y) && !blocked[idx(map, x, y)] && cellStaysClear(map, blocked, x, y, radius) : (x, y) => inBounds(map, x, y) && !blocked[idx(map, x, y)];
-  if (!clear(gx, gy)) return null;
-  const step = radius > 0 ? (cx, cy, nx, ny) => segStaysClear(map, blocked, cx, cy, nx, ny, radius) : void 0;
-  const raw = astar(map, sx, sy, gx, gy, clear, step);
+  const nav = navFns(map, blocked, opts.radius ?? 0);
+  if (!nav.clear(gx, gy)) return null;
+  const raw = astar(map, sx, sy, gx, gy, nav.clear, nav.step);
   if (!raw) return null;
-  const pts = [{ x: sx, y: sy }, ...raw];
-  const los = radius > 0 ? (a, b) => segStaysClear(map, blocked, a.x, a.y, b.x, b.y, radius) : (a, b) => supercoverClear(map, blocked, a.x, a.y, b.x, b.y);
+  return pullString({ x: sx, y: sy }, raw, nav.los);
+}
+function navFns(map, blocked, radius) {
+  if (radius > 0) {
+    return {
+      clear: (x, y) => inBounds(map, x, y) && !blocked[idx(map, x, y)] && cellStaysClear(map, blocked, x, y, radius),
+      step: (cx, cy, nx, ny) => segStaysClear(map, blocked, cx, cy, nx, ny, radius),
+      los: (a, b) => segStaysClear(map, blocked, a.x, a.y, b.x, b.y, radius)
+    };
+  }
+  return {
+    clear: (x, y) => inBounds(map, x, y) && !blocked[idx(map, x, y)],
+    step: void 0,
+    los: (a, b) => supercoverClear(map, blocked, a.x, a.y, b.x, b.y)
+  };
+}
+function pullString(start, raw, los) {
+  const pts = [start, ...raw];
   const out = [];
   let i = 0;
   while (i < pts.length - 1) {

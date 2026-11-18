@@ -177,7 +177,7 @@ function findPath(map, sx, sy, gx, gy) {
   if (!isPassable(map, gx, gy)) return null;
   return astar(map, sx, sy, gx, gy, terrainPassable(map));
 }
-function astar(map, sx, sy, gx, gy, passable, stepClear) {
+function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget) {
   const n = map.w * map.h;
   const g = new Float64Array(n).fill(Infinity);
   const f = new Float64Array(n).fill(Infinity);
@@ -190,10 +190,12 @@ function astar(map, sx, sy, gx, gy, passable, stepClear) {
   const open = new Heap(f);
   open.push(start);
   while (open.size > 0) {
+    if (budget && budget.left <= 0) return null;
     const cur = open.pop();
     if (cur === goal) return reconstruct(map, came, start, goal);
     if (closed[cur]) continue;
     closed[cur] = 1;
+    if (budget) budget.left--;
     const cx = cur % map.w;
     const cy = cur / map.w | 0;
     for (const [dx, dy, cost] of DIRS) {
@@ -205,7 +207,7 @@ function astar(map, sx, sy, gx, gy, passable, stepClear) {
       }
       if (stepClear && !stepClear(cx, cy, nx, ny)) continue;
       const ni = idx(map, nx, ny);
-      const ng = g[cur] + cost;
+      const ng = g[cur] + cost + (enterCost ? enterCost(nx, ny) : 0);
       if (ng < g[ni]) {
         g[ni] = ng;
         f[ni] = ng + octile(nx, ny, gx, gy);
@@ -271,14 +273,28 @@ function findPathSmooth(map, sx, sy, gx, gy, opts = {}) {
   if (!inBounds(map, sx, sy) || !inBounds(map, gx, gy)) return null;
   if (sx === gx && sy === gy) return [];
   const blocked = blockedMask(map, opts.blockers ?? []);
-  const radius = opts.radius ?? 0;
-  const clear = radius > 0 ? (x, y) => inBounds(map, x, y) && !blocked[idx(map, x, y)] && cellStaysClear(map, blocked, x, y, radius) : (x, y) => inBounds(map, x, y) && !blocked[idx(map, x, y)];
-  if (!clear(gx, gy)) return null;
-  const step = radius > 0 ? (cx, cy, nx, ny) => segStaysClear(map, blocked, cx, cy, nx, ny, radius) : void 0;
-  const raw = astar(map, sx, sy, gx, gy, clear, step);
+  const nav = navFns(map, blocked, opts.radius ?? 0);
+  if (!nav.clear(gx, gy)) return null;
+  const raw = astar(map, sx, sy, gx, gy, nav.clear, nav.step);
   if (!raw) return null;
-  const pts = [{ x: sx, y: sy }, ...raw];
-  const los = radius > 0 ? (a, b) => segStaysClear(map, blocked, a.x, a.y, b.x, b.y, radius) : (a, b) => supercoverClear(map, blocked, a.x, a.y, b.x, b.y);
+  return pullString({ x: sx, y: sy }, raw, nav.los);
+}
+function navFns(map, blocked, radius) {
+  if (radius > 0) {
+    return {
+      clear: (x, y) => inBounds(map, x, y) && !blocked[idx(map, x, y)] && cellStaysClear(map, blocked, x, y, radius),
+      step: (cx, cy, nx, ny) => segStaysClear(map, blocked, cx, cy, nx, ny, radius),
+      los: (a, b) => segStaysClear(map, blocked, a.x, a.y, b.x, b.y, radius)
+    };
+  }
+  return {
+    clear: (x, y) => inBounds(map, x, y) && !blocked[idx(map, x, y)],
+    step: void 0,
+    los: (a, b) => supercoverClear(map, blocked, a.x, a.y, b.x, b.y)
+  };
+}
+function pullString(start, raw, los) {
+  const pts = [start, ...raw];
   const out = [];
   let i = 0;
   while (i < pts.length - 1) {
@@ -415,6 +431,138 @@ function segBoxDist(px, py, qx, qy, bx, by) {
     segSegDist(px, py, qx, qy, x1, y1, bx, y1),
     segSegDist(px, py, qx, qy, bx, y1, bx, by)
   );
+}
+var GROUP_NODE_BUDGET = 2e5;
+var GROUP_AVOID_COST = 1.5;
+function formationSlots(target, count, map, radius = 0) {
+  if (count <= 0) return [];
+  const blocked = blockedMask(map, []);
+  const nav = navFns(map, blocked, radius);
+  return ringSlots(map, target, count, nav.clear);
+}
+function ringSlots(map, target, count, passable) {
+  const out = [];
+  const maxR = Math.max(map.w, map.h);
+  for (let r = 0; out.length < count && r <= maxR; r++) {
+    const ring = [];
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+        const x = target.x + dx;
+        const y = target.y + dy;
+        if (!inBounds(map, x, y) || !passable(x, y)) continue;
+        ring.push({ x, y });
+      }
+    }
+    ring.sort(
+      (a, b) => (a.x - target.x) ** 2 + (a.y - target.y) ** 2 - ((b.x - target.x) ** 2 + (b.y - target.y) ** 2) || a.y - b.y || a.x - b.x
+    );
+    for (const t of ring) {
+      if (out.length >= count) break;
+      out.push(t);
+    }
+  }
+  const have = out.length;
+  for (let i = 0; out.length < count && have > 0; i++) out.push(out[i % have]);
+  return out;
+}
+function findPathGroup(map, starts, target, opts = {}) {
+  const n = starts.length;
+  if (n === 0) return { paths: [], slots: [], degraded: false };
+  const none = (slots2) => ({
+    paths: starts.map(() => null),
+    slots: slots2,
+    degraded: false
+  });
+  if (!inBounds(map, target.x, target.y)) return none([]);
+  const blocked = blockedMask(map, opts.blockers ?? []);
+  const nav = navFns(map, blocked, opts.radius ?? 0);
+  const slots = ringSlots(map, target, n, nav.clear);
+  if (slots.length === 0) return none([]);
+  const free = slots.slice();
+  const assigned = starts.map((s) => {
+    let bi = 0;
+    let bd = Infinity;
+    for (let i = 0; i < free.length; i++) {
+      const d = (free[i].x - s.x) ** 2 + (free[i].y - s.y) ** 2;
+      if (d < bd) {
+        bd = d;
+        bi = i;
+      }
+    }
+    return free.splice(bi, 1)[0];
+  });
+  const avoid = opts.avoidCost ?? GROUP_AVOID_COST;
+  const budget = { left: opts.nodeBudget ?? GROUP_NODE_BUDGET };
+  const occupied = new Uint16Array(map.w * map.h);
+  const enterCost = (x, y) => occupied[idx(map, x, y)] * avoid;
+  const paths = new Array(n).fill(null);
+  let degraded = false;
+  for (let i = 0; i < n; i++) {
+    const s = starts[i];
+    let g = assigned[i];
+    if (!inBounds(map, s.x, s.y)) continue;
+    let raw = null;
+    if (s.x === g.x && s.y === g.y) {
+      raw = [];
+    } else {
+      raw = astar(map, s.x, s.y, g.x, g.y, nav.clear, nav.step, enterCost, budget);
+      if (!raw && budget.left > 0) {
+        const alt = nearestPassable(map, target.x, target.y, nav.clear);
+        if (alt && (alt.x !== g.x || alt.y !== g.y)) {
+          raw = astar(map, s.x, s.y, alt.x, alt.y, nav.clear, nav.step, enterCost, budget);
+          if (raw) {
+            g = alt;
+            assigned[i] = alt;
+          }
+        }
+      }
+    }
+    if (!raw) {
+      if (budget.left <= 0) {
+        degraded = true;
+        break;
+      }
+      continue;
+    }
+    const path = pullString(s, raw, nav.los);
+    paths[i] = path;
+    markPathTiles(map, occupied, s, path);
+  }
+  if (degraded) {
+    for (let i = 0; i < n; i++) {
+      const s = starts[i];
+      paths[i] = inBounds(map, s.x, s.y) ? findPathSmooth(map, s.x, s.y, assigned[i].x, assigned[i].y, opts) : null;
+    }
+  }
+  return { paths, slots: assigned, degraded };
+}
+function markPathTiles(map, occupied, from, path) {
+  if (path.length === 0) {
+    occupied[idx(map, from.x, from.y)]++;
+    return;
+  }
+  let px = from.x + 0.5;
+  let py = from.y + 0.5;
+  for (const wp of path) {
+    const qx = wp.x + 0.5;
+    const qy = wp.y + 0.5;
+    const steps = Math.max(1, Math.ceil(Math.hypot(qx - px, qy - py) / 0.25));
+    let last = -1;
+    for (let s = 0; s <= steps; s++) {
+      const i = idx(
+        map,
+        Math.floor(px + (qx - px) * s / steps),
+        Math.floor(py + (qy - py) * s / steps)
+      );
+      if (i !== last) {
+        occupied[i]++;
+        last = i;
+      }
+    }
+    px = qx;
+    py = qy;
+  }
 }
 
 // src/game/pathfind.test.ts
@@ -736,4 +884,123 @@ test("generated map: center is pathable to a distant grass tile", () => {
       }
     }
   }
+});
+test("formationSlots returns the requested count of unique walkable slots", () => {
+  const m = makeMap(16, 16);
+  const slots = formationSlots({ x: 8, y: 8 }, 12, m, 0);
+  assert.equal(slots.length, 12);
+  assert.equal(new Set(slots.map((s) => `${s.x},${s.y}`)).size, 12);
+  for (const s of slots) {
+    assert.ok(isPassable(m, s.x, s.y));
+    assert.ok(Math.max(Math.abs(s.x - 8), Math.abs(s.y - 8)) <= 3);
+  }
+});
+test("formationSlots around obstacles stays walkable and unique", () => {
+  const m = makeMap(9, 9, [
+    [4, 3],
+    [3, 4],
+    [5, 4],
+    [4, 5],
+    [3, 3],
+    [5, 5]
+  ]);
+  const slots = formationSlots({ x: 4, y: 4 }, 8, m, 0);
+  assert.equal(slots.length, 8);
+  assert.equal(new Set(slots.map((s) => `${s.x},${s.y}`)).size, 8);
+  for (const s of slots) assert.ok(isPassable(m, s.x, s.y));
+});
+test("formationSlots honors the clearance radius against terrain", () => {
+  const wall = [];
+  for (let x = 0; x < 10; x++) wall.push([x, 4]);
+  const m = makeMap(10, 10, wall);
+  const slots = formationSlots({ x: 5, y: 2 }, 6, m, 1);
+  assert.equal(slots.length, 6);
+  for (const s of slots) {
+    assert.ok(isPassable(m, s.x, s.y));
+    assert.ok(s.y <= 2, `slot ${s.x},${s.y} sits inside the radius band`);
+  }
+});
+test("formationSlots reuses the nearest walkable cell when short on space", () => {
+  const water = [];
+  for (let y = 0; y < 4; y++) {
+    for (let x = 0; x < 4; x++) {
+      if (!(x === 1 && y === 1) && !(x === 2 && y === 1)) water.push([x, y]);
+    }
+  }
+  const m = makeMap(4, 4, water);
+  const slots = formationSlots({ x: 1, y: 1 }, 5, m, 0);
+  assert.equal(slots.length, 5);
+  for (const s of slots) assert.ok(isPassable(m, s.x, s.y));
+  assert.ok(new Set(slots.map((s) => `${s.x},${s.y}`)).size <= 2);
+});
+test("findPathGroup spreads ten units onto distinct endpoints", () => {
+  const m = makeMap(20, 20);
+  const starts = [];
+  for (let i = 0; i < 10; i++) starts.push({ x: 2 + i, y: 2 });
+  const res = findPathGroup(m, starts, { x: 15, y: 15 });
+  assert.equal(res.degraded, false);
+  assert.equal(res.paths.length, 10);
+  assert.equal(res.slots.length, 10);
+  const ends = /* @__PURE__ */ new Set();
+  for (let i = 0; i < 10; i++) {
+    const p = res.paths[i];
+    assert.ok(p, `unit ${i} reached its slot`);
+    const end = p.length ? p.at(-1) : starts[i];
+    ends.add(`${end.x},${end.y}`);
+  }
+  assert.equal(ends.size, 10);
+});
+test("findPathGroup routes around a wall to distinct slots", () => {
+  const wall = [];
+  for (let y = 0; y <= 13; y++) wall.push([10, y]);
+  const m = makeMap(20, 20, wall);
+  const starts = [
+    { x: 2, y: 5 },
+    { x: 3, y: 5 },
+    { x: 4, y: 5 },
+    { x: 2, y: 6 },
+    { x: 3, y: 6 }
+  ];
+  const res = findPathGroup(m, starts, { x: 15, y: 5 });
+  assert.equal(res.degraded, false);
+  const ends = /* @__PURE__ */ new Set();
+  for (let i = 0; i < starts.length; i++) {
+    const p = res.paths[i];
+    assert.ok(p, `unit ${i} reached its slot`);
+    assertSegmentsPassable(m, [], starts[i], p);
+    const end = p.length ? p.at(-1) : starts[i];
+    ends.add(`${end.x},${end.y}`);
+  }
+  assert.equal(ends.size, starts.length);
+});
+test("findPathGroup degrades to per-unit findPathSmooth over budget", () => {
+  const m = makeMap(20, 20);
+  const starts = [
+    { x: 1, y: 1 },
+    { x: 2, y: 1 },
+    { x: 3, y: 1 }
+  ];
+  const res = findPathGroup(m, starts, { x: 15, y: 15 }, { nodeBudget: 1 });
+  assert.equal(res.degraded, true);
+  for (let i = 0; i < starts.length; i++) {
+    const s = starts[i];
+    const g = res.slots[i];
+    assert.deepEqual(res.paths[i], findPathSmooth(m, s.x, s.y, g.x, g.y));
+  }
+});
+test("findPathGroup returns null for a sealed-off unit without throwing", () => {
+  const m = makeMap(7, 7, [
+    [1, 1],
+    [2, 1],
+    [3, 1],
+    [1, 2],
+    [3, 2],
+    [1, 3],
+    [2, 3],
+    [3, 3]
+  ]);
+  const res = findPathGroup(m, [{ x: 2, y: 2 }, { x: 0, y: 0 }], { x: 5, y: 5 });
+  assert.equal(res.paths.length, 2);
+  assert.equal(res.paths[0], null);
+  assert.ok(res.paths[1]);
 });
