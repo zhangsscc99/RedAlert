@@ -21,11 +21,16 @@ interface TerrainOverlay {
   water: HTMLCanvasElement;
   /** Foam + shallow band only; shimmered on top of the static copy. */
   shore: HTMLCanvasElement;
+  /** Diagonal specular stripes clipped to water; blitted with a slow drift. */
+  sparkle: HTMLCanvasElement;
   /** Specular twinkle points on ore crystals, in map pixel coords. */
   glints: { x: number; y: number; phase: number }[];
 }
 
 const overlays = new WeakMap<HTMLCanvasElement, TerrainOverlay>();
+
+/** Read-only time source for the animated overlays; drawTerrain stays pure. */
+const TIME = Object.freeze({ now: (): number => performance.now() / 1000 });
 
 export function prerenderMap(map: GameMap): HTMLCanvasElement {
   const canvas = document.createElement('canvas');
@@ -44,6 +49,13 @@ export function prerenderMap(map: GameMap): HTMLCanvasElement {
   shore.height = canvas.height;
   const shoreCtx = shore.getContext('2d')!;
 
+  // Sparkle layer: a white water mask first; diagonal highlight stripes are
+  // composited into it after the tile loop so they stay clipped to water.
+  const sparkle = document.createElement('canvas');
+  sparkle.width = canvas.width;
+  sparkle.height = canvas.height;
+  const sparkleCtx = sparkle.getContext('2d')!;
+
   const glints: { x: number; y: number; phase: number }[] = [];
 
   // Grass everywhere first via a pre-rendered noise pattern; water and ore
@@ -58,6 +70,8 @@ export function prerenderMap(map: GameMap): HTMLCanvasElement {
       if (t === WATER) {
         drawWaterTile(ctx, x, y);
         waterCtx.fillRect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+        sparkleCtx.fillStyle = '#ffffff';
+        sparkleCtx.fillRect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE);
       } else if (t === ORE) {
         // Density = neighbouring ore count, so vein centres grow richer
         // crystal clusters than isolated fringe cells.
@@ -135,7 +149,174 @@ export function prerenderMap(map: GameMap): HTMLCanvasElement {
     }
   }
 
-  overlays.set(canvas, { water, shore, glints });
+  // Water sparkle: diagonal highlight stripes clipped to the water mask.
+  // drawTerrain drifts the blit offset so the stripes slowly slide.
+  sparkleCtx.globalCompositeOperation = 'source-in';
+  sparkleCtx.strokeStyle = 'rgba(190,228,255,0.6)';
+  sparkleCtx.lineWidth = 2.5;
+  sparkleCtx.beginPath();
+  const STRIPE_GAP = 26;
+  for (let d = -canvas.height; d < canvas.width + canvas.height; d += STRIPE_GAP) {
+    sparkleCtx.moveTo(d, 0);
+    sparkleCtx.lineTo(d + canvas.height, canvas.height);
+  }
+  sparkleCtx.stroke();
+  sparkleCtx.globalCompositeOperation = 'source-over';
+
+  // Dirt paths: a few deterministic random walks across the map, drawn as
+  // broken sandy-dark patches with pebble specks. Purely cosmetic — tile
+  // values are untouched so pathing is unaffected.
+  const pathTiles = new Set<number>();
+  const PATHS = 4;
+  for (let p = 0; p < PATHS; p++) {
+    let x = Math.floor(rand01(p, 0, 301) * map.w);
+    let y = Math.floor(rand01(p, 1, 302) * map.h);
+    let dx = rand01(p, 2, 303) < 0.5 ? 1 : -1;
+    let dy = 0;
+    const steps = Math.floor(Math.max(map.w, map.h) * (0.6 + rand01(p, 3, 304) * 0.9));
+    for (let s = 0; s < steps; s++) {
+      if (x < 0 || y < 0 || x >= map.w || y >= map.h) break;
+      if (map.tiles[y * map.w + x] !== WATER) pathTiles.add(y * map.w + x);
+      if (rand01(p, s, 305) < 0.16) {
+        const swap = dx;
+        dx = dy;
+        dy = swap;
+        if (rand01(p, s, 306) < 0.5) {
+          dx = -dx;
+          dy = -dy;
+        }
+      }
+      x += dx;
+      y += dy;
+    }
+  }
+  for (const idx of pathTiles) {
+    const x = idx % map.w;
+    const y = Math.floor(idx / map.w);
+    if (map.tiles[idx] === ORE) continue;
+    if (rand01(x, y, 310) < 0.25) continue; // breaks in the road
+    const px = x * TILE_SIZE;
+    const py = y * TILE_SIZE;
+    ctx.fillStyle = 'rgba(72,56,34,0.32)';
+    ctx.fillRect(px + 1, py + 1, TILE_SIZE - 2, TILE_SIZE - 2);
+    ctx.fillStyle = 'rgba(104,86,56,0.25)';
+    ctx.fillRect(px + 3, py + 3, TILE_SIZE - 6, TILE_SIZE - 6);
+    // Pebbles and ruts along the road surface.
+    for (let i = 0; i < 5; i++) {
+      const gx = px + 3 + rand01(x, y, 320 + i) * (TILE_SIZE - 6);
+      const gy = py + 3 + rand01(x, y, 330 + i) * (TILE_SIZE - 6);
+      ctx.fillStyle =
+        rand01(x, y, 340 + i) < 0.5 ? 'rgba(140,124,94,0.4)' : 'rgba(40,30,18,0.35)';
+      ctx.fillRect(gx, gy, 2, 2);
+    }
+  }
+
+  // Land-side shoreline: a shadowed rim plus a thin foam line on the land
+  // tile wherever it borders water (all four directions), so the coast
+  // reads as a small cliff/beach edge rather than a flat seam.
+  for (let y = 0; y < map.h; y++) {
+    for (let x = 0; x < map.w; x++) {
+      if (map.tiles[y * map.w + x] === WATER) continue;
+      const px = x * TILE_SIZE;
+      const py = y * TILE_SIZE;
+      for (let d = 0; d < 4; d++) {
+        const nx = x + SHORE_DX[d]!;
+        const ny = y + SHORE_DY[d]!;
+        if (nx < 0 || ny < 0 || nx >= map.w || ny >= map.h) continue;
+        if (map.tiles[ny * map.w + nx] !== WATER) continue;
+        const horiz = d >= 2; // edge runs horizontally
+        // Shadow band fading inland.
+        ctx.fillStyle = 'rgba(10,22,34,0.30)';
+        if (d === 0) ctx.fillRect(px + TILE_SIZE - 3, py, 3, TILE_SIZE);
+        else if (d === 1) ctx.fillRect(px, py, 3, TILE_SIZE);
+        else if (d === 2) ctx.fillRect(px, py + TILE_SIZE - 3, TILE_SIZE, 3);
+        else ctx.fillRect(px, py, TILE_SIZE, 3);
+        ctx.fillStyle = 'rgba(10,22,34,0.14)';
+        if (d === 0) ctx.fillRect(px + TILE_SIZE - 6, py, 3, TILE_SIZE);
+        else if (d === 1) ctx.fillRect(px + 3, py, 3, TILE_SIZE);
+        else if (d === 2) ctx.fillRect(px, py + TILE_SIZE - 6, TILE_SIZE, 3);
+        else ctx.fillRect(px, py + 3, TILE_SIZE, 3);
+        // Broken foam line right at the waterline.
+        const h1 = Math.abs(Math.imul(x * 31 + y * 17 + d * 7, 2654435761)) >>> 0;
+        ctx.fillStyle = 'rgba(235,248,250,0.55)';
+        for (let t = 0; t < TILE_SIZE; t += 4) {
+          if (((h1 >>> (t % 24)) & 3) === 0) continue;
+          if (horiz) {
+            const ey = d === 2 ? py + TILE_SIZE - 1.5 : py;
+            ctx.fillRect(px + t, ey, 3, 1.5);
+          } else {
+            const ex = d === 0 ? px + TILE_SIZE - 1.5 : px;
+            ctx.fillRect(ex, py + t, 1.5, 3);
+          }
+        }
+      }
+    }
+  }
+
+  // Decorations: sparse deterministic rocks, grass tufts and deadwood on
+  // grass tiles — low contrast so units stay readable on top.
+  for (let y = 0; y < map.h; y++) {
+    for (let x = 0; x < map.w; x++) {
+      if (map.tiles[y * map.w + x] !== 0) continue; // grass only
+      const r = rand01(x, y, 400);
+      if (r >= 0.022) continue;
+      const px = x * TILE_SIZE;
+      const py = y * TILE_SIZE;
+      const cx = px + 6 + rand01(x, y, 401) * (TILE_SIZE - 12);
+      const cy = py + 6 + rand01(x, y, 402) * (TILE_SIZE - 12);
+      if (r < 0.006) {
+        // Rock: lumpy grey ellipse with a dark base and a lit top edge.
+        const rx = 4 + rand01(x, y, 403) * 4;
+        const ry = rx * (0.6 + rand01(x, y, 404) * 0.3);
+        ctx.fillStyle = 'rgba(20,24,18,0.25)';
+        ctx.beginPath();
+        ctx.ellipse(cx, cy + ry * 0.5, rx, ry * 0.6, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = 'rgba(118,122,110,0.55)';
+        ctx.beginPath();
+        ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = 'rgba(190,195,180,0.4)';
+        ctx.beginPath();
+        ctx.ellipse(cx - rx * 0.2, cy - ry * 0.3, rx * 0.55, ry * 0.4, 0, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (r < 0.017) {
+        // Grass tuft: a small fan of short strokes.
+        const blades = 3 + Math.floor(rand01(x, y, 405) * 3);
+        ctx.strokeStyle =
+          rand01(x, y, 406) < 0.5 ? 'rgba(24,58,18,0.5)' : 'rgba(120,160,70,0.45)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let i = 0; i < blades; i++) {
+          const a = -Math.PI / 2 + (i / (blades - 1) - 0.5) * 1.5;
+          const len = 3 + rand01(x, y, 407 + i) * 3;
+          ctx.moveTo(cx, cy + 2);
+          ctx.lineTo(cx + Math.cos(a) * len, cy + 2 + Math.sin(a) * len);
+        }
+        ctx.stroke();
+      } else {
+        // Deadwood: a short brown trunk with one or two branch stubs.
+        const ang = rand01(x, y, 408) * Math.PI;
+        const len = 5 + rand01(x, y, 409) * 5;
+        const ex = cx + Math.cos(ang) * len;
+        const ey = cy + Math.sin(ang) * len;
+        ctx.strokeStyle = 'rgba(84,62,38,0.6)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(ex, ey);
+        const mx = cx + (ex - cx) * 0.6;
+        const my = cy + (ey - cy) * 0.6;
+        ctx.moveTo(mx, my);
+        ctx.lineTo(mx + Math.cos(ang + 0.9) * 3, my + Math.sin(ang + 0.9) * 3);
+        ctx.stroke();
+        ctx.fillStyle = 'rgba(46,34,20,0.5)';
+        ctx.fillRect(cx - 1, cy - 1, 2, 2);
+      }
+    }
+  }
+
+  overlays.set(canvas, { water, shore, sparkle, glints });
   return canvas;
 }
 
@@ -188,7 +369,7 @@ export function drawTerrain(
 
   const ov = overlays.get(mapCanvas);
   if (!ov) return; // e.g. the grid layer reuses drawTerrain — nothing animated.
-  const t = performance.now() / 1000;
+  const t = TIME.now();
 
   // Water slowly breathes in brightness; the foam line shimmers on a faster,
   // smaller cycle so the shoreline reads as moving surf.
@@ -196,6 +377,12 @@ export function drawTerrain(
   ctx.drawImage(ov.water, cam.x, cam.y, sw, sh, 0, 0, viewW, viewH);
   ctx.globalAlpha = 0.06 + 0.05 * Math.sin(t * 2.3 + 1.1);
   ctx.drawImage(ov.shore, cam.x, cam.y, sw, sh, 0, 0, viewW, viewH);
+
+  // Baked highlight stripes drift across the water by slowly sliding the
+  // source window — still a single blit, no per-frame drawing.
+  const drift = (t * 6) % 26;
+  ctx.globalAlpha = 0.1 + 0.04 * Math.sin(t * 0.6 + 0.4);
+  ctx.drawImage(ov.sparkle, cam.x + drift, cam.y - drift, sw, sh, 0, 0, viewW, viewH);
   ctx.globalAlpha = 1;
 
   // Ore specular twinkles. Culled to the visible window; map-px coords are
