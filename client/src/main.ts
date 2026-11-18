@@ -55,15 +55,28 @@ import {
   stopRepair,
   worldToTile,
   zoomAt,
+  createRecorder,
+  createPlayer as createReplayPlayer,
+  record as replayRecord,
+  step as replayStep,
+  listReplays,
+  saveReplay,
+  loadReplay,
+  deleteReplay,
+  clearReplays,
   type BuildingKind,
+  type Command as ReplayCmd,
   type Effect,
   type Fog,
   type GameState,
   type GBuilding,
   type GUnit,
   type Order,
+  type Player as ReplayPlayer,
   type Point,
   type PositionedCombatEvent,
+  type Replay,
+  type ReplayMeta,
   type Targetable,
   type UnitKind,
 } from './game/index.ts';
@@ -166,6 +179,9 @@ import {
   onboardingSkipHit,
   productionOrderAt,
   pushMessage,
+  drawReplayBar,
+  replayBarHit,
+  replayBarLayout,
   TOUCH_GUIDE_STEPS,
   touchGuideLayout,
   touchMenuHit,
@@ -186,11 +202,14 @@ import {
 import {
   drawGameOver,
   drawMenu,
+  drawReplayList,
   drawSettings,
   gameoverHit,
   gameoverLayout,
   menuHit,
   menuLayout,
+  replayListHit,
+  replayListLayout,
   settingsHit,
   settingsLayout,
 } from './render/menu.js';
@@ -248,7 +267,7 @@ let fogT = 0;
 
 // --------------------------------------------------------- shell state ----
 
-type Screen = 'menu' | 'settings' | 'campaign' | 'playing';
+type Screen = 'menu' | 'settings' | 'campaign' | 'playing' | 'replay';
 let screen: Screen = 'menu';
 const settings = loadSettings();
 let difficulty: Difficulty = settings.difficulty;
@@ -270,6 +289,50 @@ const attackMove = new Map<number, Point>();
 
 let paused = false;
 let speedIdx = 0;
+
+// --------------------------------------------------------- replay (F1001) --
+
+/** Nominal length of one sim step for the replay stream. */
+const TICK_MS = 1000 / 60;
+/** Playback multipliers cycled by the bar's speed button. */
+const REPLAY_SPEEDS = [1, 2, 4] as const;
+/** Silent fast-forward budget per frame while scrubbing the playhead. */
+const CATCHUP_STEPS = 120;
+
+/** Command-stream recorder for the live match; null = not recording. */
+let recorder: Replay | null = null;
+/** Index of the next sim step — commands are logged against it. */
+let matchTick = 0;
+
+interface WatchState {
+  meta: ReplayMeta;
+  rec: Replay;
+  player: ReplayPlayer;
+  speedIdx: number;
+  paused: boolean;
+  /** Stored checksum differed / a command failed to re-apply → warn. */
+  mismatch: boolean;
+  /** Last event tick + 1 — progress-bar denominator. */
+  totalTicks: number;
+  /** Set while the playhead is silently re-simming to a scrub target. */
+  catchup?: number;
+}
+
+/** Non-null during replay playback — the 'replay' screen shows the world. */
+let watch: WatchState | null = null;
+/** True while a catch-up runs — mutes per-tick sfx inside simStep. */
+let simQuiet = false;
+/** Cached replay rows for the list screen; null = reload from storage. */
+let replayList: ReplayMeta[] | null = null;
+/** Readable load error surfaced on the replay list screen. */
+let replayError = '';
+/** Progress-scrub drag state (mouse only). */
+let scrubbing = false;
+let scrubFrac = 0;
+
+/** Leaderboard rows for the menu/debrief panels; boardCtx = which query. */
+let boardLines: string[] = [];
+let boardCtx = '';
 
 // ------------------------------------------------ wired modules (F601) ----
 
@@ -324,7 +387,9 @@ function syncMusic(): void {
     return;
   }
   const track: MusicTrack =
-    screen === 'playing' && game.phase === 'playing' ? 'battle' : 'menu';
+    (screen === 'playing' || watch !== null) && game.phase === 'playing'
+      ? 'battle'
+      : 'menu';
   if (musicTrack !== track) {
     musicTrack = track;
     music.crossfade(track, 0.8);
@@ -527,8 +592,9 @@ function storage(): SlotStorage | null {
 /** Archive the live match into the session slot. Never throws. */
 function persist(): void {
   const s = storage();
-  // 战役对局不写遭遇战存档槽 —— restoreGame 还原不出 MissionState。
-  if (!s || game.phase !== 'playing' || mission) return;
+  // 战役对局不写遭遇战存档槽 —— restoreGame 还原不出 MissionState；
+  // 回放态的 GameState 也不是玩家的真实对局。
+  if (!s || game.phase !== 'playing' || mission || watch) return;
   try {
     saveSlot(s, activeSlot, snapshotGame(game, camera), { phase: game.phase });
   } catch {
@@ -583,6 +649,8 @@ function applyGame(g: GameState): void {
   missionReport = null;
   missionT = 0;
   missionStars = 0;
+  recorder = null; // each start path re-arms its own recorder
+  matchTick = 0;
   refreshFog();
 }
 
@@ -647,6 +715,7 @@ function startGame(): void {
     }),
   );
   onboarding = wantOnboarding() ? createOnboarding() : null;
+  recorder = createRecorder({ seed: game.seed, tickMs: TICK_MS });
   recenterCamera();
   activeSlot = 1; // new campaign occupies slot 1
   persist();
@@ -664,6 +733,7 @@ function continueGame(): void {
   const g = restoreGame(saved);
   if (!g) return;
   applyGame(g);
+  // 读档继续的对局不录回放 —— 存档前的命令流已不可考，重放必然跑偏。
   if (saved.camera) {
     camera.x = saved.camera.x;
     camera.y = saved.camera.y;
@@ -689,6 +759,7 @@ function startMission(index: number): void {
   applyGame(createGame(MAP_SEED, missionGameOpts(def)));
   mission = createMissionState(def);
   missionIdx = index;
+  recorder = createRecorder({ seed: game.seed, tickMs: TICK_MS });
   recenterCamera();
   screen = 'playing';
   if (guideStep < 0) showHint();
@@ -738,8 +809,11 @@ function endMission(): void {
       elapsed: game.elapsed,
       unitsLost: stats.unitsLost,
     });
-    const s = storage();
-    saveProgress(s, recordWin(loadProgress(s), mission.def.id, missionStars));
+    // 回放态下的"通关"只是重演 —— 不污染战役进度。
+    if (!watch) {
+      const s = storage();
+      saveProgress(s, recordWin(loadProgress(s), mission.def.id, missionStars));
+    }
   }
   game.phase = won ? 'won' : 'lost';
 }
@@ -818,6 +892,11 @@ function onMenuTap(p: Point): void {
     case 'continue':
       continueGame();
       break;
+    case 'replay':
+      replayList = null; // force a fresh read
+      replayError = '';
+      screen = 'replay';
+      break;
     case 'settings':
       screen = 'settings';
       break;
@@ -846,6 +925,290 @@ function onGameOverTap(p: Point): void {
   const hit = gameoverHit(gameoverLayout(viewW, viewH), p.x, p.y);
   if (hit === 'retry') startGame();
   else if (hit === 'menu') screen = 'menu';
+}
+
+// -------------------------------------------------- replay + leaderboard --
+
+/** Archive the just-finished match into the replay library (cap 5). */
+function saveReplayNow(): void {
+  const s = storage();
+  if (!s || !recorder) return;
+  try {
+    saveReplay(
+      s,
+      {
+        label: mission ? `第${missionIdx + 1}关 ${mission.def.name}` : '遭遇战',
+        missionIdx: mission ? missionIdx : undefined,
+        missionId: mission ? mission.def.id : 'skirmish',
+        difficulty: mission ? undefined : difficulty,
+        result: game.phase === 'won' ? 'won' : 'lost',
+        durationSec: Math.max(0, Math.round(mission ? mission.elapsed : game.elapsed)),
+      },
+      recorder,
+    );
+    replayList = null;
+  } catch {
+    /* storage full/blocked — the replay simply isn't kept */
+  }
+}
+
+/**
+ * Feed one replayed command back through the same issue-paths the player
+ * uses — never a parallel command model. A command that can't reproduce
+ * (target gone, all movers dead, failed build/train) flags the run as
+ * divergent instead of throwing.
+ */
+function applyReplayCommands(cmds: readonly ReplayCmd[]): void {
+  if (!watch) return;
+  for (const c of cmds) {
+    switch (c.type) {
+      case 'move': {
+        const ids = new Set(c.unitIds);
+        if (!game.units.some((u) => ids.has(u.id) && u.hp > 0)) {
+          watch.mismatch = true;
+          break;
+        }
+        for (const u of game.units) u.selected = ids.has(u.id);
+        issueMove({ x: c.x, y: c.y });
+        break;
+      }
+      case 'attack': {
+        const t = [...game.enemyUnits, ...game.enemyBuildings].find((e) => e.id === c.targetId);
+        const ids = new Set(c.unitIds);
+        if (!t || t.hp <= 0 || !game.units.some((u) => ids.has(u.id) && u.hp > 0)) {
+          watch.mismatch = true;
+          break;
+        }
+        for (const u of game.units) u.selected = ids.has(u.id);
+        issueAttack(t);
+        break;
+      }
+      case 'build': {
+        const kind = c.kind as BuildingKind;
+        if (!(kind in BUILDING_DEFS) || !buildAt(game, kind, c.gx, c.gy).ok) {
+          watch.mismatch = true;
+        }
+        break;
+      }
+      case 'train': {
+        const kind = c.kind as UnitKind;
+        if (!(kind in UNIT_STATS) || !trainUnit(game, kind).ok) watch.mismatch = true;
+        break;
+      }
+      case 'stop': {
+        const ids = new Set(c.unitIds);
+        stop(game.units.filter((u) => ids.has(u.id)), orders);
+        break;
+      }
+    }
+  }
+}
+
+/**
+ * Rebuild the match a replay was recorded on: same seed, same createGame
+ * options (difficulty for skirmish, missionGameOpts + mission state for
+ * campaign). Returns false when a mission replay references a mission that
+ * no longer exists.
+ */
+function setupWatchGame(meta: ReplayMeta): boolean {
+  if (meta.missionIdx !== undefined) {
+    const def = MISSIONS[meta.missionIdx];
+    if (!def) return false;
+    applyGame(createGame(MAP_SEED, missionGameOpts(def)));
+    mission = createMissionState(def);
+    missionIdx = meta.missionIdx;
+    return true;
+  }
+  const d =
+    DIFFICULTY[(meta.difficulty ?? 'normal') as Difficulty] ?? DIFFICULTY.normal;
+  applyGame(
+    createGame(MAP_SEED, {
+      credits: d.startCredits,
+      enemyInfantry: d.enemyStartInfantry,
+      enemyStrength: d.enemyStrengthScale,
+      waveIntervalScale: d.waveIntervalScale,
+    }),
+  );
+  return true;
+}
+
+function startWatch(meta: ReplayMeta): void {
+  const s = storage();
+  replayError = '';
+  if (!s) {
+    replayError = '本地存储不可用';
+    return;
+  }
+  const r = loadReplay(s, meta.id);
+  if (!r.ok) {
+    replayError = r.error;
+    replayList = listReplays(s); // refresh — the entry may be gone/corrupt
+    return;
+  }
+  if (!setupWatchGame(meta)) {
+    replayError = '该回放对应的关卡已不可用';
+    return;
+  }
+  recenterCamera();
+  watch = {
+    meta,
+    rec: r.rec,
+    player: createReplayPlayer(r.rec, 1),
+    speedIdx: 0,
+    paused: false,
+    mismatch: r.mismatch,
+    totalTicks: Math.max(1, (r.rec.events[r.rec.events.length - 1]?.tick ?? 0) + 1),
+  };
+}
+
+function exitWatch(): void {
+  watch = null;
+  simQuiet = false;
+  scrubbing = false;
+  applyGame(createGame(MAP_SEED)); // neutral backdrop behind the menu
+  recenterCamera();
+  screen = 'menu';
+}
+
+/**
+ * Scrub the playhead to `frac` of the recording. Catch-up lands the player
+ * at target+1 (commands through `target` applied), so only a target behind
+ * that position forces a rebuild; either way the catch-up re-sims silently
+ * over the next frames so intermediate commands aren't skipped.
+ */
+function watchSeek(frac: number): void {
+  if (!watch) return;
+  const target = Math.min(
+    watch.totalTicks,
+    Math.max(0, Math.round(frac * watch.totalTicks)),
+  );
+  if (target < watch.player.tick - 1) {
+    if (!setupWatchGame(watch.meta)) return;
+    msgs.length = 0;
+    watch.player = createReplayPlayer(watch.rec, 1);
+  }
+  watch.player.speed = 1; // catch-up consumes exactly one tick per simStep
+  watch.catchup = target;
+  simQuiet = true;
+}
+
+/** One replay-bar hit mapped to its action. */
+function onWatchHit(hit: ReturnType<typeof replayBarHit>): void {
+  if (!watch || hit === null) return;
+  if (hit === 'toggle') {
+    watch.paused = !watch.paused;
+  } else if (hit === 'speed') {
+    watch.speedIdx = (watch.speedIdx + 1) % REPLAY_SPEEDS.length;
+    watch.player.speed = REPLAY_SPEEDS[watch.speedIdx]!;
+  } else if (hit === 'exit') {
+    exitWatch();
+  } else {
+    watchSeek(hit.frac);
+  }
+}
+
+function onReplayListTap(p: Point): void {
+  const list = replayList ?? [];
+  const hit = replayListHit(replayListLayout(viewW, viewH, list.length), p.x, p.y);
+  if (!hit) return;
+  const s = storage();
+  replayError = '';
+  switch (hit.kind) {
+    case 'play': {
+      const meta = list[hit.index];
+      if (meta) startWatch(meta);
+      break;
+    }
+    case 'delete': {
+      const meta = list[hit.index];
+      if (s && meta) deleteReplay(s, meta.id);
+      replayList = null;
+      break;
+    }
+    case 'clear':
+      if (s) clearReplays(s);
+      replayList = null;
+      break;
+    case 'back':
+      screen = 'menu';
+      break;
+  }
+}
+
+/** Format one leaderboard row for the panel. */
+function boardRow(i: number, s: unknown): string {
+  const r = (s ?? {}) as Record<string, unknown>;
+  const name = (typeof r.name === 'string' && r.name.trim() !== '' ? r.name.trim() : '匿名').slice(0, 8);
+  const where = r.missionId === 'skirmish' ? '遭遇' : typeof r.missionId === 'string' ? r.missionId : '';
+  const stars = Number.isInteger(r.stars) ? (r.stars as number) : 0;
+  const kills = Number.isInteger(r.kills) ? (r.kills as number) : 0;
+  const dur = typeof r.durationSec === 'number' ? fmtClock(r.durationSec) : '--:--';
+  return `#${i} ${where} ${name} ★${stars} ${kills}杀 ${dur}`;
+}
+
+/**
+ * Refresh the leaderboard panel. Any failure (offline, non-2xx, junk JSON)
+ * degrades to「排行榜暂不可用」— it never throws into the game loop.
+ */
+function refreshBoard(missionId: string | null): void {
+  const ctx = missionId ?? 'all';
+  boardCtx = ctx;
+  boardLines = ['—— 排行榜 ——', '载入中…'];
+  const q = missionId === null ? '' : `?mission=${encodeURIComponent(missionId)}`;
+  fetch(`/api/leaderboard${q}`)
+    .then(async (r) => {
+      if (!r.ok) throw new Error(`http ${r.status}`);
+      const data: unknown = await r.json();
+      const scores =
+        typeof data === 'object' && data !== null && Array.isArray((data as { scores?: unknown }).scores)
+          ? ((data as { scores: unknown[] }).scores as unknown[])
+          : [];
+      if (boardCtx !== ctx) return; // a newer query superseded this one
+      const rows = scores.slice(0, 10).map((s, i) => boardRow(i + 1, s));
+      boardLines = ['—— 排行榜 ——', ...(rows.length > 0 ? rows : ['暂无记录'])];
+    })
+    .catch(() => {
+      if (boardCtx === ctx) boardLines = ['—— 排行榜 ——', '排行榜暂不可用'];
+    });
+}
+
+/** POST the finished match. Fire-and-forget; failure only notes a message. */
+function submitScore(): void {
+  const cap = (n: number) => Math.min(1e6, Math.max(0, Math.round(n)));
+  const body = {
+    missionId: mission ? mission.def.id : 'skirmish',
+    stars: mission ? missionStars : game.phase === 'won' ? 1 : 0,
+    kills: cap(stats.kills),
+    built: cap(stats.buildingsBuilt),
+    mined: cap(stats.oreMined),
+    durationSec: Math.min(86400, Math.max(1, mission ? mission.elapsed : game.elapsed)),
+  };
+  fetch('/api/score', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+    .then((r) => {
+      if (!r.ok) pushMessage(msgs, '排行榜暂不可用');
+    })
+    .catch(() => pushMessage(msgs, '排行榜暂不可用'));
+}
+
+/** Small leaderboard panel anchored at (x, topY) — menu + mission-end use it. */
+function drawBoardPanel(x: number, topY: number, w: number, lines: readonly string[]): void {
+  const lineH = 16;
+  const pad = 10;
+  const h = pad * 2 + lines.length * lineH;
+  ctx.fillStyle = 'rgba(10, 14, 8, 0.72)';
+  ctx.fillRect(x, topY, w, h);
+  ctx.strokeStyle = 'rgba(93, 255, 93, 0.35)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x + 0.5, topY + 0.5, w - 1, h - 1);
+  ctx.font = '12px ui-monospace, Menlo, Consolas, monospace';
+  lines.forEach((line, i) => {
+    ctx.fillStyle = line.startsWith('——') ? '#5dff5d' : '#cfe8c9';
+    ctx.fillText(line, x + pad, topY + pad + 11 + i * lineH);
+  });
 }
 
 // --------------------------------------------------------------- helpers ---
@@ -941,6 +1304,16 @@ function movedToward(x: number, y: number): Set<number> {
   return ids;
 }
 
+/** Append one player command to the replay stream; recording never breaks play. */
+function recCmd(cmd: ReplayCmd): void {
+  if (!recorder) return;
+  try {
+    replayRecord(recorder, matchTick, cmd);
+  } catch {
+    /* a bad write must not interrupt the match */
+  }
+}
+
 function issueAttack(target: Targetable): void {
   const sel = selectedIds();
   if (sel.size === 0) return;
@@ -949,6 +1322,7 @@ function issueAttack(target: Targetable): void {
   const made = attack(game.units, target);
   if (made.length === 0) return;
   orders.push(...made);
+  recCmd({ type: 'attack', unitIds: [...sel], targetId: target.id });
   moveMarker = { x: target.x, y: target.y, t: performance.now() };
 }
 
@@ -979,6 +1353,8 @@ function issueAttackMove(w: Point): void {
   const moved = movedToward(dest.x, dest.y);
   dropOrdersFor(moved);
   for (const id of moved) attackMove.set(id, dest);
+  // 攻击移动在命令模型里没有专属类型 —— 按移动记录，重放时退化为普通移动。
+  if (moved.size > 0) recCmd({ type: 'move', unitIds: [...moved], x: dest.x, y: dest.y });
   moveMarker = { x: dest.x, y: dest.y, t: performance.now() };
   obMoveTo(dest);
 }
@@ -991,6 +1367,7 @@ function issueMove(w: Point): void {
   const moved = movedToward(dest.x, dest.y);
   dropOrdersFor(moved);
   for (const id of moved) attackMove.delete(id);
+  if (moved.size > 0) recCmd({ type: 'move', unitIds: [...moved], x: dest.x, y: dest.y });
   moveMarker = { x: w.x, y: w.y, t: performance.now() };
   obMoveTo(dest);
 }
@@ -999,6 +1376,7 @@ function stopSelected(): void {
   const sel = game.units.filter((u) => u.selected);
   if (sel.length === 0) return;
   stop(sel, orders);
+  recCmd({ type: 'stop', unitIds: sel.map((u) => u.id) });
   for (const u of sel) attackMove.delete(u.id);
 }
 
@@ -1008,6 +1386,8 @@ function guardSelected(): void {
   dropOrdersFor(sel);
   for (const id of sel) attackMove.delete(id);
   for (const u of game.units) orders.push(...guard([u], { x: u.x, y: u.y }));
+  // 警戒不在命令模型里 —— 记 stop，重放表现为原地驻停。
+  recCmd({ type: 'stop', unitIds: [...sel] });
 }
 
 // --------------------------------------------------------- building ops ----
@@ -1309,7 +1689,10 @@ function handleGesture(g: Gesture): void {
     if (screen === 'menu') onMenuTap(p);
     else if (screen === 'settings') onSettingsTap(p);
     else if (screen === 'campaign') onCampaignTap(p);
-    else if (game.phase !== 'playing') onGameOverTap(p);
+    else if (screen === 'replay') {
+      if (watch) onWatchHit(replayBarHit(replayBarLayout(viewW, viewH), p.x, p.y));
+      else onReplayListTap(p);
+    } else if (game.phase !== 'playing') onGameOverTap(p);
     else onTap(p);
     return;
   }
@@ -1475,7 +1858,7 @@ function diffCombat(prev: Map<number, CombatSnap>): void {
         fromX: shooter.x,
         fromY: shooter.y,
       });
-      sfx.play(shooter.kind === 'tank' || shooter.kind === 'turret' ? 'cannon' : 'rifle');
+      if (!simQuiet) sfx.play(shooter.kind === 'tank' || shooter.kind === 'turret' ? 'cannon' : 'rifle');
     } else {
       spawnDamageText(effects, c.x, c.y, dmg);
     }
@@ -1483,7 +1866,7 @@ function diffCombat(prev: Map<number, CombatSnap>): void {
   for (const [id, p] of prev) {
     if (!nowIds.has(id)) {
       spawnExplosion(effects, p.x, p.y, Math.max(16, p.r * 2));
-      sfx.play('explosion');
+      if (!simQuiet) sfx.play('explosion');
       // 战报 + 引导事件：敌方死亡计击杀，己方计损失；敌方建筑另报摧毁。
       if (p.team === 'enemy') {
         record(stats, { type: 'kill', unit: p.kind, time: game.elapsed });
@@ -1525,6 +1908,7 @@ function failText(reason: string): string {
 function tryTrain(kind: UnitKind): void {
   const r = trainUnit(game, kind);
   if (r.ok) {
+    recCmd({ type: 'train', kind });
     pushMessage(msgs, `${BAR_DEFS.find((d) => d.kind === kind)?.label ?? kind} 已入队`);
     return;
   }
@@ -1546,6 +1930,7 @@ function doBuild(p: Point): void {
     r.ok ? `${BUILDING_DEFS[pendingBuild].label} 已落地` : failText(r.ok ? '' : r.reason),
   );
   if (r.ok) {
+    recCmd({ type: 'build', kind: pendingBuild, gx: g.x, gy: g.y });
     pendingBuild = null;
     sfx.play('build');
   }
@@ -1588,6 +1973,22 @@ canvas.addEventListener('pointerdown', (e) => {
   }
   if (screen === 'campaign') {
     if (e.button === 0) onCampaignTap(p);
+    return;
+  }
+  // 回放态：列表点击或播放条控制；世界输入一律不进入。
+  if (screen === 'replay') {
+    if (e.button === 0) {
+      if (watch) {
+        const hit = replayBarHit(replayBarLayout(viewW, viewH), p.x, p.y);
+        if (hit !== null && typeof hit === 'object') {
+          scrubbing = true; // track press — pointerup lands the final seek
+          scrubFrac = hit.frac;
+        }
+        onWatchHit(hit);
+      } else {
+        onReplayListTap(p);
+      }
+    }
     return;
   }
   if (game.phase !== 'playing') {
@@ -1692,6 +2093,10 @@ canvas.addEventListener('pointermove', (e) => {
   }
 
   mouseInside = true;
+  if (scrubbing && watch) {
+    const l = replayBarLayout(viewW, viewH);
+    scrubFrac = Math.min(1, Math.max(0, (p.x - l.track.x) / l.track.w));
+  }
   if (screen !== 'playing') return; // hover only; no drag state outside a match
   const dx = p.x - dragPrev.x;
   const dy = p.y - dragPrev.y;
@@ -1720,6 +2125,11 @@ canvas.addEventListener('pointerup', (e) => {
   if (e.pointerType === 'touch') {
     for (const g of gestures.up(e.pointerId, p.x, p.y, performance.now())) handleGesture(g);
     return;
+  }
+
+  if (scrubbing) {
+    scrubbing = false;
+    if (watch) watchSeek(scrubFrac); // release lands the final scrub position
   }
 
   if (screen !== 'playing' || game.phase !== 'playing') {
@@ -1774,6 +2184,7 @@ canvas.addEventListener('pointercancel', (e) => {
   pressedAction = null;
   pressedBuild = -1;
   pressedMenu = null;
+  scrubbing = false;
   dragMode = 'none';
 });
 canvas.addEventListener('pointerleave', () => {
@@ -1787,7 +2198,7 @@ canvas.addEventListener(
   'wheel',
   (e) => {
     e.preventDefault();
-    if (screen !== 'playing') return;
+    if (screen !== 'playing' && !watch) return; // replays allow view-only zoom
     const p = canvasPos(e);
     zoomAt(camera, p.x, p.y, e.deltaY < 0 ? 1.15 : 1 / 1.15);
   },
@@ -1904,6 +2315,22 @@ window.addEventListener('keydown', (e) => {
     } else if (k === 'enter') {
       // Enter starts the first unlocked-but-uncleared mission.
       startMission(nextMissionIndex(loadProgress(storage())));
+    }
+    return;
+  }
+  if (screen === 'replay') {
+    if (watch) {
+      if (k === 'escape') exitWatch();
+      else if (k === ' ') {
+        watch.paused = !watch.paused;
+        e.preventDefault();
+      } else if (k === '1' || k === '2' || k === '4') {
+        watch.speedIdx = k === '4' ? 2 : Number(k) - 1;
+        watch.player.speed = REPLAY_SPEEDS[watch.speedIdx]!;
+      }
+    } else if (k === 'escape' || k === 'enter') {
+      screen = 'menu';
+      e.preventDefault();
     }
     return;
   }
@@ -2129,11 +2556,13 @@ function drawBanner(): void {
         mouse.y,
       ),
     });
+    const bh = 20 + boardLines.length * 16;
+    drawBoardPanel(12, viewH - 12 - bh, Math.min(340, viewW - 24), boardLines);
     return;
   }
   const hover = gameoverHit(gameoverLayout(viewW, viewH), mouse.x, mouse.y);
   drawGameOver(ctx, viewW, viewH, game.phase, hover);
-  drawBattleReport(ctx, viewW, viewH, reportCard);
+  drawBattleReport(ctx, viewW, viewH, [...reportCard, '', ...boardLines]);
 }
 
 /** 前置建筑未满足时的显示名（指挥部自带雷达 → 雷达站）。 */
@@ -2197,6 +2626,96 @@ let rafId = 0;
 let loopRunning = false;
 let prevPhase = game.phase;
 
+/**
+ * Advance the sim one step. In watch mode this first emits the replay
+ * commands scheduled for the current tick — recording wrote them against
+ * this same per-step index — then runs the identical simulation path a
+ * live match takes.
+ */
+function simStep(gameDt: number, now: number): void {
+  if (watch) applyReplayCommands(replayStep(watch.player));
+  matchTick++;
+
+  const prev = snapshotCombat();
+  const earned0 = game.economy.earned;
+  const enemyN0 = game.enemyUnits.length;
+  const wEv = stepWeather(weather, gameDt);
+  if (wEv) pushMessage(msgs, WEATHER_LABEL[wEv.to]);
+  const speedMul = weatherMul('speed');
+  for (const u of game.units) u.speed = UNIT_STATS[u.kind].speed * speedMul;
+  for (const u of game.enemyUnits) u.speed = UNIT_STATS[u.kind].speed * speedMul;
+  // Harvesters read the stats table, not the unit field (harvest.stepAlong),
+  // so the kind row is scaled for the duration of this tick.
+  const harvestBase = UNIT_STATS.harvester.speed;
+  UNIT_STATS.harvester.speed = harvestBase * speedMul;
+  updateOrders(orders, game.units, [...game.enemyUnits, ...game.enemyBuildings], gameDt);
+  stepAttackMove();
+  const ev = tickGame(game, gameDt);
+  UNIT_STATS.harvester.speed = harvestBase;
+  diffCombat(prev);
+  updateEffects(effects, gameDt);
+
+  // F701 domain events → 战报统计 / 新手引导 / 消息。
+  for (const b of ev.built) {
+    if (b.team !== 'player') continue;
+    record(stats, { type: 'buildingBuilt', building: b.kind, time: game.elapsed });
+    obEvent({ type: 'buildingDone', building: b.kind });
+  }
+  for (const k of ev.trained) {
+    record(stats, { type: 'unitTrained', unit: k, time: game.elapsed });
+    obEvent({ type: 'unitTrained', unit: k });
+  }
+  for (const d of ev.upgrades) {
+    const b = game.buildings.find((x) => x.id === d.buildingId);
+    pushMessage(msgs, `${b ? BUILDING_LABEL[b.kind] : '建筑'} 升级完成 Lv${d.level}`);
+    if (!simQuiet) sfx.play('build');
+  }
+  for (const id of ev.repaired) {
+    const b = game.buildings.find((x) => x.id === id);
+    if (b) pushMessage(msgs, `${BUILDING_LABEL[b.kind]} 维修完成`);
+  }
+  // 采矿统计 = 本 tick 入账 − 出售退款（trickle 也算矿厂收益）。
+  const mined = Math.round(game.economy.earned - earned0 - sellRefunded);
+  sellRefunded = 0;
+  if (mined > 0) record(stats, { type: 'mined', amount: mined, time: game.elapsed });
+  if (enemyN0 > 0 && game.enemyUnits.length === 0 && game.ai.wave > 0) {
+    record(stats, { type: 'waveCleared', wave: game.ai.wave, time: game.elapsed });
+  }
+  // 维修因资金耗尽暂停时给提示（节流 6s），而不是静默卡住。
+  if (
+    game.repairs.jobs.some((j) => j.engineerId !== null) &&
+    game.economy.credits <= 0 &&
+    now - repairBrokeWarnT > 6000
+  ) {
+    repairBrokeWarnT = now;
+    pushMessage(msgs, '资金不足，维修暂停');
+  }
+  // Radar pulse: the HQ dish scans while it stands and the grid holds.
+  const hq = game.buildings.find((b) => b.kind === 'hq' && b.done);
+  radarOn = radarAvailable(!isLowPower(computePower(game.buildings)), hq !== undefined);
+  if (radarOn && hq) {
+    radar.cx = hq.x;
+    radar.cy = hq.y;
+    stepRadar(radar, gameDt, game.enemyUnits, 'player');
+  }
+  fogT += gameDt;
+  if (fogT >= FOG_REFRESH) {
+    fogT %= FOG_REFRESH;
+    refreshFog();
+  }
+  // 战役目标推进：0.2s 节流，胜负由 updateMission 判定（manualEnd 模式
+  // 下 tickGame 不再接管 phase）。
+  if (mission) {
+    missionT += gameDt;
+    if (missionT >= MISSION_TICK) {
+      const step = missionT;
+      missionT = 0;
+      missionReport = updateMission(mission, missionCtx(game), step);
+      if (missionReport.status !== 'active') endMission();
+    }
+  }
+}
+
 /** Dimmed live map behind the shell screens. */
 function drawShellBackdrop(): void {
   drawTerrain(ctx, camera, mapCanvas, viewW, viewH);
@@ -2227,11 +2746,12 @@ function frame(now: number): void {
   ctx.fillStyle = '#0b0e0a';
   ctx.fillRect(0, 0, viewW, viewH);
 
-  if (screen !== 'playing') {
+  if (screen !== 'playing' && !watch) {
     clampToMap(camera, map, viewW, viewH);
     canvas.style.cursor = 'default';
     drawShellBackdrop();
     if (screen === 'menu') {
+      if (boardCtx !== 'all') refreshBoard(null); // menu panel: all missions
       const info = continueInfo();
       drawMenu(ctx, viewW, viewH, {
         difficulty,
@@ -2239,8 +2759,25 @@ function frame(now: number): void {
         continueLabel: info.label,
         hover: menuHit(menuLayout(viewW, viewH), mouse.x, mouse.y),
       });
+      const bh = 20 + boardLines.length * 16;
+      drawBoardPanel(12, viewH - 12 - bh, Math.min(340, viewW - 24), boardLines);
     } else if (screen === 'campaign') {
       drawCampaign(ctx, viewW, viewH, campaignModel());
+    } else if (screen === 'replay') {
+      const s = storage();
+      if (replayList === null) replayList = s ? listReplays(s) : [];
+      const l = replayListLayout(viewW, viewH, replayList.length);
+      drawReplayList(ctx, viewW, viewH, {
+        entries: replayList,
+        hover: replayListHit(l, mouse.x, mouse.y),
+      });
+      if (replayError) {
+        ctx.font = 'bold 13px ui-monospace, Menlo, Consolas, monospace';
+        ctx.fillStyle = '#ff6b5e';
+        ctx.textAlign = 'center';
+        ctx.fillText(replayError, viewW / 2, l.back.y + l.back.h + 26);
+        ctx.textAlign = 'left';
+      }
     } else {
       drawSettings(ctx, viewW, viewH, {
         mute: settings.mute,
@@ -2252,7 +2789,14 @@ function frame(now: number): void {
     return;
   }
 
-  const gameDt = paused ? 0 : dt * SPEEDS[speedIdx]!;
+  const catchingUp = watch?.catchup !== undefined;
+  const gameDt = watch
+    ? watch.paused || catchingUp
+      ? 0
+      : dt * REPLAY_SPEEDS[watch.speedIdx]!
+    : paused
+      ? 0
+      : dt * SPEEDS[speedIdx]!;
 
   applyKeyPan(dt);
   // Edge pan is mouse-only — on touch it fights with drag/pinch gestures.
@@ -2262,112 +2806,60 @@ function frame(now: number): void {
   }
   clampToMap(camera, map, viewW, viewH);
 
-  if (gameDt > 0 && game.phase === 'playing') {
-    const prev = snapshotCombat();
-    const earned0 = game.economy.earned;
-    const enemyN0 = game.enemyUnits.length;
-    const wEv = stepWeather(weather, gameDt);
-    if (wEv) pushMessage(msgs, WEATHER_LABEL[wEv.to]);
-    const speedMul = weatherMul('speed');
-    for (const u of game.units) u.speed = UNIT_STATS[u.kind].speed * speedMul;
-    for (const u of game.enemyUnits) u.speed = UNIT_STATS[u.kind].speed * speedMul;
-    // Harvesters read the stats table, not the unit field (harvest.stepAlong),
-    // so the kind row is scaled for the duration of this tick.
-    const harvestBase = UNIT_STATS.harvester.speed;
-    UNIT_STATS.harvester.speed = harvestBase * speedMul;
-    updateOrders(orders, game.units, [...game.enemyUnits, ...game.enemyBuildings], gameDt);
-    stepAttackMove();
-    const ev = tickGame(game, gameDt);
-    UNIT_STATS.harvester.speed = harvestBase;
-    diffCombat(prev);
-    updateEffects(effects, gameDt);
-
-    // F701 domain events → 战报统计 / 新手引导 / 消息。
-    for (const b of ev.built) {
-      if (b.team !== 'player') continue;
-      record(stats, { type: 'buildingBuilt', building: b.kind, time: game.elapsed });
-      obEvent({ type: 'buildingDone', building: b.kind });
-    }
-    for (const k of ev.trained) {
-      record(stats, { type: 'unitTrained', unit: k, time: game.elapsed });
-      obEvent({ type: 'unitTrained', unit: k });
-    }
-    for (const d of ev.upgrades) {
-      const b = game.buildings.find((x) => x.id === d.buildingId);
-      pushMessage(msgs, `${b ? BUILDING_LABEL[b.kind] : '建筑'} 升级完成 Lv${d.level}`);
-      sfx.play('build');
-    }
-    for (const id of ev.repaired) {
-      const b = game.buildings.find((x) => x.id === id);
-      if (b) pushMessage(msgs, `${BUILDING_LABEL[b.kind]} 维修完成`);
-    }
-    // 采矿统计 = 本 tick 入账 − 出售退款（trickle 也算矿厂收益）。
-    const mined = Math.round(game.economy.earned - earned0 - sellRefunded);
-    sellRefunded = 0;
-    if (mined > 0) record(stats, { type: 'mined', amount: mined, time: game.elapsed });
-    if (enemyN0 > 0 && game.enemyUnits.length === 0 && game.ai.wave > 0) {
-      record(stats, { type: 'waveCleared', wave: game.ai.wave, time: game.elapsed });
-    }
-    // 维修因资金耗尽暂停时给提示（节流 6s），而不是静默卡住。
-    if (
-      game.repairs.jobs.some((j) => j.engineerId !== null) &&
-      game.economy.credits <= 0 &&
-      now - repairBrokeWarnT > 6000
+  // Scrub fast-forward: re-sim toward the catch-up target in a per-frame
+  // budget so intermediate commands aren't skipped, then restore the speed.
+  if (watch && watch.catchup !== undefined) {
+    const target = watch.catchup;
+    const tickDt = watch.rec.tickMs / 1000;
+    for (
+      let n = 0;
+      n < CATCHUP_STEPS && watch.player.tick <= target && game.phase === 'playing';
+      n++
     ) {
-      repairBrokeWarnT = now;
-      pushMessage(msgs, '资金不足，维修暂停');
+      simStep(tickDt, now);
     }
-    // Radar pulse: the HQ dish scans while it stands and the grid holds.
-    const hq = game.buildings.find((b) => b.kind === 'hq' && b.done);
-    radarOn = radarAvailable(!isLowPower(computePower(game.buildings)), hq !== undefined);
-    if (radarOn && hq) {
-      radar.cx = hq.x;
-      radar.cy = hq.y;
-      stepRadar(radar, gameDt, game.enemyUnits, 'player');
-    }
-    fogT += gameDt;
-    if (fogT >= FOG_REFRESH) {
-      fogT %= FOG_REFRESH;
-      refreshFog();
-    }
-    // 战役目标推进：0.2s 节流，胜负由 updateMission 判定（manualEnd 模式
-    // 下 tickGame 不再接管 phase）。
-    if (mission) {
-      missionT += gameDt;
-      if (missionT >= MISSION_TICK) {
-        const step = missionT;
-        missionT = 0;
-        missionReport = updateMission(mission, missionCtx(game), step);
-        if (missionReport.status !== 'active') endMission();
-      }
+    if (watch.player.tick > target || game.phase !== 'playing') {
+      watch.catchup = undefined;
+      watch.player.speed = REPLAY_SPEEDS[watch.speedIdx]!;
+      simQuiet = false;
+      msgs.length = 0;
     }
   }
+
+  if (gameDt > 0 && game.phase === 'playing') simStep(gameDt, now);
+
   if (game.phase !== prevPhase) {
     if (game.phase !== 'playing') {
       sfx.play(game.phase === 'won' ? 'fanfare' : 'defeat');
-      // 遭遇战才记战报/历史最佳；战役结果走 recordWin 星评，互不污染。
-      if (!mission) {
-        // 战报：结算本局、合并历史最佳并落盘，遮罩渲染 stats 的文本块。
-        record(stats, {
-          type: 'gameOver',
-          victory: game.phase === 'won',
-          elapsed: game.elapsed,
-        });
-        const store = storage();
-        const prevBest = store ? loadBest(store) : defaultBest();
-        statsBest = mergeBest(prevBest, summary(stats));
-        if (store) {
-          try {
-            saveBest(store, statsBest);
-          } catch {
-            /* storage may be unavailable */
+      // 回放结算只是重演 —— 不记战报、不上传成绩、不二次入库。
+      if (!watch) {
+        // 遭遇战才记战报/历史最佳；战役结果走 recordWin 星评，互不污染。
+        if (!mission) {
+          // 战报：结算本局、合并历史最佳并落盘，遮罩渲染 stats 的文本块。
+          record(stats, {
+            type: 'gameOver',
+            victory: game.phase === 'won',
+            elapsed: game.elapsed,
+          });
+          const store = storage();
+          const prevBest = store ? loadBest(store) : defaultBest();
+          statsBest = mergeBest(prevBest, summary(stats));
+          if (store) {
+            try {
+              saveBest(store, statsBest);
+            } catch {
+              /* storage may be unavailable */
+            }
           }
+          reportCard = [
+            ...reportLines(stats),
+            ...(statsBest.score > prevBest.score && statsBest.score > 0 ? ['★ 新纪录！'] : []),
+            ...bestLines(statsBest),
+          ];
         }
-        reportCard = [
-          ...reportLines(stats),
-          ...(statsBest.score > prevBest.score && statsBest.score > 0 ? ['★ 新纪录！'] : []),
-          ...bestLines(statsBest),
-        ];
+        saveReplayNow();
+        submitScore();
+        refreshBoard(mission ? mission.def.id : 'skirmish');
       }
       selectedBuilding = null;
     }
@@ -2481,12 +2973,28 @@ function frame(now: number): void {
     pressed: pressedAction,
   });
   drawPaused();
-  drawBanner();
+  if (!watch) drawBanner();
+  if (watch) {
+    const l = replayBarLayout(viewW, viewH);
+    const total = watch.totalTicks;
+    const cur = Math.min(watch.player.tick, total);
+    const catching = watch.catchup !== undefined;
+    drawReplayBar(ctx, l, {
+      playing: !watch.paused && !catching && game.phase === 'playing',
+      speed: REPLAY_SPEEDS[watch.speedIdx]!,
+      frac: scrubbing ? scrubFrac : cur / total,
+      timeText: catching
+        ? `快进中 ${fmtClock((cur * watch.rec.tickMs) / 1000)}`
+        : `${fmtClock((cur * watch.rec.tickMs) / 1000)} / ${fmtClock((total * watch.rec.tickMs) / 1000)}`,
+      mismatch: watch.mismatch,
+      hover: replayBarHit(l, mouse.x, mouse.y),
+    });
+  }
   drawTapRings(now);
   if (touchMenu) drawTouchMenu(ctx, touchMenu, pressedMenu);
-  if (guideStep >= 0) drawTouchGuide(ctx, viewW, viewH, guideStep);
+  if (guideStep >= 0 && !watch) drawTouchGuide(ctx, viewW, viewH, guideStep);
   if (hotkeyCard) drawHotkeyCard(ctx, viewW, viewH, commandCard('game', commandState()));
-  if (isTouch && now < hintUntil) {
+  if (isTouch && !watch && now < hintUntil) {
     drawTouchHint(ctx, lay, TOUCH_HINT, Math.min(1, (hintUntil - now) / 600));
   }
 

@@ -131,9 +131,10 @@ function menuLayout(viewW, viewH) {
       rect: { x: cx - bw / 2 + i * (dw + DIFF_GAP), y: top, w: dw, h: DIFF_H }
     })),
     campaign: { x: cx - bw / 2 + half + DIFF_GAP, y: y0, w: half, h: bh },
+    replay: { x: cx - bw / 2, y: y0 + 2 * (bh + BTN_GAP), w: half, h: bh },
     buttons: ids.map((id, i) => ({
       id,
-      rect: id === "start" ? { x: cx - bw / 2, y: y0, w: half, h: bh } : { x: cx - bw / 2, y: y0 + i * (bh + BTN_GAP), w: bw, h: bh }
+      rect: id === "start" ? { x: cx - bw / 2, y: y0, w: half, h: bh } : id === "settings" ? { x: cx - bw / 2 + half + DIFF_GAP, y: y0 + i * (bh + BTN_GAP), w: half, h: bh } : { x: cx - bw / 2, y: y0 + i * (bh + BTN_GAP), w: bw, h: bh }
     }))
   };
 }
@@ -142,6 +143,7 @@ function menuHit(l, x, y) {
     if (inRect(b.rect, x, y)) return { kind: "button", id: b.id };
   }
   if (inRect(l.campaign, x, y)) return { kind: "button", id: "campaign" };
+  if (inRect(l.replay, x, y)) return { kind: "button", id: "replay" };
   for (const d of l.difficulty) {
     if (inRect(d.rect, x, y)) return { kind: "difficulty", difficulty: d.d };
   }
