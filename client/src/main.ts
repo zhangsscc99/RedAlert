@@ -2,26 +2,57 @@
 
 import {
   BUILDING_DEFS,
+  TILE_SIZE,
   UNIT_RADIUS,
+  UNIT_STATS,
+  applyEdgePan,
+  attack,
+  assignGroup,
   buildAt,
+  buildingAt,
+  buildingSource,
   canBuildAt,
   clampToMap,
   commandMove,
   createCamera,
+  createFog,
   createGame,
+  edgePanVelocity,
+  effectsFromCombatEvents,
+  filterVisibleEnemies,
+  findPath,
+  guard,
+  isExplored,
   normRect,
   panBy,
   restart,
   screenToWorld,
+  selectGroup,
   selectUnits,
+  snapToPassable,
+  spawnDamageText,
+  spawnExplosion,
+  stop,
   tickGame,
+  tileCenter,
   trainUnit,
   unitAt,
   unitsInRect,
+  unitSource,
+  updateEffects,
+  updateFog,
+  updateOrders,
   worldToTile,
   zoomAt,
   type BuildingKind,
+  type Effect,
+  type Fog,
+  type GBuilding,
+  type GUnit,
+  type Order,
   type Point,
+  type PositionedCombatEvent,
+  type Targetable,
   type UnitKind,
 } from './game/index.ts';
 import { drawTerrain, prerenderMap } from './render/terrain.js';
@@ -31,18 +62,27 @@ import {
   drawPlacementPreview,
   drawUnitsColored,
 } from './render/buildings.js';
+import { drawEffects } from './render/effects.js';
+import { bakeFog, createFogLayer, drawFog, type FogLayer } from './render/fog.js';
 import {
+  buildBarHit,
+  drawBuildBar,
   drawHud,
   drawMessages,
   drawMinimap,
   drawSelectBox,
   minimapToWorld,
   pushMessage,
+  type BuildBarItem,
   type HudMessage,
+  type ProductionItem,
 } from './render/hud.js';
 
 const MAP_SEED = 1337;
 const CLICK_DRAG_THRESHOLD = 5; // screen px
+const FOG_REFRESH = 0.2; // seconds between fog rebuilds
+const EDGE_PAN_MARGIN = 24; // screen px from an edge that auto-scrolls
+const SPEEDS = [1, 2, 3] as const;
 
 const canvas = document.getElementById('game') as HTMLCanvasElement;
 const ctx = canvas.getContext('2d')!;
@@ -50,11 +90,23 @@ const ctx = canvas.getContext('2d')!;
 let game = createGame(MAP_SEED);
 let map = game.map;
 let mapCanvas = prerenderMap(map);
+let fog: Fog = createFog(map);
+let fogLayer: FogLayer = createFogLayer(fog);
+let fogT = 0;
 
 let viewW = 0;
 let viewH = 0;
 let dpr = 1;
 const camera = createCamera(map, window.innerWidth, window.innerHeight);
+
+const effects: Effect[] = [];
+const orders: Order[] = [];
+const groups = new Map<number, number[]>();
+/** Attack-move bookkeeping: unit id -> destination (world px). */
+const attackMove = new Map<number, Point>();
+
+let paused = false;
+let speedIdx = 0;
 
 function resize(): void {
   dpr = window.devicePixelRatio || 1;
@@ -81,6 +133,7 @@ let dragMode: DragMode = 'none';
 let dragStart: Point = { x: 0, y: 0 }; // screen coords
 let dragPrev: Point = { x: 0, y: 0 };
 let mouse: Point = { x: 0, y: 0 };
+let mouseInside = false;
 let moveMarker: { x: number; y: number; t: number } | null = null;
 let pendingBuild: BuildingKind | null = null;
 const msgs: HudMessage[] = [];
@@ -91,12 +144,287 @@ function canvasPos(e: PointerEvent | WheelEvent): Point {
   return { x: e.clientX - r.left, y: e.clientY - r.top };
 }
 
+// --------------------------------------------------------------- helpers ---
+
+interface BarDef {
+  id: string;
+  label: string;
+  hotkey?: string;
+  kind: UnitKind | BuildingKind;
+  cost: number;
+}
+
+const BAR_DEFS: BarDef[] = [
+  { id: 'infantry', label: '步兵', hotkey: 'Q', kind: 'infantry', cost: UNIT_STATS.infantry.cost },
+  { id: 'tank', label: '坦克', hotkey: 'W', kind: 'tank', cost: UNIT_STATS.tank.cost },
+  { id: 'harvester', label: '矿车', hotkey: 'E', kind: 'harvester', cost: UNIT_STATS.harvester.cost },
+  { id: 'barracks', label: '兵营', hotkey: 'B', kind: 'barracks', cost: BUILDING_DEFS.barracks.cost },
+  { id: 'refinery', label: '矿厂', hotkey: 'R', kind: 'refinery', cost: BUILDING_DEFS.refinery.cost },
+  { id: 'power', label: '电厂', kind: 'power', cost: BUILDING_DEFS.power.cost },
+];
+
+const UNIT_KINDS: readonly string[] = ['infantry', 'tank', 'harvester'];
+
+function barItems(): BuildBarItem[] {
+  const rax = game.buildings.some((b) => b.kind === 'barracks' && b.done);
+  const credits = game.economy.credits;
+  return BAR_DEFS.map((d) => {
+    const isUnit = UNIT_KINDS.includes(d.kind);
+    const reason = isUnit && !rax ? '需要兵营' : credits < d.cost ? '资金不足' : undefined;
+    return {
+      id: d.id,
+      label: d.label,
+      hotkey: d.hotkey,
+      cost: d.cost,
+      enabled: reason === undefined,
+      reason,
+      active: !isUnit && pendingBuild === d.kind,
+    };
+  });
+}
+
+function activateBarItem(i: number): void {
+  const d = BAR_DEFS[i];
+  if (!d) return;
+  const item = barItems()[i]!;
+  if (!item.enabled) {
+    pushMessage(msgs, `${d.label}: ${item.reason ?? '无法执行'}`);
+    return;
+  }
+  if (UNIT_KINDS.includes(d.kind)) tryTrain(d.kind as UnitKind);
+  else pendingBuild = pendingBuild === d.kind ? null : (d.kind as BuildingKind);
+}
+
+function refreshFog(): void {
+  updateFog(fog, map, [
+    ...game.units.map(unitSource),
+    ...game.buildings.filter((b) => b.done).map(buildingSource),
+  ]);
+  bakeFog(fog, fogLayer);
+}
+
+function selectedIds(): Set<number> {
+  return new Set(game.units.filter((u) => u.selected).map((u) => u.id));
+}
+
+function dropOrdersFor(ids: Set<number>): void {
+  for (let i = orders.length - 1; i >= 0; i--) {
+    if (ids.has(orders[i]!.unitId)) orders.splice(i, 1);
+  }
+}
+
+/** Selected units whose current path ends at (x,y) — i.e. took the last order. */
+function movedToward(x: number, y: number): Set<number> {
+  const ids = new Set<number>();
+  for (const u of game.units) {
+    if (!u.selected) continue;
+    const last = u.path[u.path.length - 1];
+    if (last && Math.abs(last.x - x) < 1 && Math.abs(last.y - y) < 1) ids.add(u.id);
+  }
+  return ids;
+}
+
+function issueAttack(target: Targetable): void {
+  const sel = selectedIds();
+  if (sel.size === 0) return;
+  dropOrdersFor(sel);
+  for (const id of sel) attackMove.delete(id);
+  const made = attack(game.units, target);
+  if (made.length === 0) return;
+  orders.push(...made);
+  moveMarker = { x: target.x, y: target.y, t: performance.now() };
+}
+
+function issueAttackMove(w: Point): void {
+  const goal = snapToPassable(map, worldToTile(w.x), worldToTile(w.y));
+  if (!goal) return;
+  if (commandMove(game.units, map, goal.x, goal.y) === 0) return;
+  const dest = { x: tileCenter(goal.x), y: tileCenter(goal.y) };
+  const moved = movedToward(dest.x, dest.y);
+  dropOrdersFor(moved);
+  for (const id of moved) attackMove.set(id, dest);
+  moveMarker = { x: dest.x, y: dest.y, t: performance.now() };
+}
+
+function issueMove(w: Point): void {
+  const goal = snapToPassable(map, worldToTile(w.x), worldToTile(w.y));
+  if (!goal) return;
+  if (commandMove(game.units, map, goal.x, goal.y) === 0) return;
+  const dest = { x: tileCenter(goal.x), y: tileCenter(goal.y) };
+  const moved = movedToward(dest.x, dest.y);
+  dropOrdersFor(moved);
+  for (const id of moved) attackMove.delete(id);
+  moveMarker = { x: w.x, y: w.y, t: performance.now() };
+}
+
+function stopSelected(): void {
+  const sel = game.units.filter((u) => u.selected);
+  if (sel.length === 0) return;
+  stop(sel, orders);
+  for (const u of sel) attackMove.delete(u.id);
+}
+
+function guardSelected(): void {
+  const sel = selectedIds();
+  if (sel.size === 0) return;
+  dropOrdersFor(sel);
+  for (const id of sel) attackMove.delete(id);
+  for (const u of game.units) orders.push(...guard([u], { x: u.x, y: u.y }));
+}
+
+/** Re-path a single unit toward a tile, ignoring selection state. */
+function repath(u: GUnit, tx: number, ty: number): void {
+  const goal = snapToPassable(map, tx, ty);
+  if (!goal) return;
+  const p = findPath(map, worldToTile(u.x), worldToTile(u.y), goal.x, goal.y);
+  if (p) u.path = p.map((t) => ({ x: tileCenter(t.x), y: tileCenter(t.y) }));
+}
+
+/**
+ * Attack-move upkeep: advance toward the destination, but halt and let
+ * stepCombat fire whenever an enemy is inside weapon range. Resume the
+ * march once the area is clear; drop the marker on arrival or death.
+ */
+function stepAttackMove(): void {
+  if (attackMove.size === 0) return;
+  const foes: Targetable[] = [...game.enemyUnits, ...game.enemyBuildings];
+  for (const [id, dest] of attackMove) {
+    const u = game.units.find((x) => x.id === id);
+    if (!u || u.hp <= 0) {
+      attackMove.delete(id);
+      continue;
+    }
+    if (Math.hypot(dest.x - u.x, dest.y - u.y) <= TILE_SIZE * 0.5) {
+      attackMove.delete(id);
+      continue;
+    }
+    let nearest: Targetable | null = null;
+    let bestD = Infinity;
+    if (u.range > 0) {
+      for (const f of foes) {
+        if (f.hp <= 0) continue;
+        const d = Math.hypot(f.x - u.x, f.y - u.y);
+        if (d < bestD) {
+          bestD = d;
+          nearest = f;
+        }
+      }
+    }
+    if (nearest && bestD <= u.range) {
+      u.path = [];
+      u.angle = Math.atan2(nearest.y - u.y, nearest.x - u.x);
+      continue;
+    }
+    if (u.path.length === 0) repath(u, worldToTile(dest.x), worldToTile(dest.y));
+  }
+}
+
+// --------------------------------------------------------- combat diff -----
+
+interface CombatSnap {
+  hp: number;
+  x: number;
+  y: number;
+  team: 'player' | 'enemy';
+  cooldown: number;
+  range: number;
+  r: number; // body radius, world px
+}
+
+function combatants(): (GUnit | GBuilding)[] {
+  return [...game.units, ...game.enemyUnits, ...game.buildings, ...game.enemyBuildings];
+}
+
+function combatRadius(c: GUnit | GBuilding): number {
+  if ('gx' in c) {
+    const d = BUILDING_DEFS[c.kind];
+    return (Math.max(d.w, d.h) * TILE_SIZE) / 2;
+  }
+  return UNIT_STATS[c.kind].radius;
+}
+
+function snapshotCombat(): Map<number, CombatSnap> {
+  const m = new Map<number, CombatSnap>();
+  for (const c of combatants()) {
+    m.set(c.id, {
+      hp: c.hp,
+      x: c.x,
+      y: c.y,
+      team: c.team,
+      cooldown: c.cooldown,
+      range: c.range,
+      r: combatRadius(c),
+    });
+  }
+  return m;
+}
+
+/**
+ * tickGame doesn't emit combat events, so reconstruct them: a cooldown that
+ * went back up means that combatant fired this tick; attribute each hp drop
+ * to the nearest such enemy in range and emit hit/death effects.
+ */
+function diffCombat(prev: Map<number, CombatSnap>): void {
+  const now = combatants();
+  const nowIds = new Set(now.map((c) => c.id));
+
+  const fired = now.filter((c) => {
+    const p = prev.get(c.id);
+    return p !== undefined && c.cooldown > p.cooldown;
+  });
+
+  const events: PositionedCombatEvent[] = [];
+  for (const c of now) {
+    const p = prev.get(c.id);
+    if (!p || c.hp >= p.hp) continue;
+    const dmg = p.hp - c.hp;
+    let shooter: (GUnit | GBuilding) | null = null;
+    let bestD = Infinity;
+    for (const f of fired) {
+      if (f.team === c.team) continue;
+      const d = Math.hypot(f.x - c.x, f.y - c.y);
+      if (d <= f.range + TILE_SIZE && d < bestD) {
+        bestD = d;
+        shooter = f;
+      }
+    }
+    if (shooter) {
+      events.push({
+        type: 'hit',
+        from: shooter.id,
+        to: c.id,
+        damage: dmg,
+        x: c.x,
+        y: c.y,
+        fromX: shooter.x,
+        fromY: shooter.y,
+      });
+    } else {
+      spawnDamageText(effects, c.x, c.y, dmg);
+    }
+  }
+  for (const [id, p] of prev) {
+    if (!nowIds.has(id)) spawnExplosion(effects, p.x, p.y, Math.max(16, p.r * 2));
+  }
+  effectsFromCombatEvents(events, effects);
+}
+
 function resetGame(): void {
   game = restart(game);
   map = game.map;
   mapCanvas = prerenderMap(map);
   pendingBuild = null;
   msgs.length = 0;
+  effects.length = 0;
+  orders.length = 0;
+  attackMove.clear();
+  groups.clear();
+  paused = false;
+  speedIdx = 0;
+  fogT = 0;
+  fog = createFog(map);
+  fogLayer = createFogLayer(fog);
+  refreshFog();
 }
 
 /** Footprint top-left tile so the ghost stays centered under the cursor. */
@@ -135,6 +463,22 @@ canvas.addEventListener('pointerdown', (e) => {
   const p = canvasPos(e);
   dragStart = p;
   dragPrev = p;
+
+  // HUD build bar swallows clicks before anything else.
+  const bi = buildBarHit(viewW, viewH, BAR_DEFS.length, p.x, p.y);
+  if (bi >= 0) {
+    if (e.button === 0) activateBarItem(bi);
+    dragMode = 'none';
+    return;
+  }
+
+  // A + left click = attack-move (works on the minimap too).
+  if (e.button === 0 && keys.has('a') && !pendingBuild) {
+    const w = minimapToWorld(map, viewW, viewH, p.x, p.y) ?? screenToWorld(camera, p.x, p.y);
+    issueAttackMove(w);
+    dragMode = 'none';
+    return;
+  }
 
   // Placement mode: left = build here, right = cancel. Minimap still works.
   if (pendingBuild) {
@@ -178,6 +522,7 @@ canvas.addEventListener('pointerdown', (e) => {
 canvas.addEventListener('pointermove', (e) => {
   const p = canvasPos(e);
   mouse = p;
+  mouseInside = true;
   const dx = p.x - dragPrev.x;
   const dy = p.y - dragPrev.y;
   const moved = Math.hypot(p.x - dragStart.x, p.y - dragStart.y);
@@ -210,15 +555,27 @@ canvas.addEventListener('pointerup', (e) => {
     selectUnits(units, unitAt(units, w, (UNIT_RADIUS + 4) / camera.zoom), additive);
   } else if (dragMode === 'maybeOrder') {
     const w = screenToWorld(camera, p.x, p.y);
-    if (commandMove(units, map, worldToTile(w.x), worldToTile(w.y)) > 0) {
-      moveMarker = { x: w.x, y: w.y, t: performance.now() };
+    // Right-click a visible enemy to focus fire; empty ground stays "move".
+    const eu = unitAt(filterVisibleEnemies(fog, game.enemyUnits), w, (UNIT_RADIUS + 6) / camera.zoom);
+    let target: Targetable | null = eu;
+    if (!target) {
+      const b = buildingAt(game.enemyBuildings, worldToTile(w.x), worldToTile(w.y)) as GBuilding | null;
+      if (b) {
+        const d = BUILDING_DEFS[b.kind];
+        if (isExplored(fog, b.gx + (d.w >> 1), b.gy + (d.h >> 1))) target = b;
+      }
     }
+    if (target) issueAttack(target);
+    else issueMove(w);
   }
   dragMode = 'none';
 });
 
 canvas.addEventListener('pointercancel', () => {
   dragMode = 'none';
+});
+canvas.addEventListener('pointerleave', () => {
+  mouseInside = false;
 });
 
 canvas.addEventListener(
@@ -239,23 +596,72 @@ window.addEventListener('keydown', (e) => {
     if (k === 'enter' || k === 'r') resetGame();
     return;
   }
-  if (k === 'b') pendingBuild = 'barracks';
-  else if (k === 'r') pendingBuild = 'refinery';
-  else if (k === 'escape') pendingBuild = null;
-  else if (k === '1') tryTrain('infantry');
-  else if (k === '2') tryTrain('tank');
+  if (k === ' ') {
+    paused = !paused;
+    e.preventDefault();
+    return;
+  }
+  if (k === '+' || k === '=') {
+    speedIdx = Math.min(SPEEDS.length - 1, speedIdx + 1);
+    return;
+  }
+  if (k === '-' || k === '_') {
+    speedIdx = Math.max(0, speedIdx - 1);
+    return;
+  }
+  if (k === 'escape') {
+    pendingBuild = null;
+    return;
+  }
+  if (/^[1-9]$/.test(k)) {
+    const n = Number(k);
+    if (e.ctrlKey || e.metaKey) {
+      if (assignGroup(groups, n, game.units)) pushMessage(msgs, `编队 ${n} 已保存`);
+      e.preventDefault();
+    } else {
+      const picked = selectGroup(groups, n, game.units);
+      if (picked.length > 0) pushMessage(msgs, `编队 ${n}（${picked.length} 单位）`);
+    }
+    return;
+  }
+  switch (k) {
+    case 'b':
+      pendingBuild = 'barracks';
+      break;
+    case 'r':
+      pendingBuild = 'refinery';
+      break;
+    case 'q':
+      tryTrain('infantry');
+      break;
+    case 'w':
+      tryTrain('tank');
+      break;
+    case 'e':
+      tryTrain('harvester');
+      break;
+    case 's':
+      stopSelected();
+      break;
+    case 'g':
+      guardSelected();
+      break;
+  }
 });
 window.addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
-window.addEventListener('blur', () => keys.clear());
+window.addEventListener('blur', () => {
+  keys.clear();
+  mouseInside = false;
+});
 
 function applyKeyPan(dt: number): void {
   const v = 600 * dt; // screen px per second
   let dx = 0;
   let dy = 0;
-  if (keys.has('arrowleft') || keys.has('a')) dx += v;
-  if (keys.has('arrowright') || keys.has('d')) dx -= v;
-  if (keys.has('arrowup') || keys.has('w')) dy += v;
-  if (keys.has('arrowdown') || keys.has('s')) dy -= v;
+  if (keys.has('arrowleft')) dx += v;
+  if (keys.has('arrowright')) dx -= v;
+  if (keys.has('arrowup')) dy += v;
+  if (keys.has('arrowdown')) dy -= v;
   if (dx || dy) panBy(camera, dx, dy);
 }
 
@@ -283,7 +689,8 @@ function drawMoveMarker(now: number): void {
 
 function drawTimer(): void {
   const t = Math.floor(game.elapsed);
-  const text = `T+ ${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
+  const tag = paused ? '  PAUSED' : SPEEDS[speedIdx]! > 1 ? `  ×${SPEEDS[speedIdx]}` : '';
+  const text = `T+ ${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}${tag}`;
   ctx.font = 'bold 13px ui-monospace, Menlo, Consolas, monospace';
   const w = ctx.measureText(text).width + 20;
   const x = viewW - w - 12;
@@ -292,9 +699,29 @@ function drawTimer(): void {
   ctx.strokeStyle = 'rgba(93, 255, 93, 0.35)';
   ctx.lineWidth = 1;
   ctx.strokeRect(x + 0.5, 10.5, w - 1, 25);
-  ctx.fillStyle = '#cfe8c9';
+  ctx.fillStyle = paused ? '#ffd94d' : '#cfe8c9';
   ctx.textBaseline = 'middle';
   ctx.fillText(text, x + 10, 23.5);
+  ctx.textBaseline = 'alphabetic';
+}
+
+function drawPaused(): void {
+  if (!paused || game.phase !== 'playing') return;
+  ctx.font = 'bold 26px ui-monospace, Menlo, Consolas, monospace';
+  const text = '‖ PAUSED';
+  const w = ctx.measureText(text).width + 48;
+  const x = (viewW - w) / 2;
+  const y = 48;
+  ctx.fillStyle = 'rgba(10, 14, 8, 0.78)';
+  ctx.fillRect(x, y, w, 48);
+  ctx.strokeStyle = 'rgba(255, 217, 77, 0.55)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x + 0.5, y + 0.5, w - 1, 47);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ffd94d';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, viewW / 2, y + 25);
+  ctx.textAlign = 'left';
   ctx.textBaseline = 'alphabetic';
 }
 
@@ -313,27 +740,74 @@ function drawBanner(): void {
   ctx.textAlign = 'left';
 }
 
+function productionItems(): ProductionItem[] {
+  const items: ProductionItem[] = [];
+  for (const q of game.queue) {
+    const label = BAR_DEFS.find((d) => d.id === q.key)?.label ?? q.key;
+    const top = items[items.length - 1];
+    if (top && top.label === label) {
+      top.count = (top.count ?? 1) + 1;
+    } else {
+      items.push({
+        label,
+        progress: q.buildTime > 0 ? q.elapsed / q.buildTime : 0,
+        count: 1,
+        ready: q.elapsed >= q.buildTime,
+      });
+    }
+  }
+  return items;
+}
+
 let last = performance.now();
 function frame(now: number): void {
   const dt = Math.min((now - last) / 1000, 0.05);
   last = now;
+  const gameDt = paused ? 0 : dt * SPEEDS[speedIdx]!;
 
   applyKeyPan(dt);
+  if (mouseInside && dragMode !== 'panMiddle' && dragMode !== 'panRight') {
+    const vel = edgePanVelocity(mouse, viewW, viewH, EDGE_PAN_MARGIN);
+    if (vel.x !== 0 || vel.y !== 0) applyEdgePan(camera, vel, dt);
+  }
   clampToMap(camera, map, viewW, viewH);
-  tickGame(game, dt);
+
+  if (gameDt > 0 && game.phase === 'playing') {
+    const prev = snapshotCombat();
+    updateOrders(orders, game.units, [...game.enemyUnits, ...game.enemyBuildings], gameDt);
+    stepAttackMove();
+    tickGame(game, gameDt);
+    diffCombat(prev);
+    updateEffects(effects, gameDt);
+    fogT += gameDt;
+    if (fogT >= FOG_REFRESH) {
+      fogT %= FOG_REFRESH;
+      refreshFog();
+    }
+  }
   for (const m of msgs) m.ttl -= dt;
   while (msgs.length > 0 && msgs[0]!.ttl <= 0) msgs.shift();
+
+  canvas.style.cursor = keys.has('a') ? 'crosshair' : 'default';
 
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = '#0b0e0a';
   ctx.fillRect(0, 0, viewW, viewH);
 
+  const seenEnemyBuildings = game.enemyBuildings.filter((b) => {
+    const d = BUILDING_DEFS[b.kind];
+    return isExplored(fog, b.gx + (d.w >> 1), b.gy + (d.h >> 1));
+  });
+  const visibleEnemies = filterVisibleEnemies(fog, game.enemyUnits);
+
   drawTerrain(ctx, camera, mapCanvas, viewW, viewH);
-  drawBuildings(ctx, camera, game.enemyBuildings);
+  drawBuildings(ctx, camera, seenEnemyBuildings);
   drawBuildings(ctx, camera, game.buildings);
+  drawEffects(ctx, camera, effects);
+  drawFog(ctx, camera, fogLayer, viewW, viewH);
   drawMoveMarker(now);
   drawUnits(ctx, camera, game.units);
-  drawUnitsColored(ctx, camera, game.enemyUnits, '#e8765a', '#5a2018');
+  drawUnitsColored(ctx, camera, visibleEnemies, '#e8765a', '#5a2018');
 
   if (pendingBuild) {
     const g = ghostAnchor(mouse);
@@ -358,12 +832,16 @@ function frame(now: number): void {
       buildings: game.buildings.length,
     },
     viewW,
+    { viewH, production: productionItems() },
   );
+  drawBuildBar(ctx, viewW, viewH, barItems());
   drawTimer();
   drawMessages(ctx, msgs, viewW, viewH);
-  drawMinimap(ctx, map, camera, [...game.units, ...game.enemyUnits], viewW, viewH);
+  drawMinimap(ctx, map, camera, game.units, viewW, viewH, visibleEnemies, fog);
+  drawPaused();
   drawBanner();
 
   requestAnimationFrame(frame);
 }
+refreshFog();
 requestAnimationFrame(frame);

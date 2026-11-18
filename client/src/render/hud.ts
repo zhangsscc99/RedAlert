@@ -3,7 +3,9 @@
 import {
   GRASS,
   TILE_SIZE,
+  isExplored,
   type Camera,
+  type Fog,
   type GameMap,
   type Rect,
   type Unit,
@@ -362,6 +364,8 @@ export function drawMinimap(
   units: readonly Unit[],
   viewW: number,
   viewH: number,
+  enemies: readonly Unit[] = [],
+  fog?: Fog,
 ): void {
   const r = minimapRect(viewW, viewH);
   const sx = r.w / (map.w * TILE_SIZE);
@@ -373,7 +377,11 @@ export function drawMinimap(
   for (let ty = 0; ty < map.h; ty++) {
     for (let tx = 0; tx < map.w; tx++) {
       ctx.fillStyle =
-        map.tiles[ty * map.w + tx] === GRASS ? '#3e7f30' : '#1a4882';
+        fog && !isExplored(fog, tx, ty)
+          ? '#0b0e0a'
+          : map.tiles[ty * map.w + tx] === GRASS
+            ? '#3e7f30'
+            : '#1a4882';
       ctx.fillRect(
         r.x + tx * TILE_SIZE * sx,
         r.y + ty * TILE_SIZE * sy,
@@ -385,6 +393,10 @@ export function drawMinimap(
 
   for (const u of units) {
     ctx.fillStyle = u.selected ? '#5dff5d' : '#ffe08a';
+    ctx.fillRect(r.x + u.x * sx - 1.5, r.y + u.y * sy - 1.5, 3, 3);
+  }
+  for (const u of enemies) {
+    ctx.fillStyle = '#ff6b5d';
     ctx.fillRect(r.x + u.x * sx - 1.5, r.y + u.y * sy - 1.5, 3, 3);
   }
 
@@ -400,6 +412,98 @@ export function drawMinimap(
 
   ctx.strokeStyle = 'rgba(255,255,255,0.4)';
   ctx.strokeRect(r.x - 2.5, r.y - 2.5, r.w + 5, r.h + 5);
+}
+
+// ----------------------------------------------------------- build bar ----
+
+/** 底栏按钮项：单位生产或建筑放置。enabled=false 时 reason 说明原因。 */
+export interface BuildBarItem {
+  id: string;
+  label: string;
+  hotkey?: string;
+  cost: number;
+  enabled: boolean;
+  reason?: string;
+  /** 放置模式进行中（建筑按钮被激活）。 */
+  active?: boolean;
+}
+
+const BAR_BTN_W = 76;
+const BAR_BTN_H = 54;
+const BAR_GAP = 6;
+const BAR_PAD = 8;
+const BAR_BOTTOM = 8;
+
+/** Bottom-centered rect covering the whole bar with `count` buttons. */
+export function buildBarRect(viewW: number, viewH: number, count: number): Rect {
+  const w = BAR_PAD * 2 + count * BAR_BTN_W + Math.max(0, count - 1) * BAR_GAP;
+  const h = BAR_PAD * 2 + BAR_BTN_H;
+  return { x: (viewW - w) / 2, y: viewH - h - BAR_BOTTOM, w, h };
+}
+
+/** Index of the bar button at (px,py), or -1. */
+export function buildBarHit(
+  viewW: number,
+  viewH: number,
+  count: number,
+  px: number,
+  py: number,
+): number {
+  const r = buildBarRect(viewW, viewH, count);
+  if (px < r.x || px > r.x + r.w || py < r.y || py > r.y + r.h) return -1;
+  const i = Math.floor((px - r.x - BAR_PAD) / (BAR_BTN_W + BAR_GAP));
+  if (i < 0 || i >= count) return -1;
+  const bx = r.x + BAR_PAD + i * (BAR_BTN_W + BAR_GAP);
+  return px <= bx + BAR_BTN_W ? i : -1;
+}
+
+/** 底栏生产/建造按钮：名称 + 快捷键 + 造价，禁用时显示原因。 */
+export function drawBuildBar(
+  ctx: CanvasRenderingContext2D,
+  viewW: number,
+  viewH: number,
+  items: readonly BuildBarItem[],
+): void {
+  if (items.length === 0) return;
+  const r = buildBarRect(viewW, viewH, items.length);
+  panel(ctx, r.x, r.y, r.w, r.h);
+
+  items.forEach((it, i) => {
+    const x = r.x + BAR_PAD + i * (BAR_BTN_W + BAR_GAP);
+    const y = r.y + BAR_PAD;
+    const dim = !it.enabled;
+
+    ctx.fillStyle = it.active
+      ? 'rgba(93, 255, 93, 0.14)'
+      : dim
+        ? 'rgba(255,255,255,0.03)'
+        : 'rgba(255,255,255,0.07)';
+    ctx.fillRect(x, y, BAR_BTN_W, BAR_BTN_H);
+    ctx.strokeStyle = it.active ? ACCENT : 'rgba(255,255,255,0.18)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x + 0.5, y + 0.5, BAR_BTN_W - 1, BAR_BTN_H - 1);
+
+    const text = dim ? TEXT_DIM : TEXT_MAIN;
+    ctx.textBaseline = 'alphabetic';
+    ctx.font = 'bold 12px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillStyle = text;
+    ctx.fillText(it.label, x + 6, y + 15);
+    if (it.hotkey) {
+      ctx.font = '10px ui-monospace, Menlo, Consolas, monospace';
+      ctx.fillStyle = dim ? TEXT_DIM : ACCENT;
+      ctx.textAlign = 'right';
+      ctx.fillText(it.hotkey, x + BAR_BTN_W - 5, y + 13);
+      ctx.textAlign = 'left';
+    }
+
+    ctx.font = '11px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillStyle = dim ? TEXT_DIM : WARN;
+    ctx.fillText(`$${it.cost}`, x + 6, y + 31);
+
+    ctx.font = '9px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillStyle = BAD;
+    if (!it.enabled && it.reason) ctx.fillText(it.reason, x + 6, y + 46);
+  });
 }
 
 /** World coords for a click inside the minimap rect, or null if outside. */
