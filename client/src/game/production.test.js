@@ -90,9 +90,68 @@ var UNIT_STATS = {
 var UNIT_RADIUS = UNIT_STATS.infantry.radius;
 var INFANTRY_SPEED = UNIT_STATS.infantry.speed;
 
+// src/game/upgrades.ts
+var stock = (effect) => ({
+  level: 1,
+  label: "\u57FA\u7840",
+  cost: 0,
+  time: 0,
+  effect,
+  multiplier: 1,
+  needsPower: false
+});
+var UPGRADE_TABLE = {
+  hq: {
+    1: stock("armor"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 800, time: 15, effect: "armor", multiplier: 1.25, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 1500, time: 25, effect: "armor", multiplier: 1.5, needsPower: true }
+  },
+  barracks: {
+    1: stock("production"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 300, time: 12, effect: "production", multiplier: 1.25, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 600, time: 20, effect: "production", multiplier: 1.5, needsPower: true }
+  },
+  refinery: {
+    1: stock("production"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 1e3, time: 18, effect: "production", multiplier: 1.5, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 2e3, time: 30, effect: "production", multiplier: 2, needsPower: true }
+  },
+  power: {
+    1: stock("production"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 200, time: 8, effect: "production", multiplier: 1.5, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 400, time: 15, effect: "production", multiplier: 2, needsPower: true }
+  },
+  turret: {
+    1: stock("range"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 400, time: 12, effect: "range", multiplier: 1.25, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 800, time: 20, effect: "range", multiplier: 1.5, needsPower: true }
+  },
+  wall: {
+    1: stock("armor"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 50, time: 4, effect: "armor", multiplier: 1.5, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 100, time: 8, effect: "armor", multiplier: 2, needsPower: true }
+  }
+};
+function nextLevel(level) {
+  return level === 1 ? 2 : level === 2 ? 3 : null;
+}
+function canUpgrade(b, level, credits, powered) {
+  if (!b.done) return { ok: false, reason: "not-done" };
+  const next = nextLevel(level);
+  if (next === null) return { ok: false, reason: "max-level" };
+  const tier = UPGRADE_TABLE[b.kind][next];
+  if (tier.needsPower && !powered) return { ok: false, reason: "no-power" };
+  if (credits < tier.cost) return { ok: false, reason: "funds" };
+  return { ok: true };
+}
+
 // src/game/production.ts
 var PARALLEL_PER_BARRACKS = 1;
 var CANCEL_REFUND_RATIO = 0.5;
+function refundFor(cost, elapsed, buildTime) {
+  const progress = buildTime > 0 ? Math.min(1, Math.max(0, elapsed / buildTime)) : 0;
+  return Math.round(cost * (1 - progress));
+}
 function overlapsPending(c, kind, gx, gy) {
   const a = BUILDING_DEFS[c.kind];
   const b = BUILDING_DEFS[kind];
@@ -130,7 +189,7 @@ function tickConstruction(list, dt, buildings, nextId) {
 function cancelConstruction(list, e, index) {
   if (index < 0 || index >= list.length) return false;
   const [c] = list.splice(index, 1);
-  credit(e, Math.round(c.cost * CANCEL_REFUND_RATIO));
+  credit(e, Math.round(c.cost * (1 - Math.min(1, Math.max(0, c.progress)))));
   return true;
 }
 function createUnitQueue() {
@@ -138,40 +197,120 @@ function createUnitQueue() {
 }
 function enqueueUnit(q, e, kind) {
   const s = UNIT_STATS[kind];
-  const order = { key: kind, kind, cost: s.cost, buildTime: s.buildTime, elapsed: 0 };
+  const order = {
+    type: "unit",
+    key: kind,
+    kind,
+    cost: s.cost,
+    buildTime: s.buildTime,
+    elapsed: 0
+  };
   return enqueue(q, e, order);
+}
+function enqueueUnitTo(q, e, kind, barracksId, rally) {
+  const s = UNIT_STATS[kind];
+  const order = {
+    type: "unit",
+    key: kind,
+    kind,
+    cost: s.cost,
+    buildTime: s.buildTime,
+    elapsed: 0,
+    barracksId
+  };
+  const p = rally?.get(barracksId);
+  if (p) order.rally = { x: p.x, y: p.y };
+  return enqueue(q, e, order);
+}
+function createRallyPoints() {
+  return /* @__PURE__ */ new Map();
+}
+function setRallyPoint(rally, q, barracksId, to) {
+  rally.set(barracksId, { x: to.x, y: to.y });
+  for (const o of q) {
+    if (o.type === "unit" && o.barracksId === barracksId) o.rally = { x: to.x, y: to.y };
+  }
+}
+function clearRallyPoint(rally, q, barracksId) {
+  rally.delete(barracksId);
+  for (const o of q) {
+    if (o.type === "unit" && o.barracksId === barracksId) delete o.rally;
+  }
+}
+function enqueueUpgrade(q, e, b, level, powered) {
+  if (q.some((o) => o.type === "upgrade" && o.buildingId === b.id)) {
+    return { ok: false, reason: "busy" };
+  }
+  const chk = canUpgrade(b, level, e.credits, powered);
+  if (!chk.ok) return chk;
+  const to = level === 1 ? 2 : 3;
+  const tier = UPGRADE_TABLE[b.kind][to];
+  const order = {
+    type: "upgrade",
+    key: `upgrade:${b.id}`,
+    kind: b.kind,
+    buildingId: b.id,
+    from: level,
+    to,
+    cost: tier.cost,
+    buildTime: tier.time,
+    elapsed: 0,
+    effect: tier.effect,
+    multiplier: tier.multiplier
+  };
+  if (!enqueue(q, e, order)) return { ok: false, reason: "funds" };
+  return { ok: true, order };
+}
+function laneKey(o) {
+  return o.type === "upgrade" ? o.buildingId : o.barracksId;
+}
+function tickLanes(list, dt, lanes, done) {
+  let remaining = dt;
+  while (remaining > 0) {
+    const active = Math.min(lanes, list.length);
+    if (active === 0) break;
+    let minNeed = Infinity;
+    for (let i = 0; i < active; i++) {
+      minNeed = Math.min(minNeed, list[i].buildTime - list[i].elapsed);
+    }
+    const step = Math.min(remaining, Math.max(0, minNeed));
+    for (let i = 0; i < active; i++) list[i].elapsed += step;
+    remaining -= step;
+    let removed = 0;
+    for (let i = 0; i < active; i++) {
+      const o = list[i - removed];
+      if (o.elapsed >= o.buildTime) {
+        done.push(o);
+        list.splice(i - removed, 1);
+        removed++;
+      }
+    }
+  }
 }
 function tickProduction(q, dt, parallel = PARALLEL_PER_BARRACKS) {
   const done = [];
   if (!(dt > 0)) return done;
   const lanes = Math.max(1, Math.floor(parallel));
-  let remaining = dt;
-  while (remaining > 0) {
-    const active = Math.min(lanes, q.length);
-    if (active === 0) break;
-    let minNeed = Infinity;
-    for (let i = 0; i < active; i++) {
-      minNeed = Math.min(minNeed, q[i].buildTime - q[i].elapsed);
-    }
-    const step = Math.min(remaining, minNeed);
-    for (let i = 0; i < active; i++) q[i].elapsed += step;
-    remaining -= step;
-    let removed = 0;
-    for (let i = 0; i < active; i++) {
-      const o = q[i - removed];
-      if (o.elapsed >= o.buildTime) {
-        done.push(o);
-        q.splice(i - removed, 1);
-        removed++;
-      }
-    }
+  const groups = /* @__PURE__ */ new Map();
+  for (const o of q) {
+    const k = laneKey(o);
+    const list = groups.get(k);
+    if (list) list.push(o);
+    else groups.set(k, [o]);
   }
+  const rest = [];
+  for (const list of groups.values()) {
+    tickLanes(list, dt, lanes, done);
+    rest.push(...list);
+  }
+  q.length = 0;
+  q.push(...rest);
   return done;
 }
 function cancelUnit(q, e, index) {
   if (index < 0 || index >= q.length) return false;
   const [o] = q.splice(index, 1);
-  credit(e, Math.round(o.cost * CANCEL_REFUND_RATIO));
+  credit(e, refundFor(o.cost, o.elapsed, o.buildTime));
   return true;
 }
 
@@ -287,18 +426,29 @@ test("tickConstruction on an empty list is a no-op", () => {
   assert.deepEqual(tickConstruction([], 10, buildings, nextIdGen()), []);
   assert.equal(buildings.length, 0);
 });
-test("cancelConstruction refunds half the cost (CANCEL_REFUND_RATIO)", () => {
+test("cancelConstruction refunds scale with progress: 0% full, partial prorated", () => {
   const e = createEconomy(1e4);
   const map = openMap();
-  const r = startConstruction("refinery", 0, 0, e, [], map);
+  const buildings = [];
+  const r = startConstruction("refinery", 0, 0, e, buildings, map);
   if (!r.ok) assert.fail("site should start");
   const list = [r.item];
   const cost = BUILDING_DEFS.refinery.cost;
   assert.equal(cancelConstruction(list, e, 0), true);
   assert.equal(list.length, 0);
-  assert.equal(e.credits, 1e4 - cost + Math.round(cost * CANCEL_REFUND_RATIO));
+  assert.equal(e.credits, 1e4);
+  const r2 = startConstruction("refinery", 0, 0, e, buildings, map);
+  if (!r2.ok) assert.fail("site should restart");
+  list.push(r2.item);
+  tickConstruction(list, BUILDING_DEFS.refinery.buildTime / 2, buildings, nextIdGen());
+  assert.equal(r2.item.progress, 0.5);
+  assert.equal(cancelConstruction(list, e, 0), true);
+  assert.equal(e.credits, 1e4 - cost + Math.round(cost * (1 - 0.5)));
   assert.equal(cancelConstruction(list, e, 0), false);
   assert.equal(cancelConstruction(list, e, -1), false);
+});
+test("CANCEL_REFUND_RATIO still exported for API compatibility", () => {
+  assert.equal(CANCEL_REFUND_RATIO, 0.5);
 });
 test("enqueueUnit charges UNIT_STATS cost up front, FIFO order", () => {
   const e = createEconomy(1e3);
@@ -375,20 +525,203 @@ test("tickProduction on an empty queue or with dt <= 0 is a no-op", () => {
   assert.deepEqual(tickProduction(q, 0), []);
   assert.equal(q[0].elapsed, 0);
 });
-test("cancelUnit refunds half the cost, full price already spent", () => {
-  const e = createEconomy(1e3);
+test("cancelUnit refunds scale with progress, not a flat ratio", () => {
+  const e = createEconomy(1e4);
   const q = createUnitQueue();
   enqueueUnit(q, e, "tank");
   enqueueUnit(q, e, "infantry");
-  assert.equal(e.credits, 100);
-  assert.equal(e.spent, 900);
   assert.equal(cancelUnit(q, e, 0), true);
-  assert.equal(e.credits, 100 + Math.round(UNIT_STATS.tank.cost * CANCEL_REFUND_RATIO));
+  assert.equal(e.credits, 1e4 - UNIT_STATS.infantry.cost);
   assert.deepEqual(
     q.map((o) => o.kind),
     ["infantry"]
   );
+  tickProduction(q, 2);
+  assert.equal(q[0].elapsed, 2);
+  const before = e.credits;
+  assert.equal(cancelUnit(q, e, 0), true);
+  assert.equal(e.credits, before + Math.round(UNIT_STATS.infantry.cost * 0.5));
+  assert.equal(q.length, 0);
+  enqueueUnit(q, e, "infantry");
+  tickProduction(q, UNIT_STATS.infantry.buildTime - 1e-3);
+  const nearEnd = e.credits;
+  assert.equal(cancelUnit(q, e, 0), true);
+  assert.equal(e.credits - nearEnd, Math.round(UNIT_STATS.infantry.cost * (1e-3 / 4)));
+  assert.ok(e.credits - nearEnd < UNIT_STATS.infantry.cost);
   assert.equal(cancelUnit(q, e, 7), false);
   assert.equal(cancelUnit(q, e, -1), false);
+});
+test("enqueueUnitTo binds orders to a barracks lane", () => {
+  const e = createEconomy(1e4);
+  const q = createUnitQueue();
+  assert.equal(enqueueUnitTo(q, e, "infantry", 7), true);
+  assert.equal(enqueueUnitTo(q, e, "tank", 9), true);
+  const a = q[0];
+  const b = q[1];
+  assert.equal(a.barracksId, 7);
+  assert.equal(b.barracksId, 9);
+});
+test("two barracks produce different kinds in parallel in one tick", () => {
+  const e = createEconomy(1e4);
+  const q = createUnitQueue();
+  enqueueUnitTo(q, e, "infantry", 7);
+  enqueueUnitTo(q, e, "tank", 9);
+  enqueueUnitTo(q, e, "infantry", 9);
+  const done = tickProduction(q, 4);
+  assert.deepEqual(
+    done.map((o) => o.kind),
+    ["infantry"]
+  );
+  assert.equal(done[0].type, "unit");
+  assert.equal(q.length, 2);
+  const tank = q.find((o) => o.kind === "tank");
+  assert.equal(tank.barracksId, 9);
+  assert.equal(tank.elapsed, 4);
+  const waiting = q.find((o) => o.type === "unit" && o.kind === "infantry");
+  assert.equal(waiting.elapsed, 0);
+});
+test("per-barracks lanes keep FIFO inside each producer", () => {
+  const e = createEconomy(1e4);
+  const q = createUnitQueue();
+  enqueueUnitTo(q, e, "infantry", 7);
+  enqueueUnitTo(q, e, "infantry", 7);
+  enqueueUnitTo(q, e, "tank", 9);
+  const done = tickProduction(q, 6);
+  assert.equal(done.length, 1);
+  const sib = q.find((o) => o.barracksId === 7);
+  assert.equal(sib.elapsed, 2);
+  const tank = q.find((o) => o.kind === "tank");
+  assert.equal(tank.elapsed, 6);
+});
+test("unassigned orders still share the default lane", () => {
+  const e = createEconomy(1e4);
+  const q = createUnitQueue();
+  enqueueUnit(q, e, "infantry");
+  enqueueUnit(q, e, "infantry");
+  const done = tickProduction(q, 4);
+  assert.equal(done.length, 1);
+  assert.equal(q[0].elapsed, 0);
+});
+test("setRallyPoint stamps new and queued orders; completions carry it", () => {
+  const e = createEconomy(1e4);
+  const q = createUnitQueue();
+  const rally = createRallyPoints();
+  const goal = { x: 320, y: 160 };
+  setRallyPoint(rally, q, 7, goal);
+  assert.deepEqual(rally.get(7), goal);
+  enqueueUnitTo(q, e, "infantry", 7, rally);
+  assert.deepEqual(q[0].rally, goal);
+  const moved = { x: 64, y: 64 };
+  setRallyPoint(rally, q, 7, moved);
+  assert.deepEqual(q[0].rally, moved);
+  const done = tickProduction(q, UNIT_STATS.infantry.buildTime);
+  assert.equal(done.length, 1);
+  assert.deepEqual(done[0].rally, moved);
+  enqueueUnitTo(q, e, "infantry", 7, rally);
+  clearRallyPoint(rally, q, 7);
+  assert.equal(rally.has(7), false);
+  assert.equal(q[0].rally, void 0);
+});
+test("rally points are per-barracks and do not leak between producers", () => {
+  const e = createEconomy(1e4);
+  const q = createUnitQueue();
+  const rally = createRallyPoints();
+  setRallyPoint(rally, q, 7, { x: 10, y: 10 });
+  enqueueUnitTo(q, e, "infantry", 9, rally);
+  assert.equal(q[0].rally, void 0);
+  enqueueUnitTo(q, e, "infantry", 7, rally);
+  setRallyPoint(rally, q, 9, { x: 99, y: 99 });
+  assert.deepEqual(q[1].rally, { x: 10, y: 10 });
+});
+function doneBarracks(id = 7) {
+  const b = place([], "barracks", 0, 0, id);
+  b.done = true;
+  return b;
+}
+test("enqueueUpgrade charges UPGRADE_TABLE cost and queues with tier time", () => {
+  const e = createEconomy(1e4);
+  const q = createUnitQueue();
+  const rax = doneBarracks();
+  const tier = UPGRADE_TABLE.barracks[2];
+  const r = enqueueUpgrade(q, e, rax, 1, true);
+  if (!r.ok) assert.fail("upgrade should queue");
+  assert.equal(r.order.type, "upgrade");
+  assert.equal(r.order.buildingId, rax.id);
+  assert.equal(r.order.from, 1);
+  assert.equal(r.order.to, 2);
+  assert.equal(r.order.cost, tier.cost);
+  assert.equal(r.order.buildTime, tier.time);
+  assert.equal(r.order.effect, tier.effect);
+  assert.equal(r.order.multiplier, tier.multiplier);
+  assert.equal(e.credits, 1e4 - tier.cost);
   assert.equal(q.length, 1);
+});
+test("enqueueUpgrade reuses canUpgrade validation and refuses dupes", () => {
+  const e = createEconomy(1e4);
+  const q = createUnitQueue();
+  const rax = doneBarracks();
+  const raw = place([], "barracks", 0, 0, 99);
+  assert.deepEqual(enqueueUpgrade(q, e, raw, 1, true), { ok: false, reason: "not-done" });
+  assert.deepEqual(enqueueUpgrade(q, e, rax, 1, false), { ok: false, reason: "no-power" });
+  assert.deepEqual(enqueueUpgrade(q, e, rax, 3, true), { ok: false, reason: "max-level" });
+  assert.equal(enqueueUpgrade(q, e, rax, 1, true).ok, true);
+  const paid = e.credits;
+  assert.deepEqual(enqueueUpgrade(q, e, rax, 1, true), { ok: false, reason: "busy" });
+  assert.equal(e.credits, paid);
+  const poor = createEconomy(0);
+  assert.deepEqual(enqueueUpgrade(q, poor, doneBarracks(8), 1, true), {
+    ok: false,
+    reason: "funds"
+  });
+});
+test("upgrade on a barracks shares its lane with unit production", () => {
+  const e = createEconomy(1e4);
+  const q = createUnitQueue();
+  const rax = doneBarracks(7);
+  enqueueUpgrade(q, e, rax, 1, true);
+  enqueueUnitTo(q, e, "infantry", 7);
+  enqueueUnitTo(q, e, "infantry", 9);
+  const done = tickProduction(q, 4);
+  assert.equal(done.length, 1);
+  assert.equal(done[0].barracksId, 9);
+  const job = q.find((o) => o.type === "upgrade");
+  const waiting = q.find((o) => o.type === "unit" && o.barracksId === 7);
+  assert.equal(job.elapsed, 4);
+  assert.equal(waiting.elapsed, 0);
+  assert.equal(q.some((o) => o.type === "unit" && o.barracksId === 9), false);
+  const done2 = tickProduction(q, 8);
+  assert.equal(done2.length, 1);
+  const finished = done2[0];
+  assert.equal(finished.type, "upgrade");
+  assert.equal(finished.buildingId, 7);
+  assert.equal(finished.to, 2);
+  assert.equal(finished.multiplier, UPGRADE_TABLE.barracks[2].multiplier);
+  assert.equal(waiting.elapsed, 0);
+});
+test("upgrade on a non-barracks building does not block unit lanes", () => {
+  const e = createEconomy(1e4);
+  const q = createUnitQueue();
+  const ref = place([], "refinery", 0, 0, 5);
+  ref.done = true;
+  enqueueUpgrade(q, e, ref, 1, true);
+  enqueueUnit(q, e, "infantry");
+  const done = tickProduction(q, 4);
+  assert.deepEqual(
+    done.map((o) => o.kind),
+    ["infantry"]
+  );
+  assert.equal(q.length, 1);
+  assert.equal(q[0].type, "upgrade");
+  assert.equal(q[0].elapsed, 4);
+});
+test("cancelling a queued upgrade refunds its remaining progress", () => {
+  const e = createEconomy(1e4);
+  const q = createUnitQueue();
+  const rax = doneBarracks();
+  enqueueUpgrade(q, e, rax, 1, true);
+  const tier = UPGRADE_TABLE.barracks[2];
+  tickProduction(q, tier.time / 2);
+  const before = e.credits;
+  assert.equal(cancelUnit(q, e, 0), true);
+  assert.equal(e.credits, before + Math.round(tier.cost * 0.5));
 });
