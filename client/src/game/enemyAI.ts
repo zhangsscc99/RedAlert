@@ -25,6 +25,15 @@
 // battered units pull back at a difficulty-scaled hp threshold and healed
 // ones rejoin the push, and each wave musters a little larger than the last
 // while still honoring a minimum rest between launches.
+//
+// opts.adaptive (implies tactics) layers the F903 doctrine: a harass squad
+// peels 2–3 units off the main force to flank the player's harvesters and
+// refineries and breaks off when outmatched; a wave down to half its
+// committed strength — or with half its survivors battered — routs home to
+// refit instead of dying in place; the next wave's size and launch
+// interval flex with the scouted player threat; and a 0–3 difficulty
+// curve level scales the AI's starting bank, expansion pace, unit mix,
+// and harass cadence.
 
 import { MAP_H, MAP_W, mulberry32, tileCenter, worldToTile } from './grid.js';
 import { DIFFICULTY, WAVE_BALANCE, type Difficulty } from './balance.js';
@@ -129,6 +138,26 @@ export interface AIState {
   healing: number;
   /** Seconds between periodic recon dispatches (difficulty-paced). */
   scoutPeriod: number;
+  /** F903 adaptive layer (harass squads / rout-refit / dynamic waves). */
+  adaptive: boolean;
+  /** Difficulty-curve level 0–3; scales credits/mix/pace within adaptive. */
+  level: number;
+  /** Level-scaled guaranteed infantry screen at the head of each wave. */
+  infantryScreen: number;
+  /** Level-scaled counter-pick skew toward tanks (1 = neutral). */
+  tankBias: number;
+  /** Seconds between harass dispatches (level-paced). */
+  raidPeriod: number;
+  /** AI tick of the last harass dispatch. */
+  lastRaidTick: number;
+  /** Raiders believed out (host-corrected via intel.raiders). */
+  raiders: number;
+  /** A recall order is already out for the current raid squad. */
+  raidRecalled: boolean;
+  /** Freshest economy target sighted — a harvester first, else a refinery. */
+  raidPos: { x: number; y: number } | null;
+  /** Largest army the current push has fielded (rout bookkeeping). */
+  wavePeak: number;
 }
 
 export type AICommand =
@@ -142,7 +171,11 @@ export type AICommand =
   | { type: 'build'; kind: AIBuildKind; at: { x: number; y: number } } // `at` in tiles
   | { type: 'defend'; to: { x: number; y: number }; count: number } // hold `count` units home
   | { type: 'focus'; to: { x: number; y: number } } // wave locks one target
-  | { type: 'rejoin'; to: { x: number; y: number }; count: number }; // healed units rejoin the push
+  | { type: 'rejoin'; to: { x: number; y: number }; count: number } // healed units rejoin the push
+  // `count` raiders peel off the push to flank the player economy at `to`
+  | { type: 'harass'; to: { x: number; y: number }; count: number }
+  // the raid squad breaks off and falls back home when outmatched
+  | { type: 'recall'; to: { x: number; y: number }; count: number };
 
 /**
  * Host-supplied per-tick observations for the deep machine. Everything is
@@ -207,6 +240,10 @@ export interface AIIntel {
   scouts?: number;
   /** Retreated units that finished healing at base; triggers 'rejoin'. */
   healed?: number;
+  /** Live harass-squad units; corrects the AI's own tally so losses free the slot. */
+  raiders?: number;
+  /** Player defenders near the raid target; > raiders recalls the squad. */
+  raidThreat?: number;
 }
 
 export interface AIOptions {
@@ -246,6 +283,22 @@ export interface AIOptions {
   tactics?: boolean;
   /** Seconds between recon dispatches at normal pace; default scales with difficulty. */
   scoutPeriod?: number;
+  /**
+   * Enable the F903 adaptive layer: a harass squad that flanks the player
+   * economy and breaks off when outmatched, waves that rout home to refit
+   * rather than die in place, wave size/tempo that flexes with the scouted
+   * player threat, and the 0–3 difficulty curve. Implies `tactics` (and
+   * `deep`). Default false = behavior identical to no options.
+   */
+  adaptive?: boolean;
+  /**
+   * Difficulty-curve level 0–3 inside the adaptive layer: scales the
+   * starting bank, expansion pace, infantry screen / tank bias, and harass
+   * cadence. Values clamp into range; >0 implies `adaptive`. Default 0.
+   */
+  level?: number;
+  /** Seconds between harass dispatches at level 0 pace; default scales with level. */
+  raidPeriod?: number;
 }
 
 export const AI_TICK = 1; // seconds between decision ticks
@@ -322,6 +375,56 @@ export const AI_TARGET_VALUE: Record<UnitKind | BuildingKind, number> = {
   wall: 0.5,
 };
 
+// --------------------------------------------------------- adaptive (F903)
+
+/** Max difficulty-curve level (0–3). */
+export const AI_MAX_LEVEL = 3;
+/** Smallest harass squad — "pull 2–3 units off the main force". */
+export const AI_RAID_MIN = 2;
+/** Largest harass squad. */
+export const AI_RAID_MAX = 3;
+/** Seconds between harass dispatches at curve level 0 (higher → faster). */
+export const AI_RAID_PERIOD = 45;
+/** Troops the main force keeps behind when a raid squad peels off. */
+export const AI_RAID_RESERVE = 4;
+/** Tiles off the base→target line the squad aims for — a flank approach. */
+export const AI_FLANK_TILES = 6;
+/** Fraction of the committed force at/below which the wave routs home. */
+export const AI_ROUT_REMAIN = 0.5;
+/** Fraction of survivors below the retreat hp bar that triggers a rout. */
+export const AI_ROUT_BATTERED = 0.5;
+/** Wave-goal units added per scouted threat point. */
+export const AI_THREAT_SIZE = 0.4;
+/** Fraction of the wave gap shaved per threat point (floored). */
+export const AI_THREAT_PACE = 0.05;
+/** Floor on the threat-driven gap shrink. */
+export const AI_THREAT_GAP_MIN = 0.5;
+/**
+ * Per-kind weights for the threat estimate behind dynamic waves: combat
+ * units and defenses register, miners and walls barely do.
+ */
+export const AI_THREAT_WEIGHT: Record<UnitKind | BuildingKind, number> = {
+  infantry: 1,
+  tank: 2.5,
+  harvester: 0.5,
+  hq: 4,
+  barracks: 1.5,
+  refinery: 1,
+  power: 0.5,
+  turret: 3,
+  wall: 0.25,
+};
+/**
+ * Difficulty-curve tables indexed by level 0–3 — the adaptive AI's
+ * starting bank, expansion pace multiplier, infantry-screen units dropped,
+ * counter-pick tank bias, and harass-period multiplier.
+ */
+export const AI_LEVEL_CREDITS: readonly number[] = [0, 150, 300, 500];
+export const AI_LEVEL_EXPAND_PACE: readonly number[] = [1, 0.9, 0.8, 0.65];
+export const AI_LEVEL_SCREEN: readonly number[] = [0, 1, 2, 3];
+export const AI_LEVEL_TANK_BIAS: readonly number[] = [1, 1.15, 1.35, 1.6];
+export const AI_LEVEL_RAID_PACE: readonly number[] = [1, 0.8, 0.6, 0.45];
+
 /**
  * Desired building counts per expansion level, in build-priority order.
  * The level rises with elapsed ticks × difficulty pace and is itself capped
@@ -371,10 +474,15 @@ export function createAIState(seed: number, incomeScale = 1, opts: AIOptions = {
   // Muster size scales with the tier's fielded army size, normal = baseline.
   const sizeScale = tier.enemyStartInfantry / DIFFICULTY.normal.enemyStartInfantry;
   const musterSize = opts.musterSize ?? Math.max(2, Math.round(AI_ARMY_PER_WAVE * sizeScale));
-  const tactics = opts.tactics ?? false;
+  const rawLevel = opts.level ?? 0;
+  const level = Number.isFinite(rawLevel)
+    ? Math.max(0, Math.min(AI_MAX_LEVEL, Math.floor(rawLevel)))
+    : 0;
+  const adaptive = (opts.adaptive ?? false) || level > 0;
+  const tactics = (opts.tactics ?? false) || adaptive;
   return {
     phase: 'gather',
-    credits: 0,
+    credits: AI_LEVEL_CREDITS[level],
     army: 0,
     wave: 0,
     timer: 0,
@@ -400,7 +508,8 @@ export function createAIState(seed: number, incomeScale = 1, opts: AIOptions = {
     saving: false,
     siteSelector: opts.buildSite ?? scanBuildSite,
     baseCap: opts.baseCap ?? AI_BASE_CAP,
-    expandTicks: opts.expandTicks ?? AI_EXPAND_TICKS,
+    // Higher curve levels expand on a faster clock (level 0 = base pace).
+    expandTicks: opts.expandTicks ?? AI_EXPAND_TICKS * AI_LEVEL_EXPAND_PACE[level],
     tactics,
     known: { pos: null, units: {}, structures: {}, tick: -1 },
     focus: null,
@@ -409,6 +518,16 @@ export function createAIState(seed: number, incomeScale = 1, opts: AIOptions = {
     healing: 0,
     // Faster tiers scout more often: hard probes ~30s, easy ~54s.
     scoutPeriod: opts.scoutPeriod ?? AI_SCOUT_PERIOD * tier.waveIntervalScale,
+    adaptive,
+    level,
+    infantryScreen: Math.max(0, AI_INFANTRY_PER_WAVE - AI_LEVEL_SCREEN[level]),
+    tankBias: AI_LEVEL_TANK_BIAS[level],
+    raidPeriod: opts.raidPeriod ?? AI_RAID_PERIOD * AI_LEVEL_RAID_PACE[level],
+    lastRaidTick: 0,
+    raiders: 0,
+    raidRecalled: false,
+    raidPos: null,
+    wavePeak: 0,
   };
 }
 
@@ -439,6 +558,11 @@ export function stepAI(s: AIState, dt: number, intel?: AIIntel): AICommand[] {
       recordIntel(s, intel);
       maybeRejoin(s, intel, cmds);
       maybeRecon(s, intel, cmds); // after maybeBuild: scouts never drain `saving`
+    }
+    if (s.adaptive) {
+      syncRaiders(s, intel);
+      maybeRaidRecall(s, intel, cmds);
+      maybeRaid(s, intel, cmds);
     }
     switch (s.phase) {
       case 'gather':
@@ -483,12 +607,13 @@ export function stepAI(s: AIState, dt: number, intel?: AIIntel): AICommand[] {
           s.army += 1;
           cmds.push({ type: 'train', kind });
         }
-        const goal = armyGoal(s);
-        const ready = s.army >= goal && s.sinceWave >= effectiveWaveGap(s);
+        const goal = waveGoal(s, intel);
+        const wait = waveWait(s, intel);
+        const ready = s.army >= goal && s.sinceWave >= wait;
         // Spotted enemies are engaged early with whatever has rallied —
         // but a tactics wave still honors a minimum rest between launches.
         const commit = Math.max(2, Math.ceil(goal / 3));
-        const rested = !s.tactics || s.sinceWave >= effectiveWaveGap(s) * AI_MIN_REST_RATIO;
+        const rested = !s.tactics || s.sinceWave >= wait * AI_MIN_REST_RATIO;
         if (ready || (s.spotted && s.army >= commit && rested)) {
           launchWave(s, cmds);
         } else {
@@ -501,9 +626,10 @@ export function stepAI(s: AIState, dt: number, intel?: AIIntel): AICommand[] {
           s.phase = s.deep ? 'muster' : 'build';
           s.retreatSent = false;
           s.focus = null; // the next wave locks a fresh target
+          s.wavePeak = 0;
           // Regroup survivors at base so the next wave pushes as one.
           if (s.deep) cmds.push({ type: 'rally', to: anchorOf(intel) });
-        } else {
+        } else if (!maybeRout(s, intel, cmds)) {
           cmds.push({ type: 'attack' });
           if (s.tactics) maybeFocus(s, intel, cmds);
           maybeRetreat(s, intel, cmds);
@@ -522,10 +648,14 @@ export function stepAI(s: AIState, dt: number, intel?: AIIntel): AICommand[] {
  * composition (live playerArmor is the fallback when still blind).
  */
 function pickTrainKind(s: AIState, intel?: AIIntel): 'infantry' | 'tank' {
-  if (s.army < AI_INFANTRY_PER_WAVE) return 'infantry';
+  // The adaptive layer's level shrinks the infantry screen and skews the
+  // counter math toward armor — higher curves field heavier waves.
+  const screen = s.adaptive ? s.infantryScreen : AI_INFANTRY_PER_WAVE;
+  if (s.army < screen) return 'infantry';
+  const bias = s.adaptive ? s.tankBias : 1;
   if (s.tactics && s.known.tick >= 0) {
     const w = counterWeights({ ...s.known.units, ...s.known.structures });
-    return w.tank >= w.infantry ? 'tank' : 'infantry';
+    return w.tank * bias >= w.infantry ? 'tank' : 'infantry';
   }
   const counts = intel?.playerArmor;
   if (!counts) return 'tank';
@@ -536,7 +666,7 @@ function pickTrainKind(s: AIState, intel?: AIIntel): 'infantry' | 'tank' {
     }
     return sum;
   };
-  return score('tank') >= score('infantry') ? 'tank' : 'infantry';
+  return score('tank') * bias >= score('infantry') ? 'tank' : 'infantry';
 }
 
 /**
@@ -595,13 +725,17 @@ function recordIntel(s: AIState, intel?: AIIntel): void {
   if (!seen || seen.length === 0) return;
   const units: Partial<Record<UnitKind, number>> = {};
   const structures: Partial<Record<BuildingKind, number>> = {};
+  let harv: AISighting | null = null;
+  let ref: AISighting | null = null;
   let x = 0;
   let y = 0;
   for (const it of seen) {
     if (it.kind === 'infantry' || it.kind === 'tank' || it.kind === 'harvester') {
       units[it.kind] = (units[it.kind] ?? 0) + 1;
+      if (it.kind === 'harvester') harv ??= it;
     } else {
       structures[it.kind] = (structures[it.kind] ?? 0) + 1;
+      if (it.kind === 'refinery') ref ??= it;
     }
     x += it.x;
     y += it.y;
@@ -613,6 +747,9 @@ function recordIntel(s: AIState, intel?: AIIntel): void {
     tick: s.ticks,
   };
   s.spotted = true;
+  // The harass squad hunts economy: miners first, else their refinery.
+  const eco = harv ?? ref;
+  if (s.adaptive && eco) s.raidPos = { x: eco.x, y: eco.y };
 }
 
 /**
@@ -715,6 +852,9 @@ function launchWave(s: AIState, cmds: AICommand[]): void {
   s.retreatSent = false;
   s.defenders = 0; // the wave re-absorbs guards; threats re-issue 'defend'
   s.focus = null; // a fresh wave locks a fresh target
+  s.wavePeak = s.army; // rout bookkeeping: half of this means turn home
+  s.raiders = 0; // the launch 'move' re-absorbs the raid squad
+  s.raidRecalled = false;
   cmds.push({ type: 'move', to: attackTarget(s) }, { type: 'attack' });
 }
 
@@ -735,6 +875,142 @@ function jitterTarget(s: AIState, jitterTiles: number): { x: number; y: number }
   const tx = MAP_W / 2 + (s.rng() * 2 - 1) * jitterTiles;
   const ty = MAP_H / 2 + (s.rng() * 2 - 1) * jitterTiles;
   return { x: tileCenter(Math.floor(tx)), y: tileCenter(Math.floor(ty)) };
+}
+
+// ------------------------------------------------------- adaptive (F903)
+
+/**
+ * Threat estimate behind dynamic waves: weight the banked knowledge by
+ * kind — combat units and defenses register, miners and walls barely do.
+ */
+export function threatScore(k: AIKnowledge): number {
+  let t = 0;
+  for (const kind of Object.keys(k.units) as UnitKind[]) {
+    t += (k.units[kind] ?? 0) * AI_THREAT_WEIGHT[kind];
+  }
+  for (const kind of Object.keys(k.structures) as BuildingKind[]) {
+    t += (k.structures[kind] ?? 0) * AI_THREAT_WEIGHT[kind];
+  }
+  return t;
+}
+
+/**
+ * Threat driving the next wave's size and tempo: the banked picture when
+ * recon has landed, else the live armor mix (foot ≈ infantry, vehicles ≈
+ * tanks, structures ≈ guns). Blind and silent = 0.
+ */
+function threatOf(s: AIState, intel?: AIIntel): number {
+  if (!s.adaptive) return 0;
+  if (s.known.tick >= 0) return threatScore(s.known);
+  const armor = intel?.playerArmor;
+  if (!armor) return 0;
+  return (
+    (armor.infantry ?? 0) * AI_THREAT_WEIGHT.infantry +
+    (armor.vehicle ?? 0) * AI_THREAT_WEIGHT.tank +
+    (armor.building ?? 0) * AI_THREAT_WEIGHT.turret
+  );
+}
+
+/** Wave size this launch: the base muster grown by the scouted threat. */
+function waveGoal(s: AIState, intel?: AIIntel): number {
+  const goal = armyGoal(s);
+  if (!s.adaptive) return goal;
+  return Math.min(
+    WAVE_BALANCE.max,
+    goal + Math.round(threatOf(s, intel) * AI_THREAT_SIZE),
+  );
+}
+
+/** Rest between launches: a bigger reported threat quickens the tempo. */
+function waveWait(s: AIState, intel?: AIIntel): number {
+  const gap = effectiveWaveGap(s);
+  if (!s.adaptive) return gap;
+  return gap * Math.max(AI_THREAT_GAP_MIN, 1 - threatOf(s, intel) * AI_THREAT_PACE);
+}
+
+/** Host-corrected raider tally — losses free the squad slot next period. */
+function syncRaiders(s: AIState, intel?: AIIntel): void {
+  if (intel?.raiders === undefined) return;
+  s.raiders = Math.max(0, Math.min(AI_RAID_MAX, Math.floor(intel.raiders)));
+}
+
+/**
+ * A harass squad under pressure: defenders at the target that outnumber
+ * the raiders recall them home once — the latch re-arms when the squad is
+ * gone or the threat passes.
+ */
+function maybeRaidRecall(s: AIState, intel: AIIntel | undefined, cmds: AICommand[]): void {
+  const threat = intel?.raidThreat ?? 0;
+  if (s.raiders <= 0 || threat <= s.raiders) {
+    s.raidRecalled = false;
+    return;
+  }
+  if (s.raidRecalled) return;
+  s.raidRecalled = true;
+  cmds.push({ type: 'recall', to: anchorOf(intel), count: s.raiders });
+}
+
+/**
+ * Every raidPeriod, peel AI_RAID_MIN..AI_RAID_MAX units off the main force
+ * and send them wide at the freshest economy target — miners first, else
+ * refineries, else the last-known enemy position. One squad out at a
+ * time, and only while the main force keeps a reserve behind.
+ */
+function maybeRaid(s: AIState, intel: AIIntel | undefined, cmds: AICommand[]): void {
+  if (s.phase !== 'muster' && s.phase !== 'attack') return;
+  if (s.raiders > 0) return; // one squad out at a time
+  if (s.ticks - s.lastRaidTick < s.raidPeriod) return;
+  const n = Math.min(AI_RAID_MAX, s.army - AI_RAID_RESERVE);
+  if (n < AI_RAID_MIN) return;
+  const to = raidTarget(s, intel);
+  if (!to) return; // blind — recon has to find the economy first
+  s.raiders = n;
+  s.lastRaidTick = s.ticks;
+  cmds.push({ type: 'harass', to, count: n });
+}
+
+/**
+ * Raid approach: offset to one flank of the base→target line rather than
+ * straight down it, so the squad comes in from the side.
+ */
+function raidTarget(s: AIState, intel?: AIIntel): { x: number; y: number } | null {
+  const base = s.raidPos ?? s.known.pos;
+  if (!base) return null;
+  const a = anchorOf(intel);
+  const bx = worldToTile(base.x);
+  const by = worldToTile(base.y);
+  const dx = bx - worldToTile(a.x);
+  const dy = by - worldToTile(a.y);
+  const d = Math.hypot(dx, dy) || 1;
+  const side = s.rng() < 0.5 ? -1 : 1;
+  const tx = Math.floor(bx + (-dy / d) * side * AI_FLANK_TILES + (s.rng() - 0.5) * 2);
+  const ty = Math.floor(by + (dx / d) * side * AI_FLANK_TILES + (s.rng() - 0.5) * 2);
+  return {
+    x: tileCenter(Math.min(MAP_W - 1, Math.max(0, tx))),
+    y: tileCenter(Math.min(MAP_H - 1, Math.max(0, ty))),
+  };
+}
+
+/**
+ * Rout and refit: a wave down to half its committed strength — or with
+ * half its survivors below the retreat bar — turns for home and refits in
+ * muster instead of dying in place. Clearing `spotted` forces the next
+ * push to wait for a full refill rather than an early re-commit.
+ */
+function maybeRout(s: AIState, intel: AIIntel | undefined, cmds: AICommand[]): boolean {
+  if (!s.adaptive) return false;
+  s.wavePeak = Math.max(s.wavePeak, s.army);
+  const low = Math.min(intel?.lowHp ?? 0, s.army);
+  const decimated = s.army <= s.wavePeak * AI_ROUT_REMAIN;
+  const battered = low > 0 && low >= s.army * AI_ROUT_BATTERED;
+  if (!decimated && !battered) return false;
+  s.phase = 'muster';
+  s.focus = null;
+  s.spotted = false;
+  s.retreatSent = true; // the whole force already has its orders
+  s.healing += low; // the battered survivors queue for repairs
+  cmds.push({ type: 'retreat', to: anchorOf(intel), count: s.army });
+  return true;
 }
 
 // ------------------------------------------------------- base economy (F704)
