@@ -21,11 +21,19 @@ function worldToTile(px) {
 
 // src/game/buildings.ts
 var BUILDING_DEFS = {
-  hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2e3, label: "HQ" },
-  barracks: { w: 3, h: 2, cost: 500, buildTime: 15, hp: 800, label: "Barracks" },
-  refinery: { w: 4, h: 3, cost: 2e3, buildTime: 25, hp: 1200, label: "Refinery" },
-  power: { w: 2, h: 2, cost: 300, buildTime: 8, hp: 400, label: "Power Plant" }
+  hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2e3, label: "HQ", buildable: false },
+  barracks: { w: 3, h: 2, cost: 500, buildTime: 15, hp: 800, label: "Barracks", powerUse: 40, buildable: true },
+  refinery: { w: 4, h: 3, cost: 2e3, buildTime: 25, hp: 1200, label: "Refinery", powerUse: 50, buildable: true },
+  power: { w: 2, h: 2, cost: 300, buildTime: 8, hp: 400, label: "Power Plant", buildable: true },
+  turret: { w: 2, h: 2, cost: 700, buildTime: 12, hp: 700, label: "Turret", range: 150, damage: 30, powerUse: 30, buildable: true },
+  wall: { w: 1, h: 1, cost: 100, buildTime: 4, hp: 500, label: "Wall", blocksPath: true, buildable: true }
 };
+function isDefensive(kind) {
+  return kind === "turret" || kind === "wall";
+}
+function blocksMovement(kind) {
+  return BUILDING_DEFS[kind].blocksPath === true;
+}
 function snapToGrid(px, py) {
   return { x: worldToTile(px), y: worldToTile(py) };
 }
@@ -152,6 +160,52 @@ test("footprintTiles returns w*h unique in-rect tiles per kind", () => {
       assert.ok(t.y >= b.gy && t.y < b.gy + def.h);
     }
   }
+});
+test("turret and wall place on clear grass", () => {
+  const m = openMap();
+  assert.deepEqual(canPlace(m, [], "turret", 4, 4), { ok: true });
+  assert.deepEqual(canPlace(m, [], "wall", 0, 0), { ok: true });
+});
+test("turret and wall reject water and overlap like any building", () => {
+  const m = openMap(16, 16);
+  m.tiles[5 * m.w + 5] = WATER;
+  assert.equal(canPlace(m, [], "turret", 4, 4).reason, "water");
+  assert.equal(canPlace(m, [], "wall", 5, 5).reason, "water");
+  assert.equal(canPlace(m, [], "turret", 6, 6).ok, true);
+  assert.equal(canPlace(m, [], "wall", 4, 5).ok, true);
+  const bs = [];
+  place(bs, "turret", 8, 8, 1);
+  assert.equal(canPlace(m, bs, "wall", 9, 9).reason, "overlap");
+  assert.equal(canPlace(m, bs, "turret", 9, 8).reason, "overlap");
+  assert.equal(canPlace(m, bs, "wall", 10, 9).ok, true);
+  assert.equal(canPlace(m, bs, "wall", 7, 8).ok, true);
+});
+test("defensive footprints: wall covers 1 tile, turret covers 4", () => {
+  const bs = [];
+  const wall = place(bs, "wall", 3, 3, 1);
+  const turret = place(bs, "turret", 6, 6, 2);
+  assert.deepEqual(footprintTiles(wall), [{ x: 3, y: 3 }]);
+  assert.equal(footprintTiles(turret).length, 4);
+  assert.deepEqual(footprintTiles(turret), [
+    { x: 6, y: 6 },
+    { x: 7, y: 6 },
+    { x: 6, y: 7 },
+    { x: 7, y: 7 }
+  ]);
+});
+test("blocksMovement: walls block, production buildings do not", () => {
+  assert.equal(blocksMovement("wall"), true);
+  assert.equal(blocksMovement("hq"), false);
+  assert.equal(blocksMovement("barracks"), false);
+  assert.equal(blocksMovement("refinery"), false);
+});
+test("isDefensive flags turret and wall only", () => {
+  assert.equal(isDefensive("turret"), true);
+  assert.equal(isDefensive("wall"), true);
+  assert.equal(isDefensive("hq"), false);
+  assert.equal(isDefensive("barracks"), false);
+  assert.equal(isDefensive("refinery"), false);
+  assert.equal(isDefensive("power"), false);
 });
 test("place appends a not-yet-done building at full hp", () => {
   const bs = [];

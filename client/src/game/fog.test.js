@@ -10,10 +10,12 @@ function worldToTile(px) {
 
 // src/game/buildings.ts
 var BUILDING_DEFS = {
-  hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2e3, label: "HQ" },
-  barracks: { w: 3, h: 2, cost: 500, buildTime: 15, hp: 800, label: "Barracks" },
-  refinery: { w: 4, h: 3, cost: 2e3, buildTime: 25, hp: 1200, label: "Refinery" },
-  power: { w: 2, h: 2, cost: 300, buildTime: 8, hp: 400, label: "Power Plant" }
+  hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2e3, label: "HQ", buildable: false },
+  barracks: { w: 3, h: 2, cost: 500, buildTime: 15, hp: 800, label: "Barracks", powerUse: 40, buildable: true },
+  refinery: { w: 4, h: 3, cost: 2e3, buildTime: 25, hp: 1200, label: "Refinery", powerUse: 50, buildable: true },
+  power: { w: 2, h: 2, cost: 300, buildTime: 8, hp: 400, label: "Power Plant", buildable: true },
+  turret: { w: 2, h: 2, cost: 700, buildTime: 12, hp: 700, label: "Turret", range: 150, damage: 30, powerUse: 30, buildable: true },
+  wall: { w: 1, h: 1, cost: 100, buildTime: 4, hp: 500, label: "Wall", blocksPath: true, buildable: true }
 };
 
 // src/game/fog.ts
@@ -23,7 +25,10 @@ var SIGHT_RADIUS = {
   harvester: 5,
   hq: 8,
   barracks: 8,
-  refinery: 8
+  refinery: 8,
+  power: 8,
+  turret: 8,
+  wall: 8
 };
 function createFog(map2) {
   return { w: map2.w, h: map2.h, explored: new Uint8Array(map2.w * map2.h), visible: new Uint8Array(map2.w * map2.h) };

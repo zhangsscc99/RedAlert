@@ -32,7 +32,9 @@ export const BUILDING_BALANCE: Record<BuildingKind | 'power', BuildingBalance> =
   hq: { w: 4, h: 3, hp: 2000, cost: 2500, buildTime: 40 },
   barracks: { w: 3, h: 2, hp: 800, cost: 500, buildTime: 15 },
   refinery: { w: 4, h: 3, hp: 1200, cost: 2000, buildTime: 25 },
-  power: { w: 2, h: 2, hp: 600, cost: 800, buildTime: 10 },
+  power: { w: 2, h: 2, hp: 400, cost: 300, buildTime: 8 },
+  turret: { w: 2, h: 2, hp: 700, cost: 700, buildTime: 12 },
+  wall: { w: 1, h: 1, hp: 500, cost: 100, buildTime: 4 },
 };
 
 export const WAVE_BALANCE = {
