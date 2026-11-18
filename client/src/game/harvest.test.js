@@ -93,7 +93,7 @@ var Heap = class {
     return top;
   }
 };
-function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget) {
+function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget, hScale = 1) {
   const n = map.w * map.h;
   const g = new Float64Array(n).fill(Infinity);
   const f = new Float64Array(n).fill(Infinity);
@@ -102,7 +102,7 @@ function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget) {
   const start = idx(map, sx, sy);
   const goal = idx(map, gx, gy);
   g[start] = 0;
-  f[start] = octile(sx, sy, gx, gy);
+  f[start] = octile(sx, sy, gx, gy) * hScale;
   const open = new Heap(f);
   open.push(start);
   while (open.size > 0) {
@@ -123,10 +123,10 @@ function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget) {
       }
       if (stepClear && !stepClear(cx, cy, nx, ny)) continue;
       const ni = idx(map, nx, ny);
-      const ng = g[cur] + cost + (enterCost ? enterCost(nx, ny) : 0);
+      const ng = g[cur] + cost + (enterCost ? enterCost(nx, ny, cost) : 0);
       if (ng < g[ni]) {
         g[ni] = ng;
-        f[ni] = ng + octile(nx, ny, gx, gy);
+        f[ni] = ng + octile(nx, ny, gx, gy) * hScale;
         came[ni] = cur;
         open.push(ni);
       }

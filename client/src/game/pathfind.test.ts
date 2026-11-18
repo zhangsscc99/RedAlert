@@ -1,7 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { GRASS, WATER, generateMap, isPassable, type GameMap, type Tile } from './grid.js';
 import {
+  GRASS,
+  ORE,
+  WATER,
+  generateMap,
+  isPassable,
+  type GameMap,
+  type Tile,
+} from './grid.js';
+import {
+  ROAD,
   findPath,
   findPathAvoiding,
   findPathGroup,
@@ -536,4 +545,160 @@ test('findPathGroup returns null for a sealed-off unit without throwing', () => 
   assert.equal(res.paths.length, 2);
   assert.equal(res.paths[0], null);
   assert.ok(res.paths[1]);
+});
+
+// ------------------------------------------------------ F905: cost tiers --
+
+/** Stamp tiles of one terrain value into a hand-built map. */
+function stamp(m: GameMap, v: number, cells: [number, number][]): GameMap {
+  for (const [x, y] of cells) m.tiles[y * m.w + x] = v;
+  return m;
+}
+
+test('terrainCost: ore wall is crossable at a price, water stays impassable', () => {
+  // Full-height ore wall at x=3; a lone water tile beyond it.
+  const ore: [number, number][] = [];
+  for (let y = 0; y < 7; y++) ore.push([3, y]);
+  const m = stamp(makeMap(7, 7, [[6, 6]]), ORE, ore);
+  // Default rules: ore is impassable, no way through the wall.
+  assert.equal(findPathSmooth(m, 1, 3, 5, 3), null);
+  // Cost tiers: ore costs triple but the unit gets through.
+  const path = findPathSmooth(m, 1, 3, 5, 3, { terrainCost: true });
+  assert.ok(path);
+  assert.deepEqual(path.at(-1), { x: 5, y: 3 });
+  assert.ok(
+    [...sweptTiles({ x: 1, y: 3 }, path)].some((k) => k.startsWith('3,')),
+    'expected the path to cross the ore wall',
+  );
+  // Water never becomes walkable.
+  assert.equal(findPathSmooth(m, 1, 3, 6, 6, { terrainCost: true }), null);
+});
+
+test('terrainCost: expensive ore pushes the path onto a grass detour', () => {
+  // Ore blob rows 4..5, cols 3..6 on a 9x9 grass field; open grass above.
+  const ore: [number, number][] = [];
+  for (const y of [4, 5]) for (let x = 3; x <= 6; x++) ore.push([x, y]);
+  const m = stamp(makeMap(9, 9), ORE, ore);
+  const path = findPathSmooth(m, 1, 4, 8, 4, { terrainCost: true });
+  assert.ok(path);
+  assert.deepEqual(path.at(-1), { x: 8, y: 4 });
+  // Detouring around the blob beats paying 4x to cross it.
+  for (const key of sweptTiles({ x: 1, y: 4 }, path)) {
+    const [tx, ty] = key.split(',').map(Number) as [number, number];
+    assert.notEqual(m.tiles[ty * m.w + tx], ORE, `path crossed ore at ${tx},${ty}`);
+  }
+});
+
+test('terrainCost: cheap road lane attracts the route', () => {
+  // Rows 0..1 are water and an ore wall seals everything below row 3 for
+  // x=3..6, leaving two east-west corridors: the road on row 3 (0.6x) and
+  // the grass on row 2 (1x). The priced path hugs the road; the flat path
+  // treats road as wall and detours along row 2.
+  const water: [number, number][] = [];
+  for (let x = 0; x < 10; x++) water.push([x, 0], [x, 1]);
+  const ore: [number, number][] = [];
+  for (let y = 4; y <= 9; y++) for (let x = 3; x <= 6; x++) ore.push([x, y]);
+  const road: [number, number][] = [];
+  for (let x = 3; x <= 6; x++) road.push([x, 3]);
+  const m = stamp(makeMap(10, 10, water), ORE, ore);
+  stamp(m, ROAD, road);
+  const flat = findPathSmooth(m, 1, 3, 8, 3);
+  const priced = findPathSmooth(m, 1, 3, 8, 3, { terrainCost: true });
+  assert.ok(flat);
+  assert.ok(priced);
+  assert.deepEqual(priced.at(-1), { x: 8, y: 3 });
+  const swept = sweptTiles({ x: 1, y: 3 }, priced);
+  for (const [x, y] of road) {
+    assert.ok(swept.has(`${x},${y}`), `expected the path to ride the road at ${x},${y}`);
+  }
+  // Without cost tiers the road is just wall — the flat path never touches it.
+  for (const key of sweptTiles({ x: 1, y: 3 }, flat)) {
+    const [tx, ty] = key.split(',').map(Number) as [number, number];
+    assert.notEqual(m.tiles[ty * m.w + tx], ROAD);
+  }
+});
+
+test('terrainCost off by default: road tiles are treated as impassable', () => {
+  const m = stamp(makeMap(5, 5), ROAD, [[2, 2]]);
+  // Without terrainCost a road tile is just an unknown non-grass tile.
+  assert.equal(findPathSmooth(m, 0, 0, 2, 2), null);
+  assert.ok(findPathSmooth(m, 0, 0, 2, 2, { terrainCost: true }));
+});
+
+// ---------------------------------------------------------- F905: crowd --
+
+test('crowd penalty detours around standing units', () => {
+  const m = makeMap(10, 10);
+  // A mob sitting on the direct diagonal corridor.
+  const crowd: Tile[] = [
+    { x: 3, y: 3 },
+    { x: 4, y: 4 },
+    { x: 5, y: 5 },
+    { x: 4, y: 3 },
+    { x: 5, y: 4 },
+    { x: 3, y: 4 },
+  ];
+  const path = findPathSmooth(m, 1, 1, 8, 8, { crowd, crowdRadius: 0, crowdCost: 6 });
+  assert.ok(path);
+  assert.deepEqual(path.at(-1), { x: 8, y: 8 });
+  const swept = sweptTiles({ x: 1, y: 1 }, path);
+  for (const u of crowd) {
+    assert.ok(!swept.has(`${u.x},${u.y}`), `path stepped on crowded tile ${u.x},${u.y}`);
+  }
+});
+
+test('no crowd: same call falls back to the direct route', () => {
+  const m = makeMap(10, 10);
+  assert.deepEqual(findPathSmooth(m, 1, 1, 8, 8), [{ x: 8, y: 8 }]);
+});
+
+// ----------------------------------------------------- F905: formations --
+
+test('formationSlots wide lays a horizontal line', () => {
+  const m = makeMap(16, 16);
+  const slots = formationSlots({ x: 8, y: 8 }, 5, m, 0, 'wide');
+  assert.equal(slots.length, 5);
+  assert.equal(new Set(slots.map((s) => `${s.x},${s.y}`)).size, 5);
+  for (const s of slots) assert.equal(s.y, 8);
+  assert.deepEqual(
+    slots.map((s) => s.x).sort((a, b) => a - b),
+    [6, 7, 8, 9, 10],
+  );
+});
+
+test('formationSlots narrow stacks a vertical column', () => {
+  const m = makeMap(16, 16);
+  const slots = formationSlots({ x: 8, y: 8 }, 5, m, 0, 'narrow');
+  assert.equal(slots.length, 5);
+  assert.equal(new Set(slots.map((s) => `${s.x},${s.y}`)).size, 5);
+  for (const s of slots) assert.equal(s.x, 8);
+  assert.deepEqual(
+    slots.map((s) => s.y).sort((a, b) => a - b),
+    [6, 7, 8, 9, 10],
+  );
+});
+
+test('formationSlots wide skips blocked cells and stays unique', () => {
+  // Water punches two holes in the target row.
+  const m = makeMap(16, 16, [
+    [7, 8],
+    [9, 8],
+  ]);
+  const slots = formationSlots({ x: 8, y: 8 }, 7, m, 0, 'wide');
+  assert.equal(slots.length, 7);
+  assert.equal(new Set(slots.map((s) => `${s.x},${s.y}`)).size, 7);
+  for (const s of slots) assert.ok(isPassable(m, s.x, s.y));
+});
+
+test('findPathGroup honors the wide formation', () => {
+  const m = makeMap(20, 20);
+  const starts: Tile[] = [
+    { x: 2, y: 10 },
+    { x: 3, y: 10 },
+    { x: 4, y: 10 },
+  ];
+  const res = findPathGroup(m, starts, { x: 15, y: 10 }, { formation: 'wide' });
+  assert.equal(res.slots.length, 3);
+  assert.equal(new Set(res.slots.map((s) => `${s.x},${s.y}`)).size, 3);
+  for (const s of res.slots) assert.equal(s.y, 10);
 });

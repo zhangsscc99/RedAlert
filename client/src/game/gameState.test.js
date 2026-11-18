@@ -130,6 +130,24 @@ function tileCenter(t) {
 }
 
 // src/game/pathfind.ts
+var ROAD = 3;
+var COST_ROAD = 0.6;
+var COST_GRASS = 1;
+var COST_ORE = 3;
+var MIN_TERRAIN_COST = COST_ROAD;
+var CROWD_COST = 1;
+function tileCost(t) {
+  switch (t) {
+    case ROAD:
+      return COST_ROAD;
+    case GRASS:
+      return COST_GRASS;
+    case ORE:
+      return COST_ORE;
+    default:
+      return Infinity;
+  }
+}
 var SQRT2 = Math.SQRT2;
 var DIRS = [
   [1, 0, 1],
@@ -190,7 +208,7 @@ var Heap = class {
 function terrainPassable(map) {
   return (x, y) => isPassable(map, x, y);
 }
-function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget) {
+function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget, hScale = 1) {
   const n = map.w * map.h;
   const g = new Float64Array(n).fill(Infinity);
   const f = new Float64Array(n).fill(Infinity);
@@ -199,7 +217,7 @@ function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget) {
   const start = idx(map, sx, sy);
   const goal = idx(map, gx, gy);
   g[start] = 0;
-  f[start] = octile(sx, sy, gx, gy);
+  f[start] = octile(sx, sy, gx, gy) * hScale;
   const open = new Heap(f);
   open.push(start);
   while (open.size > 0) {
@@ -220,10 +238,10 @@ function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget) {
       }
       if (stepClear && !stepClear(cx, cy, nx, ny)) continue;
       const ni = idx(map, nx, ny);
-      const ng = g[cur] + cost + (enterCost ? enterCost(nx, ny) : 0);
+      const ng = g[cur] + cost + (enterCost ? enterCost(nx, ny, cost) : 0);
       if (ng < g[ni]) {
         g[ni] = ng;
-        f[ni] = ng + octile(nx, ny, gx, gy);
+        f[ni] = ng + octile(nx, ny, gx, gy) * hScale;
         came[ni] = cur;
         open.push(ni);
       }
@@ -285,12 +303,50 @@ function nearestPassable(map, x, y, passable, maxRadius = 8) {
 function findPathSmooth(map, sx, sy, gx, gy, opts = {}) {
   if (!inBounds(map, sx, sy) || !inBounds(map, gx, gy)) return null;
   if (sx === gx && sy === gy) return [];
-  const blocked = blockedMask(map, opts.blockers ?? []);
+  const costMode = opts.terrainCost === true;
+  const blocked = blockedMask(map, opts.blockers ?? [], costMode);
   const nav = navFns(map, blocked, opts.radius ?? 0);
   if (!nav.clear(gx, gy)) return null;
-  const raw = astar(map, sx, sy, gx, gy, nav.clear, nav.step);
+  const counts = crowdCounts(map, opts.crowd, opts.crowdRadius ?? 1);
+  const enterCost = makeEnterCost(map, costMode, counts, opts.crowdCost ?? CROWD_COST);
+  const raw = astar(
+    map,
+    sx,
+    sy,
+    gx,
+    gy,
+    nav.clear,
+    nav.step,
+    enterCost,
+    void 0,
+    costMode ? MIN_TERRAIN_COST : 1
+  );
   if (!raw) return null;
-  return pullString({ x: sx, y: sy }, raw, nav.los);
+  const los = costAwareLos(map, nav.los, costMode, counts);
+  return pullString({ x: sx, y: sy }, raw, los);
+}
+function makeEnterCost(map, costMode, counts, per) {
+  if (!costMode && !counts) return void 0;
+  return (nx, ny, base) => (costMode ? (tileCost(map.tiles[idx(map, nx, ny)]) - COST_GRASS) * base : 0) + (counts ? counts[idx(map, nx, ny)] * per : 0);
+}
+function costAwareLos(map, los, costMode, counts) {
+  if (!costMode && !counts) return los;
+  const ok = (x, y) => (!costMode || tileCost(map.tiles[idx(map, x, y)]) <= COST_GRASS) && (!counts || counts[idx(map, x, y)] === 0);
+  return (a, b) => los(a, b) && supercoverWalk(map, a.x, a.y, b.x, b.y, ok);
+}
+function crowdCounts(map, units, r) {
+  if (!units || units.length === 0) return null;
+  const counts = new Uint16Array(map.w * map.h);
+  for (const u of units) {
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        const x = u.x + dx;
+        const y = u.y + dy;
+        if (inBounds(map, x, y)) counts[idx(map, x, y)]++;
+      }
+    }
+  }
+  return counts;
 }
 function navFns(map, blocked, radius) {
   if (radius > 0) {
@@ -318,10 +374,11 @@ function pullString(start, raw, los) {
   }
   return out;
 }
-function blockedMask(map, blockers) {
+function blockedMask(map, blockers, costMode = false) {
   const blocked = new Uint8Array(map.w * map.h);
   for (let i = 0; i < blocked.length; i++) {
-    if (map.tiles[i] !== GRASS) blocked[i] = 1;
+    const t = map.tiles[i];
+    if (costMode ? tileCost(t) === Infinity : t !== GRASS) blocked[i] = 1;
   }
   for (const b of blockers) {
     for (let y = b.gy; y < b.gy + b.h; y++) {
@@ -333,9 +390,12 @@ function blockedMask(map, blockers) {
   return blocked;
 }
 function supercoverClear(map, blocked, ax, ay, bx, by) {
+  return supercoverWalk(map, ax, ay, bx, by, (x, y) => !blocked[idx(map, x, y)]);
+}
+function supercoverWalk(map, ax, ay, bx, by, ok) {
   let x = ax;
   let y = ay;
-  if (blocked[idx(map, x, y)]) return false;
+  if (!ok(x, y)) return false;
   const sx = Math.sign(bx - ax);
   const sy = Math.sign(by - ay);
   const adx = Math.abs(bx - ax);
@@ -348,18 +408,18 @@ function supercoverClear(map, blocked, ax, ay, bx, by) {
     if (tx < ty) {
       x += sx;
       nx += 2;
-      if (blocked[idx(map, x, y)]) return false;
+      if (!ok(x, y)) return false;
     } else if (ty < tx) {
       y += sy;
       ny += 2;
-      if (blocked[idx(map, x, y)]) return false;
+      if (!ok(x, y)) return false;
     } else {
-      if (blocked[idx(map, x + sx, y)] || blocked[idx(map, x, y + sy)]) return false;
+      if (!ok(x + sx, y) || !ok(x, y + sy)) return false;
       x += sx;
       y += sy;
       nx += 2;
       ny += 2;
-      if (blocked[idx(map, x, y)]) return false;
+      if (!ok(x, y)) return false;
     }
   }
   return true;
@@ -1087,8 +1147,8 @@ function counterWeights(forces) {
     const count = forces[key] ?? 0;
     if (count <= 0) continue;
     const armor = armorOfKind(key);
-    w.infantry += count * damageMultiplier("bullet", armor);
-    w.tank += count * damageMultiplier("rocket", armor);
+    w.infantry += count * damageMultiplier2("bullet", armor);
+    w.tank += count * damageMultiplier2("rocket", armor);
   }
   return w;
 }

@@ -457,6 +457,26 @@ var UNIT_STATS = {
 var UNIT_RADIUS = UNIT_STATS.infantry.radius;
 var INFANTRY_SPEED = UNIT_STATS.infantry.speed;
 
+// src/game/economy.ts
+function createEconomy(start = 5e3, opts) {
+  const cap = opts?.cap;
+  const e = {
+    credits: cap !== void 0 ? Math.min(start, cap) : start,
+    earned: 0,
+    spent: 0,
+    cap,
+    maintenanceRate: opts?.maintenanceRate,
+    passiveRate: opts?.passiveRate,
+    storageFull: false,
+    broke: false,
+    lostToCap: 0
+  };
+  return e;
+}
+function createQueue() {
+  return [];
+}
+
 // src/game/buildings.ts
 var BUILDING_DEFS = {
   hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2e3, label: "HQ", buildable: false },
@@ -498,14 +518,7 @@ function place(buildings, kind, gx, gy, nextId) {
   buildings.push(b);
   return b;
 }
-
-// src/game/economy.ts
-function createEconomy(start = 5e3) {
-  return { credits: start, earned: 0, spent: 0 };
-}
-function createQueue() {
-  return [];
-}
+var RADAR_SCAN = { radius: 12 * TILE_SIZE, period: 5 };
 
 // src/game/unitRoles.ts
 var ROLE_STATS = {
@@ -601,6 +614,12 @@ var AI_CONTACT_RANGE = ROLE_STATS.scout.sight;
 var AI_EXPAND_TICKS = 45;
 var AI_BASE_CAP = 6;
 var AI_SITE_RADIUS = 14;
+var AI_SCOUT_PERIOD = 40;
+var AI_RETREAT_BY_DIFFICULTY = {
+  easy: 0.2,
+  normal: 0.28,
+  hard: 0.35
+};
 var EXPAND_WANT = {
   refinery: [1, 1, 1, 2, 2, 2, 2],
   barracks: [0, 1, 1, 1, 1, 2, 2],
@@ -613,6 +632,7 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
   const waveGap = opts.waveGap ?? WAVE_BALANCE.interval * tier.waveIntervalScale;
   const sizeScale = tier.enemyStartInfantry / DIFFICULTY.normal.enemyStartInfantry;
   const musterSize = opts.musterSize ?? Math.max(2, Math.round(AI_ARMY_PER_WAVE * sizeScale));
+  const tactics = opts.tactics ?? false;
   return {
     phase: "gather",
     credits: 0,
@@ -622,7 +642,7 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
     seed,
     incomeScale,
     rng: mulberry32(seed),
-    deep: opts.deep ?? false,
+    deep: (opts.deep ?? false) || tactics,
     difficulty,
     musterSize,
     waveGap,
@@ -631,7 +651,7 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
     spotted: false,
     scoutSent: false,
     retreatSent: false,
-    retreatRatio: opts.retreatRatio ?? AI_RETREAT_RATIO,
+    retreatRatio: opts.retreatRatio ?? (tactics ? AI_RETREAT_BY_DIFFICULTY[difficulty] : AI_RETREAT_RATIO),
     expand: opts.expandBase ?? false,
     ticks: 0,
     buildings: { refinery: 0, barracks: 0, turret: 0 },
@@ -641,7 +661,15 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
     saving: false,
     siteSelector: opts.buildSite ?? scanBuildSite,
     baseCap: opts.baseCap ?? AI_BASE_CAP,
-    expandTicks: opts.expandTicks ?? AI_EXPAND_TICKS
+    expandTicks: opts.expandTicks ?? AI_EXPAND_TICKS,
+    tactics,
+    known: { pos: null, units: {}, structures: {}, tick: -1 },
+    focus: null,
+    lastScoutTick: 0,
+    scoutsActive: 0,
+    healing: 0,
+    // Faster tiers scout more often: hard probes ~30s, easy ~54s.
+    scoutPeriod: opts.scoutPeriod ?? AI_SCOUT_PERIOD * tier.waveIntervalScale
   };
 }
 function scanBuildSite(q) {
@@ -669,7 +697,17 @@ function rectHitsAny(rects, gx, gy, w, h) {
 
 // src/game/harvest.ts
 function createHarvester(unit) {
-  return { unit, state: "idle", cargo: 0, target: null, stuckT: 0, lastX: unit.x, lastY: unit.y };
+  return {
+    unit,
+    state: "idle",
+    cargo: 0,
+    target: null,
+    noOre: false,
+    replans: 0,
+    stuckT: 0,
+    lastX: unit.x,
+    lastY: unit.y
+  };
 }
 
 // src/game/upgrades.ts
