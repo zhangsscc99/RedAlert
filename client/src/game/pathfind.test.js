@@ -177,7 +177,7 @@ function findPath(map, sx, sy, gx, gy) {
   if (!isPassable(map, gx, gy)) return null;
   return astar(map, sx, sy, gx, gy, terrainPassable(map));
 }
-function astar(map, sx, sy, gx, gy, passable) {
+function astar(map, sx, sy, gx, gy, passable, stepClear) {
   const n = map.w * map.h;
   const g = new Float64Array(n).fill(Infinity);
   const f = new Float64Array(n).fill(Infinity);
@@ -203,6 +203,7 @@ function astar(map, sx, sy, gx, gy, passable) {
       if (dx !== 0 && dy !== 0) {
         if (!passable(cx + dx, cy) || !passable(cx, cy + dy)) continue;
       }
+      if (stepClear && !stepClear(cx, cy, nx, ny)) continue;
       const ni = idx(map, nx, ny);
       const ng = g[cur] + cost;
       if (ng < g[ni]) {
@@ -265,6 +266,155 @@ function nearestPassable(map, x, y, passable, maxRadius = 8) {
     if (best) return best;
   }
   return null;
+}
+function findPathSmooth(map, sx, sy, gx, gy, opts = {}) {
+  if (!inBounds(map, sx, sy) || !inBounds(map, gx, gy)) return null;
+  if (sx === gx && sy === gy) return [];
+  const blocked = blockedMask(map, opts.blockers ?? []);
+  const radius = opts.radius ?? 0;
+  const clear = radius > 0 ? (x, y) => inBounds(map, x, y) && !blocked[idx(map, x, y)] && cellStaysClear(map, blocked, x, y, radius) : (x, y) => inBounds(map, x, y) && !blocked[idx(map, x, y)];
+  if (!clear(gx, gy)) return null;
+  const step = radius > 0 ? (cx, cy, nx, ny) => segStaysClear(map, blocked, cx, cy, nx, ny, radius) : void 0;
+  const raw = astar(map, sx, sy, gx, gy, clear, step);
+  if (!raw) return null;
+  const pts = [{ x: sx, y: sy }, ...raw];
+  const los = radius > 0 ? (a, b) => segStaysClear(map, blocked, a.x, a.y, b.x, b.y, radius) : (a, b) => supercoverClear(map, blocked, a.x, a.y, b.x, b.y);
+  const out = [];
+  let i = 0;
+  while (i < pts.length - 1) {
+    let j = pts.length - 1;
+    while (j > i + 1 && !los(pts[i], pts[j])) j--;
+    out.push(pts[j]);
+    i = j;
+  }
+  return out;
+}
+function blockedMask(map, blockers) {
+  const blocked = new Uint8Array(map.w * map.h);
+  for (let i = 0; i < blocked.length; i++) {
+    if (map.tiles[i] !== GRASS) blocked[i] = 1;
+  }
+  for (const b of blockers) {
+    for (let y = b.gy; y < b.gy + b.h; y++) {
+      for (let x = b.gx; x < b.gx + b.w; x++) {
+        if (inBounds(map, x, y)) blocked[idx(map, x, y)] = 1;
+      }
+    }
+  }
+  return blocked;
+}
+function supercoverClear(map, blocked, ax, ay, bx, by) {
+  let x = ax;
+  let y = ay;
+  if (blocked[idx(map, x, y)]) return false;
+  const sx = Math.sign(bx - ax);
+  const sy = Math.sign(by - ay);
+  const adx = Math.abs(bx - ax);
+  const ady = Math.abs(by - ay);
+  let nx = 1;
+  let ny = 1;
+  while (x !== bx || y !== by) {
+    const tx = nx * ady;
+    const ty = ny * adx;
+    if (tx < ty) {
+      x += sx;
+      nx += 2;
+      if (blocked[idx(map, x, y)]) return false;
+    } else if (ty < tx) {
+      y += sy;
+      ny += 2;
+      if (blocked[idx(map, x, y)]) return false;
+    } else {
+      if (blocked[idx(map, x + sx, y)] || blocked[idx(map, x, y + sy)]) return false;
+      x += sx;
+      y += sy;
+      nx += 2;
+      ny += 2;
+      if (blocked[idx(map, x, y)]) return false;
+    }
+  }
+  return true;
+}
+function cellStaysClear(map, blocked, x, y, r) {
+  const px = x + 0.5;
+  const py = y + 0.5;
+  const k = Math.ceil(r + 0.5);
+  for (let by = y - k; by <= y + k; by++) {
+    for (let bx = x - k; bx <= x + k; bx++) {
+      if (!inBounds(map, bx, by) || !blocked[idx(map, bx, by)]) continue;
+      if (pointBoxDist(px, py, bx, by) < r - EPS) return false;
+    }
+  }
+  return true;
+}
+function segStaysClear(map, blocked, ax, ay, bx, by, r) {
+  const px = ax + 0.5;
+  const py = ay + 0.5;
+  const qx = bx + 0.5;
+  const qy = by + 0.5;
+  const x0 = Math.max(0, Math.floor(Math.min(px, qx) - r - 1));
+  const x1 = Math.min(map.w - 1, Math.ceil(Math.max(px, qx) + r + 1) - 1);
+  const y0 = Math.max(0, Math.floor(Math.min(py, qy) - r - 1));
+  const y1 = Math.min(map.h - 1, Math.ceil(Math.max(py, qy) + r + 1) - 1);
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      if (!blocked[idx(map, x, y)]) continue;
+      if (segBoxDist(px, py, qx, qy, x, y) < r - EPS) return false;
+    }
+  }
+  return true;
+}
+var EPS = 1e-9;
+function pointBoxDist(px, py, bx, by) {
+  const dx = Math.max(bx - px, 0, px - bx - 1);
+  const dy = Math.max(by - py, 0, py - by - 1);
+  return Math.hypot(dx, dy);
+}
+function pointSegDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  let t = len2 === 0 ? 0 : ((px - ax) * dx + (py - ay) * dy) / len2;
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  return Math.hypot(px - ax - t * dx, py - ay - t * dy);
+}
+function orient(ox, oy, ax, ay, bx, by) {
+  return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox);
+}
+function segsMeet(ax, ay, bx, by, cx, cy, dx, dy) {
+  const d1 = orient(cx, cy, dx, dy, ax, ay);
+  const d2 = orient(cx, cy, dx, dy, bx, by);
+  const d3 = orient(ax, ay, bx, by, cx, cy);
+  const d4 = orient(ax, ay, bx, by, dx, dy);
+  if (d1 * d2 < 0 && d3 * d4 < 0) return true;
+  const onSeg = (sx, sy, ex, ey, px, py) => Math.min(sx, ex) - EPS <= px && px <= Math.max(sx, ex) + EPS && Math.min(sy, ey) - EPS <= py && py <= Math.max(sy, ey) + EPS;
+  if (Math.abs(d1) < EPS && onSeg(cx, cy, dx, dy, ax, ay)) return true;
+  if (Math.abs(d2) < EPS && onSeg(cx, cy, dx, dy, bx, by)) return true;
+  if (Math.abs(d3) < EPS && onSeg(ax, ay, bx, by, cx, cy)) return true;
+  if (Math.abs(d4) < EPS && onSeg(ax, ay, bx, by, dx, dy)) return true;
+  return false;
+}
+function segSegDist(ax, ay, bx, by, cx, cy, dx, dy) {
+  if (segsMeet(ax, ay, bx, by, cx, cy, dx, dy)) return 0;
+  return Math.min(
+    pointSegDist(ax, ay, cx, cy, dx, dy),
+    pointSegDist(bx, by, cx, cy, dx, dy),
+    pointSegDist(cx, cy, ax, ay, bx, by),
+    pointSegDist(dx, dy, ax, ay, bx, by)
+  );
+}
+function segBoxDist(px, py, qx, qy, bx, by) {
+  const x1 = bx + 1;
+  const y1 = by + 1;
+  if (px >= bx && px <= x1 && py >= by && py <= y1 || qx >= bx && qx <= x1 && qy >= by && qy <= y1) {
+    return 0;
+  }
+  return Math.min(
+    segSegDist(px, py, qx, qy, bx, by, x1, by),
+    segSegDist(px, py, qx, qy, x1, by, x1, y1),
+    segSegDist(px, py, qx, qy, x1, y1, bx, y1),
+    segSegDist(px, py, qx, qy, bx, y1, bx, by)
+  );
 }
 
 // src/game/pathfind.test.ts
@@ -404,6 +554,174 @@ test("findPathAvoiding with no blockers matches findPath", () => {
   const a = findPath(m, 1, 1, 8, 1);
   const b = findPathAvoiding(m, { x: 1, y: 1 }, { x: 8, y: 1 }, []);
   assert.deepEqual(b, a);
+});
+function sweptTiles(start, path) {
+  const out = /* @__PURE__ */ new Set();
+  const pts = [start, ...path];
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1];
+    const b = pts[i];
+    const steps = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.y - a.y) / 0.05));
+    for (let s = 0; s <= steps; s++) {
+      const px = a.x + 0.5 + (b.x - a.x) * s / steps;
+      const py = a.y + 0.5 + (b.y - a.y) * s / steps;
+      out.add(`${Math.floor(px)},${Math.floor(py)}`);
+    }
+  }
+  return out;
+}
+function assertSegmentsPassable(m, blockers, start, path) {
+  for (const key of sweptTiles(start, path)) {
+    const [tx, ty] = key.split(",").map(Number);
+    assert.ok(isPassable(m, tx, ty), `path crosses impassable ${tx},${ty}`);
+    assert.ok(!inAny(blockers, { x: tx, y: ty }), `path crosses blocker at ${tx},${ty}`);
+  }
+}
+function distToBlockers(blockers, px, py) {
+  let best = Infinity;
+  for (const b of blockers) {
+    const dx = Math.max(b.gx - px, 0, px - (b.gx + b.w));
+    const dy = Math.max(b.gy - py, 0, py - (b.gy + b.h));
+    best = Math.min(best, Math.hypot(dx, dy));
+  }
+  return best;
+}
+function assertSegmentsKeepRadius(blockers, start, path, radius) {
+  const pts = [start, ...path];
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1];
+    const b = pts[i];
+    const steps = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.y - a.y) / 0.05));
+    for (let s = 0; s <= steps; s++) {
+      const px = a.x + 0.5 + (b.x - a.x) * s / steps;
+      const py = a.y + 0.5 + (b.y - a.y) * s / steps;
+      const d = distToBlockers(blockers, px, py);
+      assert.ok(d >= radius - 1e-6, `segment ${i} passes ${d} < ${radius} from a blocker`);
+    }
+  }
+}
+test("findPathSmooth collapses a straight run to a single waypoint", () => {
+  const m = makeMap(10, 10);
+  assert.deepEqual(findPathSmooth(m, 1, 1, 8, 1), [{ x: 8, y: 1 }]);
+  assert.deepEqual(findPathSmooth(m, 1, 1, 8, 8), [{ x: 8, y: 8 }]);
+});
+test("findPathSmooth honors the findPath endpoint contract", () => {
+  const m = makeMap(10, 10, [[5, 5]]);
+  assert.deepEqual(findPathSmooth(m, 3, 3, 3, 3), []);
+  assert.equal(findPathSmooth(m, 3, 3, 5, 5), null);
+  assert.equal(findPathSmooth(m, -1, 0, 3, 3), null);
+});
+test("findPathSmooth detours a wall with fewer, longer legs than A*", () => {
+  const wall = [];
+  for (let y = 0; y <= 7; y++) wall.push([4, y]);
+  const m = makeMap(10, 10, wall);
+  const raw = findPath(m, 2, 3, 7, 3);
+  const path = findPathSmooth(m, 2, 3, 7, 3);
+  assert.ok(path);
+  assert.deepEqual(path.at(-1), { x: 7, y: 3 });
+  assert.ok(path.length < raw.length, `expected fewer than ${raw.length} waypoints`);
+  assert.ok(path.some((t) => t.y >= 8), "must still route through the gap");
+  for (const t of path) assert.ok(isPassable(m, t.x, t.y));
+  assertSegmentsPassable(m, [], { x: 2, y: 3 }, path);
+});
+test("findPathSmooth never lets a segment cross blocked terrain", () => {
+  const m = makeMap(12, 12, [
+    [3, 3],
+    [4, 3],
+    [3, 4],
+    [7, 6],
+    [7, 7],
+    [8, 7],
+    [5, 8],
+    [6, 8]
+  ]);
+  for (const [gx, gy] of [
+    [9, 9],
+    [1, 9],
+    [10, 2]
+  ]) {
+    const path = findPathSmooth(m, 1, 1, gx, gy);
+    assert.ok(path, `goal ${gx},${gy} reachable`);
+    assert.deepEqual(path.at(-1), { x: gx, y: gy });
+    assertSegmentsPassable(m, [], { x: 1, y: 1 }, path);
+  }
+});
+test("findPathSmooth cannot jump a diagonal pinch", () => {
+  const m = makeMap(5, 5, [
+    [2, 1],
+    [1, 2]
+  ]);
+  const path = findPathSmooth(m, 1, 1, 2, 2);
+  assert.ok(path);
+  assert.deepEqual(path.at(-1), { x: 2, y: 2 });
+  assert.ok(path.length > 1, "direct diagonal must not survive smoothing");
+  assertSegmentsPassable(m, [], { x: 1, y: 1 }, path);
+});
+test("findPathSmooth returns null when the goal is sealed off", () => {
+  const m = makeMap(5, 5, [
+    [1, 2],
+    [2, 1],
+    [3, 2],
+    [2, 3]
+  ]);
+  assert.equal(findPathSmooth(m, 0, 0, 2, 2), null);
+});
+test("findPathSmooth routes around blockers and rejects a goal inside one", () => {
+  const m = makeMap(10, 10);
+  const wall = [{ gx: 4, gy: 0, w: 1, h: 8 }];
+  const path = findPathSmooth(m, 2, 3, 7, 3, { blockers: wall });
+  assert.ok(path);
+  assert.deepEqual(path.at(-1), { x: 7, y: 3 });
+  assert.ok(path.some((t) => t.y >= 8));
+  assertSegmentsPassable(m, wall, { x: 2, y: 3 }, path);
+  assert.equal(findPathSmooth(m, 2, 3, 4, 4, { blockers: wall }), null);
+});
+test("radius keeps every segment clear of blockers", () => {
+  const m = makeMap(12, 12);
+  const box = [{ gx: 5, gy: 4, w: 3, h: 3 }];
+  const radius = 1;
+  const path = findPathSmooth(m, 2, 5, 9, 5, { blockers: box, radius });
+  assert.ok(path);
+  assert.deepEqual(path.at(-1), { x: 9, y: 5 });
+  for (const t of path) {
+    const d = Math.max(
+      Math.max(5 - t.x, t.x - 7, 0),
+      Math.max(4 - t.y, t.y - 6, 0)
+    );
+    assert.ok(d >= 2, `waypoint ${t.x},${t.y} too close to blocker`);
+    assert.ok(!inAny(box, t));
+  }
+  assertSegmentsPassable(m, box, { x: 2, y: 5 }, path);
+  assertSegmentsKeepRadius(box, { x: 2, y: 5 }, path, radius);
+});
+test("radius defaults off but seals a one-tile gap when enabled", () => {
+  const m = makeMap(10, 10);
+  const wall = [
+    { gx: 4, gy: 0, w: 1, h: 4 },
+    { gx: 4, gy: 5, w: 1, h: 5 }
+  ];
+  const slim = findPathSmooth(m, 2, 4, 7, 4, { blockers: wall });
+  assert.ok(slim);
+  assert.ok(
+    sweptTiles({ x: 2, y: 4 }, slim).has("4,4"),
+    "expected the route to thread the one-tile gap"
+  );
+  assert.equal(findPathSmooth(m, 2, 4, 7, 4, { blockers: wall, radius: 1 }), null);
+});
+test("radius also applies to blocked terrain, not just blockers", () => {
+  const wall = [];
+  for (let y = 0; y <= 7; y++) wall.push([4, y]);
+  const m = makeMap(10, 10, wall);
+  const radius = 1;
+  const path = findPathSmooth(m, 2, 3, 7, 3, { radius });
+  assert.ok(path);
+  assertSegmentsPassable(m, [], { x: 2, y: 3 }, path);
+  for (const t of path) {
+    for (const [wx, wy] of wall) {
+      const d = Math.max(Math.abs(t.x - wx), Math.abs(t.y - wy));
+      assert.ok(d >= 2, `waypoint ${t.x},${t.y} hugs water ${wx},${wy}`);
+    }
+  }
 });
 test("generated map: center is pathable to a distant grass tile", () => {
   const m = generateMap(1337);

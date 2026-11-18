@@ -102,7 +102,7 @@ function findPath(map, sx, sy, gx, gy) {
   if (!isPassable(map, gx, gy)) return null;
   return astar(map, sx, sy, gx, gy, terrainPassable(map));
 }
-function astar(map, sx, sy, gx, gy, passable) {
+function astar(map, sx, sy, gx, gy, passable, stepClear) {
   const n = map.w * map.h;
   const g = new Float64Array(n).fill(Infinity);
   const f = new Float64Array(n).fill(Infinity);
@@ -128,6 +128,7 @@ function astar(map, sx, sy, gx, gy, passable) {
       if (dx !== 0 && dy !== 0) {
         if (!passable(cx + dx, cy) || !passable(cx, cy + dy)) continue;
       }
+      if (stepClear && !stepClear(cx, cy, nx, ny)) continue;
       const ni = idx(map, nx, ny);
       const ng = g[cur] + cost;
       if (ng < g[ni]) {

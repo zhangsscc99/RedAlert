@@ -14,7 +14,7 @@ import {
   TILE_SIZE,
   type GameMap,
 } from './grid.js';
-import { findPath, snapToPassable } from './pathfind.js';
+import { findPathSmooth, snapToPassable, type Blocker } from './pathfind.js';
 import { UNIT_STATS, updateUnits, type Unit, type UnitKind } from './units.js';
 import {
   BUILDING_DEFS,
@@ -342,11 +342,37 @@ function spawnEnemy(g: GameState, kind: 'infantry' | 'tank'): void {
   if (t) g.enemyUnits.push(makeGUnit(g.nextId++, kind, t.x, t.y, 'enemy', g.opts.enemyStrength));
 }
 
-/** Route one unit toward a world-px goal (snapped to a passable tile). */
+/** Building footprints as path blockers for findPathSmooth. */
+function buildingBlockers(g: GameState): Blocker[] {
+  return allBuildings(g).map((b) => {
+    const d = BUILDING_DEFS[b.kind];
+    return { gx: b.gx, gy: b.gy, w: d.w, h: d.h };
+  });
+}
+
+/**
+ * Route one unit toward a world-px goal (snapped to a passable tile).
+ * Enemy units path around building footprints — never through them — and
+ * keep their body radius clear of walls so wide units don't snag on corners.
+ */
 function pathTo(g: GameState, u: GUnit, to: Point): void {
-  const goal = snapToPassable(g.map, worldToTile(to.x), worldToTile(to.y));
+  const snapped = snapToPassable(g.map, worldToTile(to.x), worldToTile(to.y));
+  if (!snapped) return;
+  const bs = allBuildings(g);
+  const goal = tileFree(g.map, bs, snapped.x, snapped.y)
+    ? snapped
+    : freeTilesNear(g.map, bs, snapped.x, snapped.y, 1)[0];
   if (!goal) return;
-  const p = findPath(g.map, worldToTile(u.x), worldToTile(u.y), goal.x, goal.y);
+  const blockers = buildingBlockers(g);
+  const ux = worldToTile(u.x);
+  const uy = worldToTile(u.y);
+  const p =
+    findPathSmooth(g.map, ux, uy, goal.x, goal.y, {
+      blockers,
+      radius: UNIT_STATS[u.kind].radius / TILE_SIZE,
+    }) ??
+    // A unit a building was dropped on still walks out with zero clearance.
+    findPathSmooth(g.map, ux, uy, goal.x, goal.y, { blockers });
   if (p) u.path = p.map((t) => ({ x: tileCenter(t.x), y: tileCenter(t.y) }));
 }
 

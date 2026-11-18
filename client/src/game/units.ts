@@ -1,7 +1,7 @@
 // Unit state + movement. Pure logic, no DOM.
 
-import { isPassable, tileCenter, worldToTile, type GameMap } from './grid.js';
-import { findPath, snapToPassable } from './pathfind.js';
+import { isPassable, TILE_SIZE, tileCenter, worldToTile, type GameMap } from './grid.js';
+import { findPathSmooth, snapToPassable } from './pathfind.js';
 import type { Point } from './selection.js';
 
 export type UnitKind = 'infantry' | 'harvester' | 'tank';
@@ -111,7 +111,9 @@ export function commandMove(units: Unit[], map: GameMap, gx: number, gy: number)
   let ordered = 0;
   for (const u of units) {
     if (!u.selected) continue;
-    const path = findPath(map, worldToTile(u.x), worldToTile(u.y), goal.x, goal.y);
+    const path = findPathSmooth(map, worldToTile(u.x), worldToTile(u.y), goal.x, goal.y, {
+      radius: UNIT_STATS[u.kind].radius / TILE_SIZE,
+    });
     if (!path) continue;
     u.path = path.map((t) => ({ x: tileCenter(t.x), y: tileCenter(t.y) }));
     ordered++;
