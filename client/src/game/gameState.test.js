@@ -763,6 +763,7 @@ var DIFFICULTY = {
 };
 
 // src/game/enemyAI.ts
+var AI_BUILD_KINDS = ["refinery", "barracks", "turret"];
 var AI_TICK = 1;
 var AI_INCOME_PER_TICK = 8;
 var AI_BUILD_CREDITS = 240;
@@ -772,6 +773,25 @@ var AI_INFANTRY_PER_WAVE = 6;
 var AI_ARMY_PER_WAVE = 15;
 var AI_RETREAT_RATIO = 0.35;
 var AI_CONTACT_RANGE = ROLE_STATS.scout.sight;
+var AI_REFINERY_INCOME = 6;
+var AI_BUILDING_COST = {
+  refinery: 350,
+  barracks: 150,
+  turret: 200
+};
+var AI_EXPAND_TICKS = 45;
+var AI_ORDER_SETTLE = 30;
+var AI_BASE_CAP = 6;
+var AI_DEFEND_RATIO = 1.5;
+var AI_SITE_RADIUS = 14;
+var EXPAND_WANT = {
+  refinery: [1, 1, 1, 2, 2, 2, 2],
+  barracks: [0, 1, 1, 1, 1, 2, 2],
+  turret: [0, 0, 1, 1, 2, 2, 3]
+};
+var EXPAND_MAX_LEVEL = EXPAND_WANT.refinery.length - 1;
+var AI_GAP_SHRINK = 0.07;
+var AI_MIN_GAP_SCALE = 0.55;
 var ATTACK_JITTER_TILES = 6;
 var SCOUT_JITTER_TILES = 12;
 var AI_WEAPON = {
@@ -810,7 +830,17 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
     spotted: false,
     scoutSent: false,
     retreatSent: false,
-    retreatRatio: opts.retreatRatio ?? AI_RETREAT_RATIO
+    retreatRatio: opts.retreatRatio ?? AI_RETREAT_RATIO,
+    expand: opts.expandBase ?? false,
+    ticks: 0,
+    buildings: { refinery: 0, barracks: 0, turret: 0 },
+    buildOrders: [],
+    sites: [],
+    defenders: 0,
+    saving: false,
+    siteSelector: opts.buildSite ?? scanBuildSite,
+    baseCap: opts.baseCap ?? AI_BASE_CAP,
+    expandTicks: opts.expandTicks ?? AI_EXPAND_TICKS
   };
 }
 function stepAI(s, dt, intel) {
@@ -818,17 +848,26 @@ function stepAI(s, dt, intel) {
   s.timer += dt;
   while (s.timer >= AI_TICK) {
     s.timer -= AI_TICK;
-    s.credits += AI_INCOME_PER_TICK * s.incomeScale;
+    s.ticks += 1;
+    s.credits += AI_INCOME_PER_TICK * s.incomeScale + AI_REFINERY_INCOME * s.buildings.refinery;
     s.sinceWave += AI_TICK;
     if (intel?.contact) s.spotted = true;
+    s.saving = false;
+    if (s.expand) {
+      settleBuildOrders(s);
+      syncBuildings(s, intel);
+      maybeDefend(s, intel, cmds);
+      maybeBuild(s, intel, cmds);
+    }
     switch (s.phase) {
       case "gather":
         if (s.credits >= AI_BUILD_CREDITS) s.phase = s.deep ? "scout" : "build";
         break;
       case "build": {
-        const kind = s.army < AI_INFANTRY_PER_WAVE ? "infantry" : "tank";
-        const cost = kind === "infantry" ? AI_INFANTRY_COST : AI_TANK_COST;
-        if (s.credits >= cost) {
+        for (let i = trainsPerTick(s); i > 0 && !s.saving; i--) {
+          const kind = s.army < AI_INFANTRY_PER_WAVE ? "infantry" : "tank";
+          const cost = kind === "infantry" ? AI_INFANTRY_COST : AI_TANK_COST;
+          if (s.credits < cost) break;
           s.credits -= cost;
           s.army += 1;
           cmds.push({ type: "train", kind });
@@ -850,14 +889,15 @@ function stepAI(s, dt, intel) {
         break;
       }
       case "muster": {
-        const kind = pickTrainKind(s, intel);
-        const cost = kind === "infantry" ? AI_INFANTRY_COST : AI_TANK_COST;
-        if (s.credits >= cost) {
+        for (let i = trainsPerTick(s); i > 0 && !s.saving; i--) {
+          const kind = pickTrainKind(s, intel);
+          const cost = kind === "infantry" ? AI_INFANTRY_COST : AI_TANK_COST;
+          if (s.credits < cost) break;
           s.credits -= cost;
           s.army += 1;
           cmds.push({ type: "train", kind });
         }
-        const ready = s.army >= s.musterSize && s.sinceWave >= s.waveGap;
+        const ready = s.army >= s.musterSize && s.sinceWave >= effectiveWaveGap(s);
         const commit = Math.max(2, Math.ceil(s.musterSize / 3));
         if (ready || s.spotted && s.army >= commit) {
           launchWave(s, cmds);
@@ -895,7 +935,9 @@ function pickTrainKind(s, intel) {
 }
 function maybeRetreat(s, intel, cmds) {
   if (!s.deep) return;
-  if ((intel?.lowHp ?? 0) <= 0) {
+  const low = intel?.lowHp ?? 0;
+  const stranded = s.expand ? Math.min(low, intel?.unsupported ?? low) : low;
+  if (low <= 0 || stranded <= 0) {
     s.retreatSent = false;
     return;
   }
@@ -912,6 +954,7 @@ function launchWave(s, cmds) {
   s.sinceWave = 0;
   s.spotted = false;
   s.retreatSent = false;
+  s.defenders = 0;
   cmds.push({ type: "move", to: attackTarget(s) }, { type: "attack" });
 }
 function attackTarget(s) {
@@ -921,6 +964,107 @@ function jitterTarget(s, jitterTiles) {
   const tx = MAP_W / 2 + (s.rng() * 2 - 1) * jitterTiles;
   const ty = MAP_H / 2 + (s.rng() * 2 - 1) * jitterTiles;
   return { x: tileCenter(Math.floor(tx)), y: tileCenter(Math.floor(ty)) };
+}
+function expandLevel(s) {
+  const tier = DIFFICULTY[s.difficulty];
+  const pace = 1 / tier.waveIntervalScale;
+  const cap = Math.min(tier.enemyStartInfantry, EXPAND_MAX_LEVEL);
+  return Math.min(cap, Math.floor(s.ticks * pace / s.expandTicks));
+}
+function trainsPerTick(s) {
+  return s.expand ? 1 + s.buildings.barracks : 1;
+}
+function effectiveWaveGap(s) {
+  if (!s.expand) return s.waveGap;
+  return s.waveGap * Math.max(AI_MIN_GAP_SCALE, 1 - AI_GAP_SHRINK * expandLevel(s));
+}
+function settleBuildOrders(s) {
+  if (s.buildOrders.length === 0) return;
+  s.buildOrders = s.buildOrders.filter((o) => s.ticks - o.tick < AI_ORDER_SETTLE);
+}
+function pendingBuilds(s, kind) {
+  let n = 0;
+  for (const o of s.buildOrders) if (o.kind === kind) n += 1;
+  return n;
+}
+function syncBuildings(s, intel) {
+  const rep = intel?.buildings;
+  if (!rep) return;
+  for (const kind of AI_BUILD_KINDS) {
+    const n = Math.max(0, rep[kind] ?? 0);
+    const delta = n - s.buildings[kind];
+    s.buildings[kind] = n;
+    if (delta <= 0) continue;
+    let left = delta;
+    s.buildOrders = s.buildOrders.filter((o) => {
+      if (o.kind === kind && left > 0) {
+        left -= 1;
+        return false;
+      }
+      return true;
+    });
+  }
+}
+function maybeDefend(s, intel, cmds) {
+  const threats = intel?.threats ?? 0;
+  const need = threats > 0 ? Math.min(s.army, Math.max(1, Math.ceil(threats * AI_DEFEND_RATIO))) : 0;
+  if (need === s.defenders) return;
+  s.defenders = need;
+  cmds.push({ type: "defend", to: anchorOf(intel), count: need });
+}
+function maybeBuild(s, intel, cmds) {
+  const level = expandLevel(s);
+  let owned = 0;
+  for (const k of AI_BUILD_KINDS) owned += s.buildings[k] + pendingBuilds(s, k);
+  for (const kind of AI_BUILD_KINDS) {
+    const want = EXPAND_WANT[kind][Math.min(level, EXPAND_MAX_LEVEL)];
+    if (s.buildings[kind] + pendingBuilds(s, kind) >= want) continue;
+    if (owned >= s.baseCap) return;
+    const cost = AI_BUILDING_COST[kind];
+    if (s.credits < cost) {
+      s.saving = true;
+      return;
+    }
+    const at = siteFor(s, kind, intel);
+    if (!at) return;
+    s.credits -= cost;
+    s.buildOrders.push({ kind, tick: s.ticks });
+    const def = BUILDING_DEFS[kind];
+    s.sites.push({ gx: at.x, gy: at.y, w: def.w, h: def.h });
+    cmds.push({ type: "build", kind, at });
+    return;
+  }
+}
+function siteFor(s, kind, intel) {
+  const a = anchorOf(intel);
+  return s.siteSelector({
+    kind,
+    anchor: { x: worldToTile(a.x), y: worldToTile(a.y) },
+    occupied: [...intel?.occupied ?? [], ...s.sites],
+    index: s.sites.length
+  });
+}
+function scanBuildSite(q) {
+  const def = BUILDING_DEFS[q.kind];
+  for (let r = 1; r <= AI_SITE_RADIUS; r++) {
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+        const gx = q.anchor.x + dx;
+        const gy = q.anchor.y + dy;
+        if (gx < 0 || gy < 0 || gx + def.w > MAP_W || gy + def.h > MAP_H) continue;
+        if (rectHitsAny(q.occupied, gx, gy, def.w, def.h)) continue;
+        return { x: gx, y: gy };
+      }
+    }
+  }
+  return null;
+}
+function rectHitsAny(rects, gx, gy, w, h) {
+  for (const r of rects) {
+    if (gx < r.gx + r.w && gx + w > r.gx && gy < r.gy + r.h && gy + h > r.gy) return true;
+  }
+  return false;
 }
 
 // src/game/harvest.ts
