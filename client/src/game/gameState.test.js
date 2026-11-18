@@ -105,6 +105,18 @@ function inBounds(map, x, y) {
 function isPassable(map, x, y) {
   return inBounds(map, x, y) && map.tiles[idx(map, x, y)] === GRASS;
 }
+function isOre(map, x, y) {
+  return inBounds(map, x, y) && map.tiles[idx(map, x, y)] === ORE;
+}
+function oreTiles(map) {
+  const out = [];
+  for (let y = 0; y < map.h; y++) {
+    for (let x = 0; x < map.w; x++) {
+      if (map.tiles[y * map.w + x] === ORE) out.push({ x, y });
+    }
+  }
+  return out;
+}
 function countTerrain(map, t) {
   let n = 0;
   for (let i = 0; i < map.tiles.length; i++) if (map.tiles[i] === t) n++;
@@ -461,6 +473,229 @@ function attackTarget(s) {
   return { x: tileCenter(Math.floor(tx)), y: tileCenter(Math.floor(ty)) };
 }
 
+// src/game/harvest.ts
+var HARVEST_RATE = 140;
+var HARVEST_CAPACITY = 700;
+var ORE_RESERVE = 350;
+function createHarvester(unit) {
+  return { unit, state: "idle", cargo: 0, target: null };
+}
+var reservesByMap = /* @__PURE__ */ new WeakMap();
+function reserveTable(map) {
+  let r = reservesByMap.get(map);
+  if (!r) {
+    r = new Float64Array(map.w * map.h);
+    for (const t of oreTiles(map)) r[idx(map, t.x, t.y)] = ORE_RESERVE;
+    reservesByMap.set(map, r);
+  }
+  return r;
+}
+function stepAlong(u, dt) {
+  let remaining = UNIT_STATS.harvester.speed * dt;
+  while (remaining > 0) {
+    const target = u.path[0];
+    if (!target) break;
+    const dx = target.x - u.x;
+    const dy = target.y - u.y;
+    const dist2 = Math.hypot(dx, dy);
+    u.angle = Math.atan2(dy, dx);
+    if (dist2 <= remaining) {
+      u.x = target.x;
+      u.y = target.y;
+      u.path.shift();
+      remaining -= dist2;
+    } else {
+      u.x += dx / dist2 * remaining;
+      u.y += dy / dist2 * remaining;
+      remaining = 0;
+    }
+  }
+}
+function setPath(u, map, goal) {
+  const path = findPath(map, worldToTile(u.x), worldToTile(u.y), goal.x, goal.y);
+  if (!path) {
+    u.path = [];
+    return false;
+  }
+  u.path = path.map((t) => ({ x: tileCenter(t.x), y: tileCenter(t.y) }));
+  return true;
+}
+function toIdle(h) {
+  h.state = "idle";
+  h.target = null;
+  h.unit.path = [];
+}
+function isViableOre(map, reserves, t) {
+  return t !== null && isOre(map, t.x, t.y) && reserves[idx(map, t.x, t.y)] > 0;
+}
+function standTileFor(map, ore, ux, uy) {
+  let best = null;
+  let bestD = Infinity;
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      if (dx === 0 && dy === 0) continue;
+      const x = ore.x + dx;
+      const y = ore.y + dy;
+      if (!isPassable(map, x, y)) continue;
+      const d = (x - ux) * (x - ux) + (y - uy) * (y - uy);
+      if (d < bestD) {
+        bestD = d;
+        best = { x, y };
+      }
+    }
+  }
+  return best;
+}
+function onOreEdge(ux, uy, ore) {
+  return Math.max(Math.abs(ux - ore.x), Math.abs(uy - ore.y)) <= 1;
+}
+function sendToOre(h, map, reserves) {
+  const ux = worldToTile(h.unit.x);
+  const uy = worldToTile(h.unit.y);
+  const candidates = oreTiles(map).filter((t) => reserves[idx(map, t.x, t.y)] > 0).sort((a, b) => (a.x - ux) ** 2 + (a.y - uy) ** 2 - ((b.x - ux) ** 2 + (b.y - uy) ** 2));
+  for (const ore of candidates) {
+    if (onOreEdge(ux, uy, ore)) {
+      h.target = { x: ore.x, y: ore.y };
+      h.state = "mining";
+      h.unit.path = [];
+      return true;
+    }
+    const stand = standTileFor(map, ore, ux, uy);
+    if (!stand || !setPath(h.unit, map, stand)) continue;
+    h.target = { x: ore.x, y: ore.y };
+    h.state = "toOre";
+    return true;
+  }
+  return false;
+}
+function dropoffBuilding(buildings, ux, uy) {
+  const done = buildings.filter((b) => b.done && (b.kind === "refinery" || b.kind === "hq"));
+  const refs = done.filter((b) => b.kind === "refinery");
+  const pool = refs.length > 0 ? refs : done;
+  let best = null;
+  let bestD = Infinity;
+  for (const b of pool) {
+    const def = BUILDING_DEFS[b.kind];
+    const cx = b.gx + def.w / 2;
+    const cy = b.gy + def.h / 2;
+    const d = (cx - ux) * (cx - ux) + (cy - uy) * (cy - uy);
+    if (d < bestD) {
+      bestD = d;
+      best = b;
+    }
+  }
+  return best;
+}
+function sendToRefinery(h, map, buildings) {
+  const ux = worldToTile(h.unit.x);
+  const uy = worldToTile(h.unit.y);
+  const b = dropoffBuilding(buildings, ux, uy);
+  if (!b) return false;
+  const def = BUILDING_DEFS[b.kind];
+  const stand = snapToPassable(map, Math.floor(b.gx + def.w / 2), Math.floor(b.gy + def.h / 2));
+  if (!stand || !setPath(h.unit, map, stand)) return false;
+  h.target = { x: stand.x, y: stand.y };
+  h.state = h.unit.path.length === 0 ? "unloading" : "toRefinery";
+  return true;
+}
+function hasDropoff(buildings) {
+  return buildings.some((b) => b.done && (b.kind === "refinery" || b.kind === "hq"));
+}
+function updateHarvesters(hs, map, buildings, economy, dt) {
+  const depleted = [];
+  if (dt <= 0) return depleted;
+  const reserves = reserveTable(map);
+  for (const h of hs) {
+    if (h.unit.kind !== "harvester") continue;
+    switch (h.state) {
+      case "idle": {
+        if (h.cargo > 0) {
+          sendToRefinery(h, map, buildings);
+        } else if (hasDropoff(buildings)) {
+          sendToOre(h, map, reserves);
+        }
+        break;
+      }
+      case "toOre": {
+        if (!isViableOre(map, reserves, h.target)) {
+          toIdle(h);
+          break;
+        }
+        stepAlong(h.unit, dt);
+        if (h.unit.path.length === 0) {
+          const ux = worldToTile(h.unit.x);
+          const uy = worldToTile(h.unit.y);
+          h.state = onOreEdge(ux, uy, h.target) ? "mining" : "idle";
+          if (h.state === "idle") h.target = null;
+        }
+        break;
+      }
+      case "mining": {
+        if (!isViableOre(map, reserves, h.target)) {
+          if (h.cargo >= HARVEST_CAPACITY) {
+            if (!sendToRefinery(h, map, buildings)) toIdle(h);
+          } else if (!sendToOre(h, map, reserves)) {
+            if (h.cargo <= 0 || !sendToRefinery(h, map, buildings)) toIdle(h);
+          }
+          break;
+        }
+        const i = idx(map, h.target.x, h.target.y);
+        const take = Math.min(HARVEST_RATE * dt, HARVEST_CAPACITY - h.cargo, reserves[i]);
+        h.cargo += take;
+        reserves[i] = reserves[i] - take;
+        if (reserves[i] <= 0) {
+          reserves[i] = 0;
+          depleted.push({ x: h.target.x, y: h.target.y });
+        }
+        if (h.cargo >= HARVEST_CAPACITY) {
+          if (!sendToRefinery(h, map, buildings)) toIdle(h);
+        } else if (reserves[i] <= 0) {
+          if (!sendToOre(h, map, reserves)) {
+            if (!sendToRefinery(h, map, buildings)) toIdle(h);
+          }
+        }
+        break;
+      }
+      case "toRefinery": {
+        stepAlong(h.unit, dt);
+        if (h.unit.path.length === 0) h.state = "unloading";
+        break;
+      }
+      case "unloading": {
+        credit(economy, h.cargo);
+        h.cargo = 0;
+        h.target = null;
+        h.state = "idle";
+        break;
+      }
+    }
+  }
+  return depleted;
+}
+
+// src/game/power.ts
+var HQ_PRODUCTION = 50;
+var POWER_PLANT_PRODUCTION = 100;
+var CONSUMPTION = {
+  barracks: 40,
+  refinery: 50
+};
+function computePower(buildings) {
+  let produced = 0;
+  let consumed = 0;
+  for (const b of buildings) {
+    if (b.kind === "hq") produced += HQ_PRODUCTION;
+    else if (b.kind === "power") produced += POWER_PLANT_PRODUCTION;
+    consumed += CONSUMPTION[b.kind] ?? 0;
+  }
+  return { produced, consumed, ratio: consumed === 0 ? Infinity : produced / consumed };
+}
+function powerFactor(power) {
+  if (power.ratio >= 1) return 1;
+  if (power.ratio >= 0.5) return 0.6;
+  return 0.3;
+}
+
 // src/game/gameState.ts
 var COMBAT_STATS = {
   infantry: { range: 96, damage: 9, cooldownMax: 0.8 },
@@ -554,6 +789,7 @@ function createGame(seed, opts = {}) {
     map,
     units: [],
     enemyUnits: [],
+    harvesters: [],
     buildings: [],
     enemyBuildings: [],
     economy: createEconomy(o.credits),
@@ -613,7 +849,10 @@ function spawnTrained(g, kind) {
   const ax = rax ? rax.gx + (BUILDING_DEFS[rax.kind].w >> 1) : g.map.w >> 1;
   const ay = rax ? rax.gy + BUILDING_DEFS[rax.kind].h : g.map.h >> 1;
   const t = freeTilesNear(g.map, allBuildings(g), ax, ay, 1)[0];
-  if (t) g.units.push(makeGUnit(g.nextId++, kind, t.x, t.y, "player"));
+  if (!t) return;
+  const u = makeGUnit(g.nextId++, kind, t.x, t.y, "player");
+  g.units.push(u);
+  if (kind === "harvester") g.harvesters.push(createHarvester(u));
 }
 function spawnEnemy(g, kind) {
   const t = freeTilesNear(g.map, allBuildings(g), g.enemyAnchor.x, g.enemyAnchor.y, 1)[0];
@@ -660,16 +899,17 @@ function tickGame(g, dt) {
   let refs = 0;
   for (const b of g.buildings) if (b.kind === "refinery" && b.done) refs++;
   if (refs > 0) credit(g.economy, REFINERY_TRICKLE * refs * dt);
+  const factor = powerFactor(computePower(g.buildings));
   for (const b of allBuildings(g)) {
     if (!b.done) {
-      b.buildLeft -= dt;
+      b.buildLeft -= b.team === "player" ? dt * factor : dt;
       if (b.buildLeft <= 0) {
         b.buildLeft = 0;
         b.done = true;
       }
     }
   }
-  for (const item of tickQueue(g.queue, dt)) spawnTrained(g, item.key);
+  for (const item of tickQueue(g.queue, dt * factor)) spawnTrained(g, item.key);
   if (g.enemyBuildings.length > 0) {
     for (const cmd of stepAI(g.ai, dt)) applyAICommand(g, cmd);
   }
@@ -683,11 +923,20 @@ function tickGame(g, dt) {
       }
     }
   }
-  updateUnits(g.units, dt);
+  const driven = new Set(
+    g.harvesters.filter((h) => h.unit.kind === "harvester").map((h) => h.unit.id)
+  );
+  updateUnits(g.units.filter((u) => !driven.has(u.id)), dt);
   updateUnits(g.enemyUnits, dt);
+  const dropoffs = g.buildings.filter((b) => b.kind === "refinery");
+  for (const t of updateHarvesters(g.harvesters, g.map, dropoffs, g.economy, dt)) {
+    g.map.tiles[idx(g.map, t.x, t.y)] = GRASS;
+  }
   stepCombat([...g.units, ...g.enemyUnits, ...g.buildings, ...g.enemyBuildings], dt);
   g.units = g.units.filter((u) => u.hp > 0);
   g.enemyUnits = g.enemyUnits.filter((u) => u.hp > 0);
+  const alive = new Set(g.units.map((u) => u.id));
+  g.harvesters = g.harvesters.filter((h) => alive.has(h.unit.id));
   g.buildings = g.buildings.filter((b) => b.hp > 0);
   g.enemyBuildings = g.enemyBuildings.filter((b) => b.hp > 0);
   g.ai.army = g.enemyUnits.length;
@@ -713,6 +962,14 @@ function legalSpot(g, kind) {
     }
   }
   throw new Error("no legal spot found");
+}
+function run(g, seconds, dt = 0.25) {
+  for (let t = 0; t < seconds; t += dt) tickGame(g, dt);
+}
+function buildKind(g, kind) {
+  const s = legalSpot(g, kind);
+  const r = buildAt(g, kind, s.x, s.y);
+  assert.ok(r.ok, `buildAt ${kind} failed`);
 }
 test("createGame is deterministic for the same seed", () => {
   assert.deepEqual(snap(createGame(42)), snap(createGame(42)));
@@ -884,4 +1141,83 @@ test("restart returns a fresh playing state with the same seed", () => {
   assert.equal(g2.elapsed, 0);
   assert.equal(g2.economy.credits, 5e3);
   assert.deepEqual(snap(g2), snap(createGame(7)));
+});
+test("refinery + harvester grows funds past the harvester cost and shrinks ore", () => {
+  const g = createGame(7, { credits: 5e4, enemyBase: false, enemyInfantry: 1 });
+  assert.ok(g.enemyUnits.length > 0, "sandbox guard keeps the game playing");
+  const ore0 = countTerrain(g.map, ORE);
+  assert.ok(ore0 > 0, "map generated ore");
+  buildKind(g, "power");
+  buildKind(g, "barracks");
+  buildKind(g, "refinery");
+  run(g, BUILDING_DEFS.refinery.buildTime + 1);
+  assert.ok(g.buildings.find((b) => b.kind === "refinery").done);
+  assert.ok(trainUnit(g, "harvester").ok);
+  run(g, UNIT_STATS.harvester.buildTime + 1);
+  const harv = g.units.find((u) => u.kind === "harvester");
+  assert.ok(harv, "harvester unit spawned");
+  assert.equal(g.harvesters.length, 1);
+  assert.equal(g.harvesters[0].unit.id, harv.id, "harvester aligned by unit id");
+  const c0 = g.economy.credits;
+  run(g, 240);
+  assert.ok(
+    g.economy.credits - c0 > UNIT_STATS.harvester.cost,
+    `expected funds to grow by more than ${UNIT_STATS.harvester.cost}, got ${g.economy.credits - c0}`
+  );
+  assert.ok(countTerrain(g.map, ORE) < ore0, "mining depleted at least one ore tile");
+});
+test("harvester without a refinery produces no income", () => {
+  const g = createGame(7, { credits: 5e4, enemyBase: false, enemyInfantry: 1 });
+  buildKind(g, "power");
+  buildKind(g, "barracks");
+  run(g, BUILDING_DEFS.barracks.buildTime + 1);
+  assert.ok(trainUnit(g, "harvester").ok);
+  run(g, UNIT_STATS.harvester.buildTime + 1);
+  assert.equal(g.harvesters.length, 1);
+  const earned0 = g.economy.earned;
+  const credits0 = g.economy.credits;
+  run(g, 120);
+  assert.equal(g.economy.earned, earned0, "no refinery: no trickle, no unloading");
+  assert.equal(g.economy.credits, credits0);
+  assert.equal(g.harvesters[0].state, "idle");
+});
+test("low power stretches production time vs a fed grid", () => {
+  const opts = { credits: 99999, enemyBase: false, enemyInfantry: 1 };
+  const fast = createGame(11, opts);
+  buildKind(fast, "power");
+  buildKind(fast, "barracks");
+  run(fast, BUILDING_DEFS.barracks.buildTime + 1);
+  const slow = createGame(11, opts);
+  buildKind(slow, "barracks");
+  buildKind(slow, "refinery");
+  buildKind(slow, "refinery");
+  run(slow, BUILDING_DEFS.barracks.buildTime / 0.3 + 2);
+  assert.ok(fast.buildings.find((b) => b.kind === "barracks").done);
+  assert.ok(slow.buildings.find((b) => b.kind === "barracks").done);
+  const n0 = fast.units.length;
+  assert.equal(slow.units.length, n0, "same seed and opts \u2192 same starting army");
+  assert.ok(trainUnit(fast, "infantry").ok);
+  assert.ok(trainUnit(slow, "infantry").ok);
+  run(fast, UNIT_STATS.infantry.buildTime + 1);
+  run(slow, UNIT_STATS.infantry.buildTime + 1);
+  assert.equal(fast.units.length, n0 + 1, "fed grid finished the infantry");
+  assert.equal(slow.units.length, n0, "brownout still working on it");
+  run(slow, UNIT_STATS.infantry.buildTime * 3);
+  assert.equal(slow.units.length, n0 + 1, "brownout finishes eventually");
+});
+test("same seed and same inputs produce identical credits", () => {
+  const play = () => {
+    const g = createGame(31, { credits: 5e4, enemyBase: false, enemyInfantry: 1 });
+    buildKind(g, "power");
+    buildKind(g, "barracks");
+    buildKind(g, "refinery");
+    run(g, 30);
+    trainUnit(g, "harvester");
+    run(g, 120);
+    return g;
+  };
+  const a = play();
+  const b = play();
+  assert.equal(a.economy.credits, b.economy.credits);
+  assert.deepEqual(snap(a), snap(b));
 });

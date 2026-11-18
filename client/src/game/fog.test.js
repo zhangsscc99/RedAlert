@@ -23,7 +23,8 @@ var SIGHT_RADIUS = {
   harvester: 5,
   hq: 8,
   barracks: 8,
-  refinery: 8
+  refinery: 8,
+  power: 8
 };
 function createFog(map2) {
   return { w: map2.w, h: map2.h, explored: new Uint8Array(map2.w * map2.h), visible: new Uint8Array(map2.w * map2.h) };

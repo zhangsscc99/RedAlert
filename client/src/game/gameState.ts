@@ -5,6 +5,8 @@
 
 import {
   generateMap,
+  GRASS,
+  idx,
   isPassable,
   mulberry32,
   tileCenter,
@@ -33,6 +35,8 @@ import {
 } from './economy.js';
 import { stepCombat } from './combat.js';
 import { createAIState, stepAI, type AICommand, type AIState } from './enemyAI.js';
+import { createHarvester, updateHarvesters, type Harvester } from './harvest.js';
+import { computePower, powerFactor } from './power.js';
 import type { Point } from './selection.js';
 
 export { BUILDING_DEFS } from './buildings.js';
@@ -87,6 +91,7 @@ export interface GameState {
   map: GameMap;
   units: GUnit[]; // player units
   enemyUnits: GUnit[];
+  harvesters: Harvester[]; // ore-loop FSMs, aligned with units by id
   buildings: GBuilding[]; // player buildings
   enemyBuildings: GBuilding[];
   economy: Economy;
@@ -218,6 +223,7 @@ export function createGame(seed: number, opts: GameOpts = {}): GameState {
     map,
     units: [],
     enemyUnits: [],
+    harvesters: [],
     buildings: [],
     enemyBuildings: [],
     economy: createEconomy(o.credits),
@@ -308,7 +314,10 @@ function spawnTrained(g: GameState, kind: UnitKind): void {
   const ax = rax ? rax.gx + (BUILDING_DEFS[rax.kind].w >> 1) : g.map.w >> 1;
   const ay = rax ? rax.gy + BUILDING_DEFS[rax.kind].h : g.map.h >> 1;
   const t = freeTilesNear(g.map, allBuildings(g), ax, ay, 1)[0];
-  if (t) g.units.push(makeGUnit(g.nextId++, kind, t.x, t.y, 'player'));
+  if (!t) return;
+  const u = makeGUnit(g.nextId++, kind, t.x, t.y, 'player');
+  g.units.push(u);
+  if (kind === 'harvester') g.harvesters.push(createHarvester(u));
 }
 
 /** Spawn an AI-trained enemy next to its base anchor. */
@@ -367,10 +376,13 @@ export function tickGame(g: GameState, dt: number): void {
   for (const b of g.buildings) if (b.kind === 'refinery' && b.done) refs++;
   if (refs > 0) credit(g.economy, REFINERY_TRICKLE * refs * dt);
 
+  // A short power grid slows the player's production and construction.
+  const factor = powerFactor(computePower(g.buildings));
+
   // Construction progress.
   for (const b of allBuildings(g)) {
     if (!b.done) {
-      b.buildLeft -= dt;
+      b.buildLeft -= b.team === 'player' ? dt * factor : dt;
       if (b.buildLeft <= 0) {
         b.buildLeft = 0;
         b.done = true;
@@ -379,7 +391,7 @@ export function tickGame(g: GameState, dt: number): void {
   }
 
   // Finished production items spawn at a working barracks.
-  for (const item of tickQueue(g.queue, dt)) spawnTrained(g, item.key as UnitKind);
+  for (const item of tickQueue(g.queue, dt * factor)) spawnTrained(g, item.key as UnitKind);
 
   // Enemy AI emits commands; the AI dies with its base.
   if (g.enemyBuildings.length > 0) {
@@ -397,14 +409,28 @@ export function tickGame(g: GameState, dt: number): void {
       }
     }
   }
-  updateUnits(g.units, dt);
+  // Units driven by a harvester FSM move inside updateHarvesters; the shared
+  // walker must skip them or they would advance at double speed.
+  const driven = new Set(
+    g.harvesters.filter((h) => h.unit.kind === 'harvester').map((h) => h.unit.id),
+  );
+  updateUnits(g.units.filter((u) => !driven.has(u.id)), dt);
   updateUnits(g.enemyUnits, dt);
+
+  // Harvester ore loop: only a finished refinery takes cargo, so a base
+  // without one leaves harvesters idle. Depleted veins turn back to grass.
+  const dropoffs = g.buildings.filter((b) => b.kind === 'refinery');
+  for (const t of updateHarvesters(g.harvesters, g.map, dropoffs, g.economy, dt)) {
+    g.map.tiles[idx(g.map, t.x, t.y)] = GRASS;
+  }
 
   // Units and buildings share one combat arena; dead drop to hp 0 in place.
   stepCombat([...g.units, ...g.enemyUnits, ...g.buildings, ...g.enemyBuildings], dt);
 
   g.units = g.units.filter((u) => u.hp > 0);
   g.enemyUnits = g.enemyUnits.filter((u) => u.hp > 0);
+  const alive = new Set(g.units.map((u) => u.id));
+  g.harvesters = g.harvesters.filter((h) => alive.has(h.unit.id));
   g.buildings = g.buildings.filter((b) => b.hp > 0);
   g.enemyBuildings = g.enemyBuildings.filter((b) => b.hp > 0);
   g.ai.army = g.enemyUnits.length;
