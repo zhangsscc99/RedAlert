@@ -641,49 +641,6 @@ function enqueue(q, e, item) {
   return true;
 }
 
-// src/game/buildings.ts
-var BUILDING_DEFS = {
-  hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2e3, label: "HQ", buildable: false },
-  barracks: { w: 3, h: 2, cost: 500, buildTime: 15, hp: 800, label: "Barracks", powerUse: 40, buildable: true },
-  refinery: { w: 4, h: 3, cost: 2e3, buildTime: 25, hp: 1200, label: "Refinery", powerUse: 50, buildable: true },
-  power: { w: 2, h: 2, cost: 300, buildTime: 8, hp: 400, label: "Power Plant", buildable: true },
-  turret: { w: 2, h: 2, cost: 700, buildTime: 12, hp: 700, label: "Turret", range: 150, damage: 30, powerUse: 30, buildable: true },
-  wall: { w: 1, h: 1, cost: 100, buildTime: 4, hp: 500, label: "Wall", blocksPath: true, buildable: true }
-};
-function canPlace(map, buildings, kind, gx, gy) {
-  const def = BUILDING_DEFS[kind];
-  for (let dy = 0; dy < def.h; dy++) {
-    for (let dx = 0; dx < def.w; dx++) {
-      const x = gx + dx;
-      const y = gy + dy;
-      if (!inBounds(map, x, y)) return { ok: false, reason: "oob" };
-      if (!isPassable(map, x, y)) return { ok: false, reason: "water" };
-    }
-  }
-  for (const b of buildings) {
-    const d = BUILDING_DEFS[b.kind];
-    if (gx < b.gx + d.w && gx + def.w > b.gx && gy < b.gy + d.h && gy + def.h > b.gy) {
-      return { ok: false, reason: "overlap" };
-    }
-  }
-  return { ok: true };
-}
-function place(buildings, kind, gx, gy, nextId) {
-  const def = BUILDING_DEFS[kind];
-  const b = {
-    id: nextId,
-    kind,
-    gx,
-    gy,
-    hp: def.hp,
-    maxHp: def.hp,
-    done: false
-  };
-  buildings.push(b);
-  return b;
-}
-var RADAR_SCAN = { radius: 12 * TILE_SIZE, period: 5 };
-
 // src/game/upgrades.ts
 var BASE_LEVEL = 1;
 var MAX_LEVEL = 3;
@@ -752,6 +709,49 @@ function sellValue(def, level, hpRatio) {
   const hp = hpRatio > 0 ? Math.min(1, hpRatio) : 0;
   return Math.max(0, Math.round(def.cost * SELL_REFUND[level] * hp));
 }
+
+// src/game/buildings.ts
+var BUILDING_DEFS = {
+  hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2e3, label: "HQ", radar: true, buildable: false },
+  barracks: { w: 3, h: 2, cost: 500, buildTime: 15, hp: 800, label: "Barracks", powerUse: 40, buildable: true },
+  refinery: { w: 4, h: 3, cost: 2e3, buildTime: 25, hp: 1200, label: "Refinery", powerUse: 50, buildable: true },
+  power: { w: 2, h: 2, cost: 300, buildTime: 8, hp: 400, label: "Power Plant", buildable: true },
+  turret: { w: 2, h: 2, cost: 700, buildTime: 12, hp: 700, label: "Turret", range: 150, damage: 30, powerUse: 30, antiAir: true, buildable: true },
+  wall: { w: 1, h: 1, cost: 100, buildTime: 4, hp: 500, label: "Wall", blocksPath: true, buildable: true }
+};
+function canPlace(map, buildings, kind, gx, gy) {
+  const def = BUILDING_DEFS[kind];
+  for (let dy = 0; dy < def.h; dy++) {
+    for (let dx = 0; dx < def.w; dx++) {
+      const x = gx + dx;
+      const y = gy + dy;
+      if (!inBounds(map, x, y)) return { ok: false, reason: "oob" };
+      if (!isPassable(map, x, y)) return { ok: false, reason: "water" };
+    }
+  }
+  for (const b of buildings) {
+    const d = BUILDING_DEFS[b.kind];
+    if (gx < b.gx + d.w && gx + def.w > b.gx && gy < b.gy + d.h && gy + def.h > b.gy) {
+      return { ok: false, reason: "overlap" };
+    }
+  }
+  return { ok: true };
+}
+function place(buildings, kind, gx, gy, nextId) {
+  const def = BUILDING_DEFS[kind];
+  const b = {
+    id: nextId,
+    kind,
+    gx,
+    gy,
+    hp: def.hp,
+    maxHp: def.hp,
+    done: false
+  };
+  buildings.push(b);
+  return b;
+}
+var RADAR_SCAN = { radius: 12 * TILE_SIZE, period: 5 };
 
 // src/game/production.ts
 var PARALLEL_PER_BARRACKS = 1;
@@ -2076,17 +2076,13 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles) {
 // src/game/power.ts
 var HQ_PRODUCTION = 50;
 var POWER_PLANT_PRODUCTION = 100;
-var CONSUMPTION = {
-  barracks: 40,
-  refinery: 50
-};
 function computePower(buildings) {
   let produced = 0;
   let consumed = 0;
   for (const b of buildings) {
     if (b.kind === "hq") produced += HQ_PRODUCTION;
     else if (b.kind === "power") produced += POWER_PLANT_PRODUCTION;
-    consumed += CONSUMPTION[b.kind] ?? 0;
+    consumed += BUILDING_DEFS[b.kind].powerUse ?? 0;
   }
   return { produced, consumed, ratio: consumed === 0 ? Infinity : produced / consumed };
 }

@@ -2,6 +2,7 @@
 
 import { inBounds, isPassable, worldToTile, TILE_SIZE, type GameMap } from './grid.js';
 import { spend, type Economy } from './economy.js';
+import { BASE_LEVEL, MAX_LEVEL, effectAt, type UpgradeLevel } from './upgrades.js';
 import type { Point } from './selection.js';
 
 export type BuildingKind = 'hq' | 'barracks' | 'refinery' | 'power' | 'turret' | 'wall';
@@ -18,14 +19,16 @@ export interface BuildingDef {
   powerUse?: number; // grid drain while standing; absent = draws nothing
   blocksPath?: boolean; // footprint exists to obstruct unit pathing (walls)
   buildable?: boolean; // offered in the build palette; absent = not buildable
+  antiAir?: boolean; // weapon reaches air targets (air refuses all other fire)
+  radar?: boolean; // hosts a radar dish — grants a fog vision bonus while done
 }
 
 export const BUILDING_DEFS: Record<BuildingKind, BuildingDef> = {
-  hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2000, label: 'HQ', buildable: false },
+  hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2000, label: 'HQ', radar: true, buildable: false },
   barracks: { w: 3, h: 2, cost: 500, buildTime: 15, hp: 800, label: 'Barracks', powerUse: 40, buildable: true },
   refinery: { w: 4, h: 3, cost: 2000, buildTime: 25, hp: 1200, label: 'Refinery', powerUse: 50, buildable: true },
   power: { w: 2, h: 2, cost: 300, buildTime: 8, hp: 400, label: 'Power Plant', buildable: true },
-  turret: { w: 2, h: 2, cost: 700, buildTime: 12, hp: 700, label: 'Turret', range: 150, damage: 30, powerUse: 30, buildable: true },
+  turret: { w: 2, h: 2, cost: 700, buildTime: 12, hp: 700, label: 'Turret', range: 150, damage: 30, powerUse: 30, antiAir: true, buildable: true },
   wall: { w: 1, h: 1, cost: 100, buildTime: 4, hp: 500, label: 'Wall', blocksPath: true, buildable: true },
 };
 
@@ -320,4 +323,126 @@ export function claimCompletionYield(
   if (!b.done || claimed.has(b.id)) return null;
   claimed.add(b.id);
   return { ...supply };
+}
+
+// -------------------------------------------------------------- leveling --
+
+function defOf(kindOrDef: BuildingKind | BuildingDef): BuildingDef {
+  return typeof kindOrDef === 'string' ? BUILDING_DEFS[kindOrDef] : kindOrDef;
+}
+
+/** Clamp/round an arbitrary number to a valid upgrade level (1–3). */
+export function clampLevel(level: number): UpgradeLevel {
+  const l = Math.round(level);
+  return l <= BASE_LEVEL ? BASE_LEVEL : l >= MAX_LEVEL ? MAX_LEVEL : (l as UpgradeLevel);
+}
+
+/**
+ * Effective stats for `kind` at `level`. A building's upgrade tier boosts
+ * exactly one stat (the UPGRADE_TABLE effect): 'armor' scales maxHp,
+ * 'range' scales attack reach, 'production' scales output rate. Every other
+ * stat stays at its base value.
+ */
+export interface LeveledStats {
+  hp: number; // effective maxHp
+  range: number; // attack reach, world px; 0 = cannot shoot
+  damage: number; // hp removed per shot; meaningful only with `range`
+  output: number; // production-rate multiplier (1 = stock)
+}
+
+export function buildingStatsAt(kind: BuildingKind, level: number = BASE_LEVEL): LeveledStats {
+  const def = BUILDING_DEFS[kind];
+  const { effect, multiplier } = effectAt(kind, clampLevel(level));
+  const s: LeveledStats = { hp: def.hp, range: def.range ?? 0, damage: def.damage ?? 0, output: 1 };
+  if (effect === 'armor') s.hp = Math.round(def.hp * multiplier);
+  else if (effect === 'range') s.range = Math.round((def.range ?? 0) * multiplier);
+  else s.output = multiplier;
+  return s;
+}
+
+/** Effective maxHp for `kind` at `level`. */
+export function maxHpAtLevel(kind: BuildingKind, level: number = BASE_LEVEL): number {
+  return buildingStatsAt(kind, level).hp;
+}
+
+/** Effective attack reach for `kind` at `level` (0 for unarmed kinds). */
+export function rangeAtLevel(kind: BuildingKind, level: number = BASE_LEVEL): number {
+  return buildingStatsAt(kind, level).range;
+}
+
+/** Production-rate multiplier for `kind` at `level` (1 = stock). */
+export function outputAtLevel(kind: BuildingKind, level: number = BASE_LEVEL): number {
+  return buildingStatsAt(kind, level).output;
+}
+
+/**
+ * Copy of `b` with `level` applied: maxHp scales to the new tier while hp is
+ * carried over unchanged — an upgrade never heals for free, and a downgrade
+ * clamps surplus hp to the smaller pool.
+ */
+export function applyLevel(b: Building, level: number): Building {
+  const maxHp = maxHpAtLevel(b.kind, level);
+  return { ...b, maxHp, hp: Math.min(b.hp, maxHp) };
+}
+
+// ------------------------------------------------------------- targeting --
+
+/** Altitude band a target flies/walks in. */
+export type TargetDomain = 'ground' | 'air';
+
+/** True when the def's weapon can reach air targets. */
+export function isAntiAir(kindOrDef: BuildingKind | BuildingDef): boolean {
+  return defOf(kindOrDef).antiAir === true;
+}
+
+/**
+ * May a weapon of `kindOrDef` fire on a target in `domain`? Requires an
+ * armed def (range + damage); air targets refuse every weapon except
+ * antiAir ones — a ground-only gun cannot touch aircraft.
+ */
+export function canEngage(kindOrDef: BuildingKind | BuildingDef, domain: TargetDomain): boolean {
+  const def = defOf(kindOrDef);
+  if (!((def.range ?? 0) > 0) || !((def.damage ?? 0) > 0)) return false;
+  return domain === 'ground' || def.antiAir === true;
+}
+
+/**
+ * Filter a mixed-domain target list down to what `kindOrDef` may engage;
+ * a missing `domain` counts as ground.
+ */
+export function engageableTargets<T extends { domain?: TargetDomain }>(
+  kindOrDef: BuildingKind | BuildingDef,
+  targets: readonly T[],
+): T[] {
+  return targets.filter((t) => canEngage(kindOrDef, t.domain ?? 'ground'));
+}
+
+// ---------------------------------------------------------- radar vision --
+
+/** True when the kind hosts a radar dish (the HQ doubles as one). */
+export function isRadarHost(kindOrDef: BuildingKind | BuildingDef): boolean {
+  return defOf(kindOrDef).radar === true;
+}
+
+/**
+ * Extra sight radius in tiles a finished radar host grants at each level —
+ * fog.ts reads this when assembling a FogSource (`sight` override). The
+ * level-1 value matches fog's flat RADAR_SIGHT_BONUS.
+ */
+export const RADAR_VISION_BONUS: Record<UpgradeLevel, number> = { 1: 4, 2: 6, 3: 8 };
+
+/**
+ * Sight-radius bonus (tiles) contributed by `b`'s dish: 0 while `b` is
+ * under construction or not a radar host. Pure — power state is the
+ * caller's concern.
+ */
+export function radarVisionBonus(b: Building, level: number = BASE_LEVEL): number {
+  return b.done && isRadarHost(b.kind) ? RADAR_VISION_BONUS[clampLevel(level)] : 0;
+}
+
+// ------------------------------------------------------------ depot range --
+
+/** True when `v` stands on a tile adjacent to `depot` (service range). */
+export function inDepotRange(depot: Building, v: Pick<DepotVehicle, 'x' | 'y'>): boolean {
+  return isAdjacentTo(depot, worldToTile(v.x), worldToTile(v.y));
 }

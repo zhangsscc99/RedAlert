@@ -18,6 +18,19 @@ import {
   DEPOT_REPAIR,
   tickDepotRepair,
   claimCompletionYield,
+  clampLevel,
+  buildingStatsAt,
+  maxHpAtLevel,
+  rangeAtLevel,
+  outputAtLevel,
+  applyLevel,
+  isAntiAir,
+  canEngage,
+  engageableTargets,
+  isRadarHost,
+  RADAR_VISION_BONUS,
+  radarVisionBonus,
+  inDepotRange,
   type Building,
   type DepotVehicle,
 } from './buildings.js';
@@ -348,4 +361,141 @@ test('claimCompletionYield pays out exactly once per finished building', () => {
   const other = place([], 'barracks', 4, 4, 2);
   other.done = true;
   assert.deepEqual(claimCompletionYield(other, claimed, supply), supply);
+});
+
+// -------------------------------------------------------------- leveling --
+
+test('clampLevel rounds and clamps into the 1-3 band', () => {
+  assert.equal(clampLevel(1), 1);
+  assert.equal(clampLevel(2), 2);
+  assert.equal(clampLevel(3), 3);
+  assert.equal(clampLevel(0), 1);
+  assert.equal(clampLevel(-9), 1);
+  assert.equal(clampLevel(4), 3);
+  assert.equal(clampLevel(99), 3);
+  assert.equal(clampLevel(2.4), 2);
+  assert.equal(clampLevel(2.6), 3);
+});
+
+test('armor kinds grow maxHp per level (hq 2000 → 2500 → 3000)', () => {
+  assert.equal(maxHpAtLevel('hq'), 2000);
+  assert.equal(maxHpAtLevel('hq', 1), 2000);
+  assert.equal(maxHpAtLevel('hq', 2), 2500);
+  assert.equal(maxHpAtLevel('hq', 3), 3000);
+  assert.equal(maxHpAtLevel('wall', 3), 1000); // 500 × 2
+});
+
+test('range kinds grow attack reach per level (turret 150 → 188 → 225)', () => {
+  assert.equal(rangeAtLevel('turret'), 150);
+  assert.equal(rangeAtLevel('turret', 2), Math.round(150 * 1.25)); // 188
+  assert.equal(rangeAtLevel('turret', 3), 225);
+  // Unarmed kinds never gain a weapon, whatever the level.
+  assert.equal(rangeAtLevel('refinery', 3), 0);
+  assert.equal(rangeAtLevel('hq', 3), 0);
+});
+
+test('production kinds scale output per level; other effects leave it at 1', () => {
+  assert.equal(outputAtLevel('refinery'), 1);
+  assert.equal(outputAtLevel('refinery', 2), 1.5);
+  assert.equal(outputAtLevel('refinery', 3), 2);
+  assert.equal(outputAtLevel('barracks', 3), 1.5);
+  assert.equal(outputAtLevel('power', 2), 1.5);
+  assert.equal(outputAtLevel('hq', 3), 1); // armor kind
+  assert.equal(outputAtLevel('turret', 3), 1); // range kind
+});
+
+test('buildingStatsAt reports the whole sheet with only the boosted stat moved', () => {
+  assert.deepEqual(buildingStatsAt('turret'), { hp: 700, range: 150, damage: 30, output: 1 });
+  assert.deepEqual(buildingStatsAt('turret', 3), { hp: 700, range: 225, damage: 30, output: 1 });
+  assert.deepEqual(buildingStatsAt('hq', 2), { hp: 2500, range: 0, damage: 0, output: 1 });
+  assert.deepEqual(buildingStatsAt('refinery', 2), { hp: 1200, range: 0, damage: 0, output: 1.5 });
+});
+
+test('applyLevel grows maxHp without a free heal; downgrade clamps surplus hp', () => {
+  const hq = doneHq(1); // hp 2000 / maxHp 2000
+  const up = applyLevel(hq, 2);
+  assert.equal(up.maxHp, 2500);
+  assert.equal(up.hp, 2000); // upgrading is not a repair
+  assert.equal(hq.maxHp, 2000); // original untouched
+
+  const hurt = applyLevel({ ...hq, hp: 1500 }, 3);
+  assert.equal(hurt.maxHp, 3000);
+  assert.equal(hurt.hp, 1500);
+
+  const down = applyLevel({ ...hq, hp: 2800, maxHp: 3000 }, 1);
+  assert.equal(down.maxHp, 2000);
+  assert.equal(down.hp, 2000); // surplus clamped to the smaller pool
+});
+
+// ------------------------------------------------------------- targeting --
+
+test('isAntiAir: only the turret reaches air targets', () => {
+  assert.equal(isAntiAir('turret'), true);
+  assert.equal(isAntiAir(BUILDING_DEFS.turret), true); // accepts a def too
+  for (const k of ['hq', 'barracks', 'refinery', 'power', 'wall'] as const) {
+    assert.equal(isAntiAir(k), false);
+  }
+});
+
+test('canEngage: air refuses every weapon but antiAir; unarmed kinds shoot nothing', () => {
+  assert.equal(canEngage('turret', 'ground'), true);
+  assert.equal(canEngage('turret', 'air'), true);
+  for (const k of ['hq', 'barracks', 'refinery', 'power', 'wall'] as const) {
+    assert.equal(canEngage(k, 'ground'), false);
+    assert.equal(canEngage(k, 'air'), false);
+  }
+  // A hypothetical ground-only gun cannot touch aircraft.
+  const gun = { w: 1, h: 1, cost: 0, buildTime: 0, hp: 1, label: 'Gun', range: 100, damage: 10 };
+  assert.equal(canEngage(gun, 'ground'), true);
+  assert.equal(canEngage(gun, 'air'), false);
+  // range without damage (or vice versa) is not a weapon.
+  assert.equal(canEngage({ ...gun, damage: 0 }, 'ground'), false);
+  assert.equal(canEngage({ ...gun, range: 0 }, 'ground'), false);
+});
+
+test('engageableTargets filters a mixed-domain list to legal shots', () => {
+  const targets = [
+    { id: 1, domain: 'ground' as const },
+    { id: 2, domain: 'air' as const },
+    { id: 3 }, // no domain counts as ground
+  ];
+  assert.deepEqual(engageableTargets('turret', targets).map((t) => t.id), [1, 2, 3]);
+  const gun = { w: 1, h: 1, cost: 0, buildTime: 0, hp: 1, label: 'Gun', range: 100, damage: 10 };
+  assert.deepEqual(engageableTargets(gun, targets).map((t) => t.id), [1, 3]);
+  assert.deepEqual(engageableTargets('barracks', targets), []); // unarmed
+});
+
+// ---------------------------------------------------------- radar vision --
+
+test('isRadarHost flags only dish hosts (the HQ)', () => {
+  assert.equal(isRadarHost('hq'), true);
+  assert.equal(isRadarHost(BUILDING_DEFS.hq), true);
+  for (const k of ['barracks', 'refinery', 'power', 'turret', 'wall'] as const) {
+    assert.equal(isRadarHost(k), false);
+  }
+});
+
+test('radarVisionBonus scales with level and needs a finished dish', () => {
+  const hq = doneHq(1);
+  assert.equal(RADAR_VISION_BONUS[1], 4); // matches fog's flat RADAR_SIGHT_BONUS
+  assert.equal(radarVisionBonus(hq), 4);
+  assert.equal(radarVisionBonus(hq, 2), 6);
+  assert.equal(radarVisionBonus(hq, 3), 8);
+  // Under construction the dish contributes nothing.
+  hq.done = false;
+  assert.equal(radarVisionBonus(hq, 3), 0);
+  // Non-hosts never contribute, whatever the level.
+  const rax = place([], 'barracks', 0, 0, 9);
+  rax.done = true;
+  assert.equal(radarVisionBonus(rax, 3), 0);
+});
+
+// ------------------------------------------------------------ depot range --
+
+test('inDepotRange matches the footprint ring on the vehicle tile', () => {
+  const depot = doneHq(1, 10, 10); // ring: x 9..14, y 9..13
+  assert.equal(inDepotRange(depot, vehicle(5, 9, 10, 50)), true);
+  assert.equal(inDepotRange(depot, vehicle(6, 14, 13, 50)), true); // far corner of the ring
+  assert.equal(inDepotRange(depot, vehicle(7, 15, 10, 50)), false); // one tile past it
+  assert.equal(inDepotRange(depot, vehicle(8, 20, 20, 50)), false);
 });
