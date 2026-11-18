@@ -53,6 +53,22 @@ interface SourceSnap {
   r: number;
 }
 
+/**
+ * Per-fog tuning for createFog. Anything left unset falls back to the
+ * module defaults (SIGHT_RADIUS, RADAR_SIGHT_BONUS, SOURCE_FADE_SECONDS).
+ */
+export interface FogConfig {
+  /** Sight-radius overrides in tiles, keyed by unit/building kind. */
+  sight?: Partial<Record<UnitKind | BuildingKind, number>>;
+  /** Extra sight tiles granted to a source flagged `radar`. */
+  radarBonus?: number;
+  /**
+   * Seconds a removed source keeps projecting shrinking vision.
+   * 0 collapses instantly — a destroyed building loses its sight at once.
+   */
+  fadeSeconds?: number;
+}
+
 export interface Fog {
   w: number;
   h: number;
@@ -66,11 +82,17 @@ export interface Fog {
   prevSources: SourceSnap[];
   /** Removed sources still projecting shrinking vision. */
   fading: FadeMark[];
+  /** Resolved per-kind sight table (SIGHT_RADIUS overlaid with FogConfig.sight). */
+  sight: Record<UnitKind | BuildingKind, number>;
+  /** Resolved radar bonus in tiles. */
+  radarBonus: number;
+  /** Resolved collapse time for removed sources; 0 = instant. */
+  fadeSeconds: number;
 }
 
 /**
  * Anything that projects vision. `x`,`y` are world px; `sight` overrides
- * SIGHT_RADIUS[kind] when present. `radar` adds RADAR_SIGHT_BONUS tiles.
+ * fog.sight[kind] when present. `radar` adds fog.radarBonus tiles.
  * `id` (when given) is used to detect the source's removal across ticks;
  * id-less sources are matched by kind + tile position.
  */
@@ -83,7 +105,7 @@ export interface FogSource {
   id?: number;
 }
 
-export function createFog(map: GameMap): Fog {
+export function createFog(map: GameMap, cfg: FogConfig = {}): Fog {
   return {
     w: map.w,
     h: map.h,
@@ -92,6 +114,9 @@ export function createFog(map: GameMap): Fog {
     scans: [],
     prevSources: [],
     fading: [],
+    sight: { ...SIGHT_RADIUS, ...cfg.sight },
+    radarBonus: cfg.radarBonus ?? RADAR_SIGHT_BONUS,
+    fadeSeconds: cfg.fadeSeconds ?? SOURCE_FADE_SECONDS,
   };
 }
 
@@ -111,9 +136,15 @@ export function buildingSource(b: Building): FogSource {
   };
 }
 
-function sightRadius(s: FogSource): number {
-  const base = s.sight !== undefined ? s.sight : s.kind !== undefined ? SIGHT_RADIUS[s.kind] : 0;
-  return base + (s.radar ? RADAR_SIGHT_BONUS : 0);
+/** buildingSource flagged as a radar dish: adds fog.radarBonus sight tiles. */
+export function radarSource(b: Building): FogSource {
+  return { ...buildingSource(b), radar: true };
+}
+
+/** Effective sight radius in tiles: per-source override → per-kind table, plus radar bonus. */
+export function sightRadius(fog: Fog, s: FogSource): number {
+  const base = s.sight !== undefined ? s.sight : s.kind !== undefined ? fog.sight[s.kind] : 0;
+  return base + (s.radar ? fog.radarBonus : 0);
 }
 
 function sourceKey(s: FogSource, tx: number, ty: number): string {
@@ -154,14 +185,15 @@ function stamp(fog: Fog, map: GameMap, cx: number, cy: number, r: number): void 
  *
  * `dt` (seconds since the previous update) ages scan reveals and the
  * fade-out of removed sources. Sources present last update but absent now
- * keep projecting a linearly shrinking circle for SOURCE_FADE_SECONDS.
+ * keep projecting a linearly shrinking circle for fog.fadeSeconds
+ * (SOURCE_FADE_SECONDS unless overridden in createFog).
  */
 export function updateFog(fog: Fog, map: GameMap, sources: readonly FogSource[], dt = 0): void {
   fog.visible.fill(0);
 
   const next: SourceSnap[] = [];
   for (const s of sources) {
-    const r = sightRadius(s);
+    const r = sightRadius(fog, s);
     if (r <= 0) continue;
     const cx = worldToTile(s.x);
     const cy = worldToTile(s.y);
@@ -171,12 +203,13 @@ export function updateFog(fog: Fog, map: GameMap, sources: readonly FogSource[],
 
   // Sources that vanished since last update start fading out. Only armed
   // when the caller supplies dt — dt-less updates keep the old instant
-  // removal behavior.
-  if (dt > 0) {
+  // removal behavior. fadeSeconds <= 0 collapses instantly, so a destroyed
+  // building's sight can be configured to die with it.
+  if (dt > 0 && fog.fadeSeconds > 0) {
     const currentKeys = new Set(next.map((n) => n.key));
     for (const prev of fog.prevSources) {
       if (!currentKeys.has(prev.key)) {
-        fog.fading.push({ x: prev.x, y: prev.y, r: prev.r, ttl: SOURCE_FADE_SECONDS });
+        fog.fading.push({ x: prev.x, y: prev.y, r: prev.r, ttl: fog.fadeSeconds });
       }
     }
   }
@@ -184,11 +217,13 @@ export function updateFog(fog: Fog, map: GameMap, sources: readonly FogSource[],
 
   // Shrinking afterglow of removed sources.
   const fading: FadeMark[] = [];
-  for (const f of fog.fading) {
-    f.ttl -= dt;
-    if (f.ttl <= 0) continue;
-    stamp(fog, map, f.x, f.y, (f.r * f.ttl) / SOURCE_FADE_SECONDS);
-    fading.push(f);
+  if (fog.fadeSeconds > 0) {
+    for (const f of fog.fading) {
+      f.ttl -= dt;
+      if (f.ttl <= 0) continue;
+      stamp(fog, map, f.x, f.y, (f.r * f.ttl) / fog.fadeSeconds);
+      fading.push(f);
+    }
   }
   fog.fading = fading;
 

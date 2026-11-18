@@ -13,6 +13,8 @@ import {
   filterVisibleEnemies,
   unitSource,
   buildingSource,
+  radarSource,
+  sightRadius,
   type FogSource,
 } from './fog.js';
 import { TILE_SIZE, type GameMap } from './grid.js';
@@ -180,4 +182,73 @@ test('unitSource and buildingSource adapt game objects', () => {
   assert.ok(isVisible(fog, 22, 21)); // footprint center tile
   assert.ok(isVisible(fog, 22 + 8, 21)); // radius 8
   assert.ok(!isVisible(fog, 22 + 9, 21));
+});
+
+// ------------------------------------------------------------- F1006 cases --
+
+test('FogConfig.sight overrides per-kind radius', () => {
+  const fog = createFog(map, { sight: { infantry: 2, hq: 12 } });
+  assert.equal(sightRadius(fog, src(10, 10, 'infantry')), 2);
+  assert.equal(sightRadius(fog, src(10, 10, 'hq')), 12);
+  // Untouched kinds keep the stock table.
+  assert.equal(sightRadius(fog, src(10, 10, 'tank')), SIGHT_RADIUS.tank);
+
+  updateFog(fog, map, [src(10, 10, 'infantry')]);
+  assert.ok(isVisible(fog, 12, 10));
+  assert.ok(!isVisible(fog, 13, 10));
+});
+
+test('FogConfig.radarBonus replaces RADAR_SIGHT_BONUS', () => {
+  const fog = createFog(map, { radarBonus: 10 });
+  const s = src(10, 10, 'hq');
+  s.radar = true;
+  assert.equal(sightRadius(fog, s), SIGHT_RADIUS.hq + 10);
+});
+
+test('radarSource flags a building for the sight bonus', () => {
+  const b = { id: 3, kind: 'hq' as const, gx: 8, gy: 8, hp: 1, maxHp: 1, done: true };
+  const plain = buildingSource(b);
+  const dish = radarSource(b);
+  assert.equal(plain.radar, undefined);
+  assert.equal(dish.radar, true);
+  assert.equal(dish.id, b.id);
+  const fog = createFog(map);
+  assert.equal(sightRadius(fog, dish), SIGHT_RADIUS.hq + RADAR_SIGHT_BONUS);
+});
+
+test('fadeSeconds 0: destroyed building loses sight instantly', () => {
+  const fog = createFog(map, { fadeSeconds: 0 });
+  const b = { id: 7, kind: 'hq' as const, gx: 16, gy: 16, hp: 1, maxHp: 1, done: true };
+  updateFog(fog, map, [buildingSource(b)], 0.1);
+  assert.ok(isVisible(fog, 25, 17));
+
+  updateFog(fog, map, [], 0.1); // destroyed — no afterglow at all
+  assert.ok(!isVisible(fog, 25, 17));
+  assert.ok(!isVisible(fog, 18, 17)); // not even the center lingers
+  assert.equal(fog.fading.length, 0);
+  assert.ok(isExplored(fog, 25, 17)); // explored memory survives
+});
+
+test('custom fadeSeconds tunes the collapse duration', () => {
+  const fog = createFog(map, { fadeSeconds: 4 });
+  const b = { id: 8, kind: 'hq' as const, gx: 16, gy: 16, hp: 1, maxHp: 1, done: true };
+  updateFog(fog, map, [buildingSource(b)], 0.1);
+  updateFog(fog, map, [], 0.1);
+  assert.equal(fog.fading.length, 1);
+  // After 1s of a 4s fade the circle still covers ~3/4 of radius 8.
+  updateFog(fog, map, [], 0.9);
+  assert.ok(isVisible(fog, 24, 17)); // dist 6 from center (18,17), radius ~6
+});
+
+test('memory: enemy hidden once unseen, terrain stays explored', () => {
+  const fog = createFog(map);
+  updateFog(fog, map, [src(10, 10)]);
+  const enemy = { id: 1, x: 12 * TILE_SIZE, y: 10 * TILE_SIZE };
+  assert.deepEqual(filterVisibleEnemies(fog, [enemy]), [enemy]);
+
+  // Friendly moved away: the enemy vanishes but the ground does not.
+  updateFog(fog, map, [src(28, 28)]);
+  assert.deepEqual(filterVisibleEnemies(fog, [enemy]), []);
+  assert.ok(isExplored(fog, 12, 10));
+  assert.equal(fogAlpha(fog, 12, 10), 0.5);
 });
