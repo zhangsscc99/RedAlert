@@ -190,12 +190,6 @@ var Heap = class {
 function terrainPassable(map) {
   return (x, y) => isPassable(map, x, y);
 }
-function findPath(map, sx, sy, gx, gy) {
-  if (!inBounds(map, sx, sy) || !inBounds(map, gx, gy)) return null;
-  if (sx === gx && sy === gy) return [];
-  if (!isPassable(map, gx, gy)) return null;
-  return astar(map, sx, sy, gx, gy, terrainPassable(map));
-}
 function astar(map, sx, sy, gx, gy, passable, stepClear) {
   const n = map.w * map.h;
   const g = new Float64Array(n).fill(Infinity);
@@ -234,6 +228,22 @@ function astar(map, sx, sy, gx, gy, passable, stepClear) {
     }
   }
   return null;
+}
+function findPathAvoiding(map, from, to, blockers) {
+  const blocked = new Uint8Array(map.w * map.h);
+  for (const b of blockers) {
+    for (let y = b.gy; y < b.gy + b.h; y++) {
+      for (let x = b.gx; x < b.gx + b.w; x++) {
+        if (inBounds(map, x, y)) blocked[idx(map, x, y)] = 1;
+      }
+    }
+  }
+  const passable = (x, y) => isPassable(map, x, y) && !blocked[idx(map, x, y)];
+  const s = nearestPassable(map, from.x, from.y, passable);
+  const g = nearestPassable(map, to.x, to.y, passable);
+  if (!s || !g) return null;
+  if (s.x === g.x && s.y === g.y) return [];
+  return astar(map, s.x, s.y, g.x, g.y, passable);
 }
 function reconstruct(map, came, start, goal) {
   const path = [];
@@ -734,8 +744,10 @@ function attackTarget(s) {
 var HARVEST_RATE = 140;
 var HARVEST_CAPACITY = 700;
 var ORE_RESERVE = 350;
+var STUCK_SECONDS = 3;
+var STUCK_EPS = 1;
 function createHarvester(unit) {
-  return { unit, state: "idle", cargo: 0, target: null };
+  return { unit, state: "idle", cargo: 0, target: null, stuckT: 0, lastX: unit.x, lastY: unit.y };
 }
 var reservesByMap = /* @__PURE__ */ new WeakMap();
 function reserveTable(map) {
@@ -768,8 +780,30 @@ function stepAlong(u, dt) {
     }
   }
 }
-function setPath(u, map, goal) {
-  const path = findPath(map, worldToTile(u.x), worldToTile(u.y), goal.x, goal.y);
+function buildingBlockers(buildings) {
+  return buildings.map((b) => {
+    const def = BUILDING_DEFS[b.kind];
+    return { gx: b.gx, gy: b.gy, w: def.w, h: def.h };
+  });
+}
+function blockedTiles(map, blockers) {
+  const out = new Uint8Array(map.w * map.h);
+  for (const b of blockers) {
+    for (let y = b.gy; y < b.gy + b.h; y++) {
+      for (let x = b.gx; x < b.gx + b.w; x++) {
+        if (x >= 0 && y >= 0 && x < map.w && y < map.h) out[idx(map, x, y)] = 1;
+      }
+    }
+  }
+  return out;
+}
+function setPath(u, map, goal, blockers) {
+  const path = findPathAvoiding(
+    map,
+    { x: worldToTile(u.x), y: worldToTile(u.y) },
+    goal,
+    blockers
+  );
   if (!path) {
     u.path = [];
     return false;
@@ -777,15 +811,21 @@ function setPath(u, map, goal) {
   u.path = path.map((t) => ({ x: tileCenter(t.x), y: tileCenter(t.y) }));
   return true;
 }
+function resetWatchdog(h) {
+  h.stuckT = 0;
+  h.lastX = h.unit.x;
+  h.lastY = h.unit.y;
+}
 function toIdle(h) {
   h.state = "idle";
   h.target = null;
   h.unit.path = [];
+  resetWatchdog(h);
 }
 function isViableOre(map, reserves, t) {
   return t !== null && isOre(map, t.x, t.y) && reserves[idx(map, t.x, t.y)] > 0;
 }
-function standTileFor(map, ore, ux, uy) {
+function standTileFor(map, ore, ux, uy, blocked) {
   let best = null;
   let bestD = Infinity;
   for (let dy = -1; dy <= 1; dy++) {
@@ -793,7 +833,7 @@ function standTileFor(map, ore, ux, uy) {
       if (dx === 0 && dy === 0) continue;
       const x = ore.x + dx;
       const y = ore.y + dy;
-      if (!isPassable(map, x, y)) continue;
+      if (!isPassable(map, x, y) || blocked[idx(map, x, y)]) continue;
       const d = (x - ux) * (x - ux) + (y - uy) * (y - uy);
       if (d < bestD) {
         bestD = d;
@@ -806,21 +846,28 @@ function standTileFor(map, ore, ux, uy) {
 function onOreEdge(ux, uy, ore) {
   return Math.max(Math.abs(ux - ore.x), Math.abs(uy - ore.y)) <= 1;
 }
-function sendToOre(h, map, reserves) {
+function sendToOre(h, map, reserves, claims, blockers, blocked) {
   const ux = worldToTile(h.unit.x);
   const uy = worldToTile(h.unit.y);
-  const candidates = oreTiles(map).filter((t) => reserves[idx(map, t.x, t.y)] > 0).sort((a, b) => (a.x - ux) ** 2 + (a.y - uy) ** 2 - ((b.x - ux) ** 2 + (b.y - uy) ** 2));
+  const own = h.target && (h.state === "toOre" || h.state === "mining") ? idx(map, h.target.x, h.target.y) : -1;
+  const candidates = oreTiles(map).filter((t) => {
+    const i = idx(map, t.x, t.y);
+    return reserves[i] > 0 && (!claims.has(i) || i === own);
+  }).sort((a, b) => (a.x - ux) ** 2 + (a.y - uy) ** 2 - ((b.x - ux) ** 2 + (b.y - uy) ** 2));
   for (const ore of candidates) {
     if (onOreEdge(ux, uy, ore)) {
       h.target = { x: ore.x, y: ore.y };
       h.state = "mining";
       h.unit.path = [];
-      return true;
+    } else {
+      const stand = standTileFor(map, ore, ux, uy, blocked);
+      if (!stand || !setPath(h.unit, map, stand, blockers)) continue;
+      h.target = { x: ore.x, y: ore.y };
+      h.state = "toOre";
     }
-    const stand = standTileFor(map, ore, ux, uy);
-    if (!stand || !setPath(h.unit, map, stand)) continue;
-    h.target = { x: ore.x, y: ore.y };
-    h.state = "toOre";
+    if (own >= 0) claims.delete(own);
+    claims.add(idx(map, ore.x, ore.y));
+    resetWatchdog(h);
     return true;
   }
   return false;
@@ -843,33 +890,62 @@ function dropoffBuilding(buildings, ux, uy) {
   }
   return best;
 }
-function sendToRefinery(h, map, buildings) {
+function sendToRefinery(h, map, buildings, blockers) {
   const ux = worldToTile(h.unit.x);
   const uy = worldToTile(h.unit.y);
   const b = dropoffBuilding(buildings, ux, uy);
   if (!b) return false;
   const def = BUILDING_DEFS[b.kind];
-  const stand = snapToPassable(map, Math.floor(b.gx + def.w / 2), Math.floor(b.gy + def.h / 2));
-  if (!stand || !setPath(h.unit, map, stand)) return false;
-  h.target = { x: stand.x, y: stand.y };
-  h.state = h.unit.path.length === 0 ? "unloading" : "toRefinery";
+  const goal = { x: Math.floor(b.gx + def.w / 2), y: Math.floor(b.gy + def.h / 2) };
+  const path = findPathAvoiding(map, { x: ux, y: uy }, goal, blockers);
+  if (!path) {
+    h.unit.path = [];
+    return false;
+  }
+  h.unit.path = path.map((t) => ({ x: tileCenter(t.x), y: tileCenter(t.y) }));
+  const last = path[path.length - 1];
+  h.target = last ? { x: last.x, y: last.y } : goal;
+  h.state = path.length === 0 ? "unloading" : "toRefinery";
+  resetWatchdog(h);
   return true;
 }
 function hasDropoff(buildings) {
   return buildings.some((b) => b.done && (b.kind === "refinery" || b.kind === "hq"));
 }
-function updateHarvesters(hs, map, buildings, economy, dt) {
+function updateHarvesters(hs, map, buildings, economy, dt, obstacles) {
   const depleted = [];
   if (dt <= 0) return depleted;
   const reserves = reserveTable(map);
+  const blockers = buildingBlockers(obstacles ?? buildings);
+  const blocked = blockedTiles(map, blockers);
+  const claims = /* @__PURE__ */ new Set();
+  for (const h of hs) {
+    if (h.unit.kind === "harvester" && (h.state === "toOre" || h.state === "mining") && h.target !== null && isOre(map, h.target.x, h.target.y)) {
+      claims.add(idx(map, h.target.x, h.target.y));
+    }
+  }
   for (const h of hs) {
     if (h.unit.kind !== "harvester") continue;
+    if (h.state === "toOre" || h.state === "toRefinery") {
+      const dx = h.unit.x - (h.lastX ?? h.unit.x);
+      const dy = h.unit.y - (h.lastY ?? h.unit.y);
+      const stuckT = dx * dx + dy * dy < STUCK_EPS * STUCK_EPS ? (h.stuckT ?? 0) + dt : 0;
+      h.stuckT = stuckT;
+      h.lastX = h.unit.x;
+      h.lastY = h.unit.y;
+      if (stuckT >= STUCK_SECONDS) {
+        h.unit.path = [];
+        const ok = h.state === "toOre" ? sendToOre(h, map, reserves, claims, blockers, blocked) : sendToRefinery(h, map, buildings, blockers);
+        if (!ok) toIdle(h);
+        continue;
+      }
+    }
     switch (h.state) {
       case "idle": {
         if (h.cargo > 0) {
-          sendToRefinery(h, map, buildings);
+          sendToRefinery(h, map, buildings, blockers);
         } else if (hasDropoff(buildings)) {
-          sendToOre(h, map, reserves);
+          sendToOre(h, map, reserves, claims, blockers, blocked);
         }
         break;
       }
@@ -890,9 +966,9 @@ function updateHarvesters(hs, map, buildings, economy, dt) {
       case "mining": {
         if (!isViableOre(map, reserves, h.target)) {
           if (h.cargo >= HARVEST_CAPACITY) {
-            if (!sendToRefinery(h, map, buildings)) toIdle(h);
-          } else if (!sendToOre(h, map, reserves)) {
-            if (h.cargo <= 0 || !sendToRefinery(h, map, buildings)) toIdle(h);
+            if (!sendToRefinery(h, map, buildings, blockers)) toIdle(h);
+          } else if (!sendToOre(h, map, reserves, claims, blockers, blocked)) {
+            if (h.cargo <= 0 || !sendToRefinery(h, map, buildings, blockers)) toIdle(h);
           }
           break;
         }
@@ -905,10 +981,10 @@ function updateHarvesters(hs, map, buildings, economy, dt) {
           depleted.push({ x: h.target.x, y: h.target.y });
         }
         if (h.cargo >= HARVEST_CAPACITY) {
-          if (!sendToRefinery(h, map, buildings)) toIdle(h);
+          if (!sendToRefinery(h, map, buildings, blockers)) toIdle(h);
         } else if (reserves[i] <= 0) {
-          if (!sendToOre(h, map, reserves)) {
-            if (!sendToRefinery(h, map, buildings)) toIdle(h);
+          if (!sendToOre(h, map, reserves, claims, blockers, blocked)) {
+            if (!sendToRefinery(h, map, buildings, blockers)) toIdle(h);
           }
         }
         break;
@@ -1119,7 +1195,7 @@ function spawnEnemy(g, kind) {
   const t = freeTilesNear(g.map, allBuildings(g), g.enemyAnchor.x, g.enemyAnchor.y, 1)[0];
   if (t) g.enemyUnits.push(makeGUnit(g.nextId++, kind, t.x, t.y, "enemy", g.opts.enemyStrength));
 }
-function buildingBlockers(g) {
+function buildingBlockers2(g) {
   return allBuildings(g).map((b) => {
     const d = BUILDING_DEFS[b.kind];
     return { gx: b.gx, gy: b.gy, w: d.w, h: d.h };
@@ -1131,7 +1207,7 @@ function pathTo(g, u, to) {
   const bs = allBuildings(g);
   const goal = tileFree(g.map, bs, snapped.x, snapped.y) ? snapped : freeTilesNear(g.map, bs, snapped.x, snapped.y, 1)[0];
   if (!goal) return;
-  const blockers = buildingBlockers(g);
+  const blockers = buildingBlockers2(g);
   const ux = worldToTile(u.x);
   const uy = worldToTile(u.y);
   const p = findPathSmooth(g.map, ux, uy, goal.x, goal.y, {
@@ -1206,7 +1282,8 @@ function tickGame(g, dt) {
   updateUnits(g.units.filter((u) => !driven.has(u.id)), dt);
   updateUnits(g.enemyUnits, dt);
   const dropoffs = g.buildings.filter((b) => b.kind === "refinery");
-  for (const t of updateHarvesters(g.harvesters, g.map, dropoffs, g.economy, dt)) {
+  const obstacles = [...g.buildings, ...g.enemyBuildings];
+  for (const t of updateHarvesters(g.harvesters, g.map, dropoffs, g.economy, dt, obstacles)) {
     g.map.tiles[idx(g.map, t.x, t.y)] = GRASS;
   }
   stepCombat([...g.units, ...g.enemyUnits, ...g.buildings, ...g.enemyBuildings], dt);

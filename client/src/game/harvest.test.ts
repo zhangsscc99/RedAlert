@@ -1,6 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { GRASS, ORE, WATER, idx, isPassable, tileCenter, type GameMap } from './grid.js';
+import {
+  GRASS,
+  ORE,
+  WATER,
+  idx,
+  isPassable,
+  tileCenter,
+  worldToTile,
+  type GameMap,
+} from './grid.js';
 import { UNIT_STATS, type Unit } from './units.js';
 import { BUILDING_DEFS, type Building, type BuildingKind } from './buildings.js';
 import { createEconomy, type Economy } from './economy.js';
@@ -9,6 +18,7 @@ import {
   updateHarvesters,
   HARVEST_CAPACITY,
   ORE_RESERVE,
+  STUCK_SECONDS,
   type Harvester,
 } from './harvest.js';
 
@@ -211,4 +221,117 @@ test('dt <= 0 is a no-op', () => {
   assert.deepEqual(updateHarvesters([h], map, [refinery], econ, 0), []);
   assert.equal(h.state, 'idle');
   assert.equal(econ.credits, 0);
+});
+
+test('when its vein dries the harvester retargets the nearest live ore', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  setTerrain(map, 9, 8, ORE); // adjacent: first claim, dries in ~2.5s
+  setTerrain(map, 20, 8, ORE); // next-nearest fallback
+  const h = createHarvester(unitAt('harvester', 8, 8));
+  const econ = createEconomy(0);
+
+  const first = drive([h], map, [refinery], econ, 20); // 4s: dry, re-aimed
+  assert.deepEqual(first, [{ x: 9, y: 8 }]);
+  assert.deepEqual(h.target, { x: 20, y: 8 });
+  assert.ok(h.state === 'toOre' || h.state === 'mining');
+
+  const rest = drive([h], map, [refinery], econ, 400);
+  assert.deepEqual(rest, [{ x: 20, y: 8 }]);
+  assert.equal(econ.credits, 2 * ORE_RESERVE);
+  assert.equal(h.state, 'idle');
+});
+
+test('two harvesters claim different ore tiles instead of sharing one', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  setTerrain(map, 12, 8, ORE);
+  const h1 = createHarvester(unitAt('harvester', 8, 7));
+  const h2 = createHarvester(unitAt('harvester', 8, 9));
+  h2.unit.id = 2;
+  const econ = createEconomy(0);
+
+  drive([h1, h2], map, [refinery], econ, 3);
+
+  assert.ok(h1.target, 'first harvester claimed a vein');
+  assert.ok(h2.target, 'second harvester claimed a vein');
+  assert.notDeepEqual(h1.target, h2.target);
+  assert.deepEqual(
+    [h1.target, h2.target].map((t) => `${t!.x},${t!.y}`).sort(),
+    ['10,8', '12,8'],
+  );
+});
+
+test('with a single vein the second harvester waits instead of jostling', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  const h1 = createHarvester(unitAt('harvester', 9, 8)); // on the vein's edge
+  const h2 = createHarvester(unitAt('harvester', 9, 6));
+  h2.unit.id = 2;
+  const econ = createEconomy(0);
+  const wait = { x: h2.unit.x, y: h2.unit.y };
+
+  for (let i = 0; i < 10; i++) updateHarvesters([h1, h2], map, [refinery], econ, 0.2);
+
+  assert.equal(h1.state, 'mining');
+  assert.deepEqual(h1.target, { x: 10, y: 8 });
+  assert.equal(h2.state, 'idle', 'no free tile: stays put');
+  assert.equal(h2.unit.path.length, 0);
+  assert.equal(h2.unit.x, wait.x, 'never jittered toward the claimed tile');
+  assert.equal(h2.unit.y, wait.y);
+});
+
+test('travel legs route around building footprints', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2); // covers (2..5, 2..4)
+  const plant = building('power', 7, 7); // covers (7..8, 7..8), dead ahead
+  const h = createHarvester(unitAt('harvester', 9, 8));
+  h.cargo = HARVEST_CAPACITY;
+  const econ = createEconomy(0);
+
+  updateHarvesters([h], map, [refinery, plant], econ, 0.2);
+
+  assert.equal(h.state, 'toRefinery');
+  assert.ok(h.unit.path.length > 0);
+  for (const wp of h.unit.path) {
+    const tx = worldToTile(wp.x);
+    const ty = worldToTile(wp.y);
+    const inside =
+      (tx >= 7 && tx <= 8 && ty >= 7 && ty <= 8) || // power plant
+      (tx >= 2 && tx <= 5 && ty >= 2 && ty <= 4); // the refinery itself
+    assert.ok(!inside, `waypoint (${tx},${ty}) cuts through a footprint`);
+  }
+});
+
+test('a harvester that cannot move re-plans instead of spinning forever', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  setTerrain(map, 16, 8, ORE);
+  const h = createHarvester(unitAt('harvester', 8, 8));
+  const econ = createEconomy(0);
+
+  updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, 'toOre');
+  assert.ok(h.unit.path.length > 0);
+
+  // Freeze the unit and poison its route; the watchdog must re-plan.
+  const speed = UNIT_STATS.harvester.speed;
+  UNIT_STATS.harvester.speed = 0;
+  try {
+    h.unit.path = [{ x: 99999, y: 99999 }];
+    const ticks = Math.ceil(STUCK_SECONDS / 0.2) + 2;
+    for (let i = 0; i < ticks; i++) updateHarvesters([h], map, [refinery], econ, 0.2);
+
+    assert.equal(h.state, 'toOre');
+    assert.deepEqual(h.target, { x: 16, y: 8 });
+    assert.ok(h.unit.path.length > 0, 're-planned a route');
+    assert.ok(
+      h.unit.path.every((p) => p.x < 1000 && p.y < 1000),
+      'bogus waypoint replaced by a real path',
+    );
+  } finally {
+    UNIT_STATS.harvester.speed = speed;
+  }
 });

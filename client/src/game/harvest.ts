@@ -5,6 +5,14 @@
 // adjacent to the vein and mines from there. Per-tile reserves live in a
 // WeakMap keyed by the GameMap; when a tile is mined out this module reports
 // it in the return value — the caller writes GRASS back into map.tiles.
+//
+// Scheduling rules (F607):
+// - Each ore tile may be claimed by at most one harvester at a time; others
+//   pick the next-nearest unclaimed vein instead of jostling for the tile.
+// - Travel legs path with findPathAvoiding so building footprints deflect
+//   the route instead of being driven through.
+// - A watchdog re-plans whenever a traveling harvester has not moved for
+//   STUCK_SECONDS, so it can never spin in place forever.
 
 import {
   idx,
@@ -16,7 +24,7 @@ import {
   type GameMap,
   type Tile,
 } from './grid.js';
-import { findPath, snapToPassable } from './pathfind.js';
+import { findPathAvoiding, type Blocker } from './pathfind.js';
 import { UNIT_STATS, type Unit } from './units.js';
 import { BUILDING_DEFS, type Building } from './buildings.js';
 import { credit, type Economy } from './economy.js';
@@ -25,6 +33,9 @@ import type { Point } from './selection.js';
 export const HARVEST_RATE = 140; // credits/sec pulled from the vein
 export const HARVEST_CAPACITY = 700; // cargo hold, in credits
 export const ORE_RESERVE = 350; // credits stored in one fresh ore tile
+export const STUCK_SECONDS = 3; // no-displacement budget before re-planning
+
+const STUCK_EPS = 1; // px of travel per tick that still counts as "stuck"
 
 export type HarvesterState = 'idle' | 'toOre' | 'mining' | 'toRefinery' | 'unloading';
 
@@ -33,10 +44,14 @@ export interface Harvester {
   state: HarvesterState;
   cargo: number; // credits aboard, 0..HARVEST_CAPACITY
   target: Point | null; // ore tile while toOre/mining, dropoff tile while toRefinery
+  // Watchdog bookkeeping owned by updateHarvesters.
+  stuckT?: number; // consecutive seconds without displacement
+  lastX?: number; // position sampled on the previous tick
+  lastY?: number;
 }
 
 export function createHarvester(unit: Unit): Harvester {
-  return { unit, state: 'idle', cargo: 0, target: null };
+  return { unit, state: 'idle', cargo: 0, target: null, stuckT: 0, lastX: unit.x, lastY: unit.y };
 }
 
 // Remaining ore per tile index, lazily initialized from the map. A tile at 0
@@ -76,9 +91,38 @@ function stepAlong(u: Unit, dt: number): void {
   }
 }
 
-/** A* to `goal`; returns false (and clears unit.path) when unreachable. */
-function setPath(u: Unit, map: GameMap, goal: Tile): boolean {
-  const path = findPath(map, worldToTile(u.x), worldToTile(u.y), goal.x, goal.y);
+/** Every building's footprint as a path blocker. */
+function buildingBlockers(buildings: readonly Building[]): Blocker[] {
+  return buildings.map((b) => {
+    const def = BUILDING_DEFS[b.kind];
+    return { gx: b.gx, gy: b.gy, w: def.w, h: def.h };
+  });
+}
+
+/** Flat lookup matching the blocker list; used to veto stand tiles. */
+function blockedTiles(map: GameMap, blockers: readonly Blocker[]): Uint8Array {
+  const out = new Uint8Array(map.w * map.h);
+  for (const b of blockers) {
+    for (let y = b.gy; y < b.gy + b.h; y++) {
+      for (let x = b.gx; x < b.gx + b.w; x++) {
+        if (x >= 0 && y >= 0 && x < map.w && y < map.h) out[idx(map, x, y)] = 1;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * A* to `goal` that routes around blocker footprints; returns false (and
+ * clears unit.path) when unreachable.
+ */
+function setPath(u: Unit, map: GameMap, goal: Tile, blockers: readonly Blocker[]): boolean {
+  const path = findPathAvoiding(
+    map,
+    { x: worldToTile(u.x), y: worldToTile(u.y) },
+    goal,
+    blockers,
+  );
   if (!path) {
     u.path = [];
     return false;
@@ -87,18 +131,31 @@ function setPath(u: Unit, map: GameMap, goal: Tile): boolean {
   return true;
 }
 
+function resetWatchdog(h: Harvester): void {
+  h.stuckT = 0;
+  h.lastX = h.unit.x;
+  h.lastY = h.unit.y;
+}
+
 function toIdle(h: Harvester): void {
   h.state = 'idle';
   h.target = null;
   h.unit.path = [];
+  resetWatchdog(h);
 }
 
 function isViableOre(map: GameMap, reserves: Float64Array, t: Point | null): t is Point {
   return t !== null && isOre(map, t.x, t.y) && reserves[idx(map, t.x, t.y)]! > 0;
 }
 
-/** Passable tile adjacent to `ore` closest to (ux,uy), or null if boxed in. */
-function standTileFor(map: GameMap, ore: Tile, ux: number, uy: number): Tile | null {
+/** Passable, unblocked tile adjacent to `ore` closest to (ux,uy), or null if boxed in. */
+function standTileFor(
+  map: GameMap,
+  ore: Tile,
+  ux: number,
+  uy: number,
+  blocked: Uint8Array,
+): Tile | null {
   let best: Tile | null = null;
   let bestD = Infinity;
   for (let dy = -1; dy <= 1; dy++) {
@@ -106,7 +163,7 @@ function standTileFor(map: GameMap, ore: Tile, ux: number, uy: number): Tile | n
       if (dx === 0 && dy === 0) continue;
       const x = ore.x + dx;
       const y = ore.y + dy;
-      if (!isPassable(map, x, y)) continue;
+      if (!isPassable(map, x, y) || blocked[idx(map, x, y)]) continue;
       const d = (x - ux) * (x - ux) + (y - uy) * (y - uy);
       if (d < bestD) {
         bestD = d;
@@ -122,27 +179,47 @@ function onOreEdge(ux: number, uy: number, ore: Point): boolean {
 }
 
 /**
- * Pick the nearest ore tile with reserve left and path to its closest
- * standable neighbor. Tries candidates in distance order so an unreachable
- * vein never traps the harvester; returns false when nothing can be reached.
+ * Pick the nearest ore tile with reserve left that no other harvester has
+ * claimed, and path to its closest standable neighbor while routing around
+ * buildings. Tries candidates in distance order so an unreachable vein never
+ * traps the harvester; returns false when nothing can be reached. On success
+ * the chosen tile's claim is transferred to this harvester inside `claims`.
  */
-function sendToOre(h: Harvester, map: GameMap, reserves: Float64Array): boolean {
+function sendToOre(
+  h: Harvester,
+  map: GameMap,
+  reserves: Float64Array,
+  claims: Set<number>,
+  blockers: readonly Blocker[],
+  blocked: Uint8Array,
+): boolean {
   const ux = worldToTile(h.unit.x);
   const uy = worldToTile(h.unit.y);
+  // A tile this harvester already claimed stays available to it.
+  const own =
+    h.target && (h.state === 'toOre' || h.state === 'mining')
+      ? idx(map, h.target.x, h.target.y)
+      : -1;
   const candidates = oreTiles(map)
-    .filter((t) => reserves[idx(map, t.x, t.y)]! > 0)
+    .filter((t) => {
+      const i = idx(map, t.x, t.y);
+      return reserves[i]! > 0 && (!claims.has(i) || i === own);
+    })
     .sort((a, b) => (a.x - ux) ** 2 + (a.y - uy) ** 2 - ((b.x - ux) ** 2 + (b.y - uy) ** 2));
   for (const ore of candidates) {
     if (onOreEdge(ux, uy, ore)) {
       h.target = { x: ore.x, y: ore.y };
       h.state = 'mining';
       h.unit.path = [];
-      return true;
+    } else {
+      const stand = standTileFor(map, ore, ux, uy, blocked);
+      if (!stand || !setPath(h.unit, map, stand, blockers)) continue;
+      h.target = { x: ore.x, y: ore.y };
+      h.state = 'toOre';
     }
-    const stand = standTileFor(map, ore, ux, uy);
-    if (!stand || !setPath(h.unit, map, stand)) continue;
-    h.target = { x: ore.x, y: ore.y };
-    h.state = 'toOre';
+    if (own >= 0) claims.delete(own);
+    claims.add(idx(map, ore.x, ore.y));
+    resetWatchdog(h);
     return true;
   }
   return false;
@@ -168,16 +245,30 @@ function dropoffBuilding(buildings: readonly Building[], ux: number, uy: number)
   return best;
 }
 
-function sendToRefinery(h: Harvester, map: GameMap, buildings: readonly Building[]): boolean {
+function sendToRefinery(
+  h: Harvester,
+  map: GameMap,
+  buildings: readonly Building[],
+  blockers: readonly Blocker[],
+): boolean {
   const ux = worldToTile(h.unit.x);
   const uy = worldToTile(h.unit.y);
   const b = dropoffBuilding(buildings, ux, uy);
   if (!b) return false;
   const def = BUILDING_DEFS[b.kind];
-  const stand = snapToPassable(map, Math.floor(b.gx + def.w / 2), Math.floor(b.gy + def.h / 2));
-  if (!stand || !setPath(h.unit, map, stand)) return false;
-  h.target = { x: stand.x, y: stand.y };
-  h.state = h.unit.path.length === 0 ? 'unloading' : 'toRefinery';
+  // Aim at the footprint center: findPathAvoiding snaps the goal to the
+  // nearest tile outside the blocker, i.e. the refinery's doorstep.
+  const goal = { x: Math.floor(b.gx + def.w / 2), y: Math.floor(b.gy + def.h / 2) };
+  const path = findPathAvoiding(map, { x: ux, y: uy }, goal, blockers);
+  if (!path) {
+    h.unit.path = [];
+    return false;
+  }
+  h.unit.path = path.map((t) => ({ x: tileCenter(t.x), y: tileCenter(t.y) }));
+  const last = path[path.length - 1];
+  h.target = last ? { x: last.x, y: last.y } : goal;
+  h.state = path.length === 0 ? 'unloading' : 'toRefinery';
+  resetWatchdog(h);
   return true;
 }
 
@@ -190,6 +281,11 @@ function hasDropoff(buildings: readonly Building[]): boolean {
  * mined dry this tick — the caller should write GRASS into map.tiles for
  * each of them. Never mutates map.tiles itself. A harvester that cannot
  * reach its goal drops back to idle instead of wedging in a travel state.
+ *
+ * `obstacles` lists every footprint travel legs must route around; it
+ * defaults to `buildings` so older callers get identical behavior. Only a
+ * finished refinery/HQ inside `buildings` accepts cargo — obstacles never
+ * become dropoff candidates by themselves.
  */
 export function updateHarvesters(
   hs: Harvester[],
@@ -197,19 +293,56 @@ export function updateHarvesters(
   buildings: readonly Building[],
   economy: Economy,
   dt: number,
+  obstacles?: readonly Building[],
 ): Tile[] {
   const depleted: Tile[] = [];
   if (dt <= 0) return depleted;
   const reserves = reserveTable(map);
+  const blockers = buildingBlockers(obstacles ?? buildings);
+  const blocked = blockedTiles(map, blockers);
+  // One claim per ore tile: a vein targeted by a toOre/mining harvester is
+  // off-limits to the others. The set is kept current as harvesters re-pick
+  // during this very tick, so two idle harvesters never grab the same tile.
+  const claims = new Set<number>();
+  for (const h of hs) {
+    if (
+      h.unit.kind === 'harvester' &&
+      (h.state === 'toOre' || h.state === 'mining') &&
+      h.target !== null &&
+      isOre(map, h.target.x, h.target.y)
+    ) {
+      claims.add(idx(map, h.target.x, h.target.y));
+    }
+  }
   for (const h of hs) {
     if (h.unit.kind !== 'harvester') continue;
+
+    // Watchdog: only travel legs can be stuck — mining, unloading and idle
+    // are stationary by design.
+    if (h.state === 'toOre' || h.state === 'toRefinery') {
+      const dx = h.unit.x - (h.lastX ?? h.unit.x);
+      const dy = h.unit.y - (h.lastY ?? h.unit.y);
+      const stuckT = dx * dx + dy * dy < STUCK_EPS * STUCK_EPS ? (h.stuckT ?? 0) + dt : 0;
+      h.stuckT = stuckT;
+      h.lastX = h.unit.x;
+      h.lastY = h.unit.y;
+      if (stuckT >= STUCK_SECONDS) {
+        h.unit.path = [];
+        const ok =
+          h.state === 'toOre'
+            ? sendToOre(h, map, reserves, claims, blockers, blocked)
+            : sendToRefinery(h, map, buildings, blockers);
+        if (!ok) toIdle(h);
+        continue;
+      }
+    }
 
     switch (h.state) {
       case 'idle': {
         if (h.cargo > 0) {
-          sendToRefinery(h, map, buildings);
+          sendToRefinery(h, map, buildings, blockers);
         } else if (hasDropoff(buildings)) {
-          sendToOre(h, map, reserves);
+          sendToOre(h, map, reserves, claims, blockers, blocked);
         }
         break;
       }
@@ -231,11 +364,11 @@ export function updateHarvesters(
 
       case 'mining': {
         if (!isViableOre(map, reserves, h.target)) {
-          // Vein went dry under us (e.g. shared with another harvester).
+          // Vein went dry under us (the caller already wrote GRASS back).
           if (h.cargo >= HARVEST_CAPACITY) {
-            if (!sendToRefinery(h, map, buildings)) toIdle(h);
-          } else if (!sendToOre(h, map, reserves)) {
-            if (h.cargo <= 0 || !sendToRefinery(h, map, buildings)) toIdle(h);
+            if (!sendToRefinery(h, map, buildings, blockers)) toIdle(h);
+          } else if (!sendToOre(h, map, reserves, claims, blockers, blocked)) {
+            if (h.cargo <= 0 || !sendToRefinery(h, map, buildings, blockers)) toIdle(h);
           }
           break;
         }
@@ -248,12 +381,12 @@ export function updateHarvesters(
           depleted.push({ x: h.target.x, y: h.target.y });
         }
         if (h.cargo >= HARVEST_CAPACITY) {
-          if (!sendToRefinery(h, map, buildings)) toIdle(h);
+          if (!sendToRefinery(h, map, buildings, blockers)) toIdle(h);
         } else if (reserves[i]! <= 0) {
           // Tile exhausted mid-load: chase the next vein, else deliver the
           // partial cargo rather than idling on a dry patch.
-          if (!sendToOre(h, map, reserves)) {
-            if (!sendToRefinery(h, map, buildings)) toIdle(h);
+          if (!sendToOre(h, map, reserves, claims, blockers, blocked)) {
+            if (!sendToRefinery(h, map, buildings, blockers)) toIdle(h);
           }
         }
         break;

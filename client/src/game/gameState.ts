@@ -461,8 +461,10 @@ export function tickGame(g: GameState, dt: number): void {
 
   // Harvester ore loop: only a finished refinery takes cargo, so a base
   // without one leaves harvesters idle. Depleted veins turn back to grass.
+  // Every footprint (ours and the enemy's) is a routing obstacle.
   const dropoffs = g.buildings.filter((b) => b.kind === 'refinery');
-  for (const t of updateHarvesters(g.harvesters, g.map, dropoffs, g.economy, dt)) {
+  const obstacles = [...g.buildings, ...g.enemyBuildings];
+  for (const t of updateHarvesters(g.harvesters, g.map, dropoffs, g.economy, dt, obstacles)) {
     g.map.tiles[idx(g.map, t.x, t.y)] = GRASS;
   }
 
