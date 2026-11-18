@@ -1377,13 +1377,22 @@ function isLowPower(power) {
 }
 
 // src/game/save.ts
-var SAVE_VERSION = 2;
-var cloneUnit = (u) => ({ id: u.id, kind: u.kind, x: u.x, y: u.y, hp: u.hp });
+var SAVE_VERSION = 3;
+var cloneUnit = (u) => {
+  const c = { id: u.id, kind: u.kind, x: u.x, y: u.y, hp: u.hp };
+  if (u.kills !== void 0) c.kills = u.kills;
+  return c;
+};
 var cloneBuilding = (b) => {
   const c = { id: b.id, kind: b.kind, gx: b.gx, gy: b.gy, hp: b.hp };
   if (b.done !== void 0) c.done = b.done;
+  if (b.level !== void 0) c.level = b.level;
+  if (b.repair !== void 0) c.repair = b.repair;
   return c;
 };
+var cloneStats = (s) => ({ ...s });
+var cloneWeather = (w) => ({ ...w });
+var cloneRadar = (r) => ({ ...r });
 function snapshot(input) {
   const s = {
     version: SAVE_VERSION,
@@ -1398,6 +1407,12 @@ function snapshot(input) {
   if (input.ai) s.ai = { ...input.ai };
   if (input.camera) s.camera = { ...input.camera };
   if (input.opts) s.opts = { ...input.opts };
+  if (input.fog) s.fog = { w: input.fog.w, h: input.fog.h, explored: Array.from(input.fog.explored) };
+  if (input.stats) s.stats = cloneStats(input.stats);
+  if (input.wave !== void 0) s.wave = input.wave;
+  if (input.difficulty !== void 0) s.difficulty = input.difficulty;
+  if (input.weather) s.weather = cloneWeather(input.weather);
+  if (input.radar) s.radar = cloneRadar(input.radar);
   return s;
 }
 
