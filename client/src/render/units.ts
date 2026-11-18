@@ -156,8 +156,6 @@ interface Puff {
   sand: boolean;
 }
 
-const puffs: Puff[] = [];
-
 /** Tank tread scuff stamped on the ground; fades with age. */
 interface Mark {
   x: number;
@@ -166,11 +164,58 @@ interface Mark {
   born: number;
 }
 
-const marks: Mark[] = [];
+/**
+ * Fixed-capacity ring of reusable slots: `next()` hands back the slot to
+ * overwrite (the oldest when full), expiry just advances the head index —
+ * no push/shift/allocation in the frame loop.
+ */
+class FxRing<T extends object> {
+  private slots: (T | undefined)[];
+  private head = 0;
+  private len = 0;
+  constructor(
+    private readonly cap: number,
+    private readonly make: () => T,
+  ) {
+    this.slots = new Array<T | undefined>(cap);
+  }
+  get size(): number {
+    return this.len;
+  }
+  /** Entry at logical index i (0 = oldest). */
+  at(i: number): T {
+    return this.slots[(this.head + i) % this.cap]!;
+  }
+  /** Oldest entry, or undefined when empty. */
+  oldest(): T | undefined {
+    return this.len > 0 ? this.slots[this.head] : undefined;
+  }
+  /** Drop the oldest entry. */
+  drop(): void {
+    if (this.len === 0) return;
+    this.head = (this.head + 1) % this.cap;
+    this.len--;
+  }
+  /** Next writable slot — reuses the oldest entry when full. */
+  next(): T {
+    const i = (this.head + this.len) % this.cap;
+    let s = this.slots[i];
+    if (s === undefined) s = this.slots[i] = this.make();
+    if (this.len < this.cap) this.len++;
+    else this.head = (this.head + 1) % this.cap;
+    return s;
+  }
+}
+
+const puffs = new FxRing<Puff>(MAX_PUFFS, () => ({ x: 0, y: 0, born: 0, sand: false }));
+const marks = new FxRing<Mark>(MAX_MARKS, () => ({ x: 0, y: 0, angle: 0, born: 0 }));
 
 function spawnMark(u: Unit, now: number): void {
-  if (marks.length >= MAX_MARKS) marks.shift();
-  marks.push({ x: u.x, y: u.y, angle: u.angle, born: now });
+  const m = marks.next();
+  m.x = u.x;
+  m.y = u.y;
+  m.angle = u.angle;
+  m.born = now;
 }
 
 /**
@@ -184,15 +229,13 @@ function isSandyAt(wx: number, wy: number): boolean {
 }
 
 function spawnPuff(u: Unit, now: number): void {
-  if (puffs.length >= MAX_PUFFS) puffs.shift();
   const back = u.angle + Math.PI;
   const jitter = (u.id * 2654435761 % 97) / 97 - 0.5;
-  puffs.push({
-    x: u.x + Math.cos(back) * 7 + Math.cos(u.angle + Math.PI / 2) * jitter * 6,
-    y: u.y + Math.sin(back) * 7 + Math.sin(u.angle + Math.PI / 2) * jitter * 6,
-    born: now,
-    sand: isSandyAt(u.x, u.y),
-  });
+  const p = puffs.next();
+  p.x = u.x + Math.cos(back) * 7 + Math.cos(u.angle + Math.PI / 2) * jitter * 6;
+  p.y = u.y + Math.sin(back) * 7 + Math.sin(u.angle + Math.PI / 2) * jitter * 6;
+  p.born = now;
+  p.sand = isSandyAt(u.x, u.y);
 }
 
 /** Rotate `cur` toward `target` by at most `step`, along the short arc. */
@@ -648,6 +691,80 @@ function hpColor(pct: number): string {
   return `rgb(${r},${g},40)`;
 }
 
+// Health bars queue during the unit pass and flush afterwards so they draw
+// over every body, then stack upward where they would collide — dense clumps
+// stay readable instead of smearing into one strip. Pooled records: the pool
+// grows once to the widest concurrent crowd, then allocates nothing.
+interface BarRec {
+  x: number; // left edge, screen px
+  y: number; // requested top edge, screen px
+  w: number;
+  pct: number;
+  sel: boolean;
+}
+
+const barPool: BarRec[] = [];
+const placedPool: { x: number; y: number; w: number }[] = [];
+let barCount = 0;
+const BAR_H = 5; // bar footprint height incl. border, screen px
+
+function queueBar(x: number, y: number, w: number, pct: number, sel: boolean): void {
+  let b = barPool[barCount];
+  if (b === undefined) b = barPool[barCount] = { x: 0, y: 0, w: 0, pct: 0, sel: false };
+  b.x = x;
+  b.y = y;
+  b.w = w;
+  b.pct = pct;
+  b.sel = sel;
+  barCount++;
+}
+
+/**
+ * Flush queued bars in two passes — unselected first, selected last so the
+ * picked unit's bar stays on top in a clump. Each bar rises until it clears
+ * every bar already placed this frame; capped retries bound the worst case.
+ */
+function drawHealthBars(ctx: CanvasRenderingContext2D): void {
+  let placed = 0;
+  for (let pass = 0; pass < 2; pass++) {
+    const wantSel = pass === 1;
+    for (let i = 0; i < barCount; i++) {
+      const b = barPool[i]!;
+      if (b.sel !== wantSel) continue;
+      let by = b.y;
+      for (let tries = 0; tries < 6; tries++) {
+        let hit = false;
+        for (let j = 0; j < placed; j++) {
+          const o = placedPool[j]!;
+          if (b.x < o.x + o.w && b.x + b.w > o.x && by < o.y + BAR_H && by + BAR_H > o.y) {
+            by = o.y - BAR_H;
+            hit = true;
+            break;
+          }
+        }
+        if (!hit) break;
+      }
+      let p = placedPool[placed];
+      if (p === undefined) p = placedPool[placed] = { x: 0, y: 0, w: 0 };
+      p.x = b.x;
+      p.y = by;
+      p.w = b.w;
+      placed++;
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+      ctx.fillRect(b.x - 0.5, by - 0.5, b.w + 1, 4);
+      ctx.fillStyle = hpColor(b.pct);
+      ctx.fillRect(b.x, by, Math.max(0, b.w * b.pct), 3);
+      if (b.sel) {
+        // Bright outline so the selected unit's bar can't be mistaken for a
+        // neighbour's in a dense group.
+        ctx.strokeStyle = SELECT_RING;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(b.x - 1, by - 1, b.w + 2, 5);
+      }
+    }
+  }
+}
+
 const RANK_BG: Record<string, string> = {
   rookie: 'rgba(40,40,34,0.7)',
   veteran: 'rgba(30,60,110,0.85)',
@@ -720,10 +837,14 @@ export function drawUnits(
 ): void {
   const pulse = Math.sin((now / PULSE_PERIOD) * Math.PI * 2);
   frameNo++;
+  barCount = 0;
 
-  // Expire dust once per frame; oldest-first array so a scan-out is cheap.
-  while (puffs.length > 0 && now - puffs[0]!.born > DUST_TTL_MS) puffs.shift();
-  for (const p of puffs) {
+  // Expire dust once per frame; oldest-first ring so a scan-out is cheap.
+  for (let p = puffs.oldest(); p !== undefined && now - p.born > DUST_TTL_MS; p = puffs.oldest()) {
+    puffs.drop();
+  }
+  for (let i = 0; i < puffs.size; i++) {
+    const p = puffs.at(i);
     const age = (now - p.born) / DUST_TTL_MS;
     if (age < 0 || age >= 1) continue;
     const px = (p.x - cam.x) * cam.zoom;
@@ -738,9 +859,12 @@ export function drawUnits(
   }
 
   // Tread marks: two short parallel dashes stamped behind moving vehicles.
-  // Oldest-first array like puffs, so expiry is a cheap prefix scan.
-  while (marks.length > 0 && now - marks[0]!.born > MARK_TTL_MS) marks.shift();
-  for (const m of marks) {
+  // Oldest-first ring like puffs, so expiry is a cheap prefix scan.
+  for (let m = marks.oldest(); m !== undefined && now - m.born > MARK_TTL_MS; m = marks.oldest()) {
+    marks.drop();
+  }
+  for (let i = 0; i < marks.size; i++) {
+    const m = marks.at(i);
     const age = (now - m.born) / MARK_TTL_MS;
     if (age < 0 || age >= 1) continue;
     const mx = (m.x - cam.x) * cam.zoom;
@@ -752,7 +876,7 @@ export function drawUnits(
     ctx.strokeStyle = `rgba(24,22,16,${0.3 * (1 - age)})`;
     ctx.lineWidth = Math.max(1, 1.8 * cam.zoom);
     ctx.beginPath();
-    for (const s of [-1, 1]) {
+    for (let s = -1; s <= 1; s += 2) {
       ctx.moveTo(mx - ca * half - sa * off * s, my - sa * half + ca * off * s);
       ctx.lineTo(mx + ca * half - sa * off * s, my + sa * half + ca * off * s);
     }
@@ -797,8 +921,16 @@ export function drawUnits(
     const sy = syp + jy;
 
     if (u.selected) {
+      const ringR = r + 4 + pulse * 2;
+      // Dark under-stroke keeps the ring readable against bright terrain and
+      // in tight clumps where neighbouring bodies crowd the marker.
       ctx.beginPath();
-      ctx.arc(sx, sy, r + 4 + pulse * 2, 0, Math.PI * 2);
+      ctx.arc(sx, sy, ringR, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(8, 12, 8, 0.85)';
+      ctx.lineWidth = 4;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(sx, sy, ringR, 0, Math.PI * 2);
       ctx.strokeStyle = SELECT_RING;
       ctx.globalAlpha = 0.6 + 0.35 * pulse;
       ctx.lineWidth = 2;
@@ -869,16 +1001,10 @@ export function drawUnits(
       ctx.fill();
     }
 
-    // Health bar only once damaged.
+    // Health bar only once damaged — queued, then flushed after the loop so
+    // bars draw over every body and stack where they would collide.
     if (u.hp < u.maxHp) {
-      const pct = u.hp / u.maxHp;
-      const w = r * 2;
-      const bx = sx - r;
-      const by = sy - r - 7;
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
-      ctx.fillRect(bx - 0.5, by - 0.5, w + 1, 4);
-      ctx.fillStyle = hpColor(pct);
-      ctx.fillRect(bx, by, Math.max(0, w * pct), 3);
+      queueBar(sx - r, sy - r - 7, r * 2, u.hp / u.maxHp, u.selected);
     }
 
     // Veterancy badge above the health bar — only when the unit reports a
@@ -887,6 +1013,8 @@ export function drawUnits(
       drawRankBadge(ctx, sx, sy, r, fx.rank, cam.zoom);
     }
   }
+
+  drawHealthBars(ctx);
 
   // Forget despawned units so the tracking map can't grow unbounded. The
   // per-track seenAt stamp replaces a per-frame Set allocation.
