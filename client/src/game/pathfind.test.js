@@ -168,10 +168,16 @@ var Heap = class {
     return top;
   }
 };
+function terrainPassable(map) {
+  return (x, y) => isPassable(map, x, y);
+}
 function findPath(map, sx, sy, gx, gy) {
   if (!inBounds(map, sx, sy) || !inBounds(map, gx, gy)) return null;
   if (sx === gx && sy === gy) return [];
   if (!isPassable(map, gx, gy)) return null;
+  return astar(map, sx, sy, gx, gy, terrainPassable(map));
+}
+function astar(map, sx, sy, gx, gy, passable) {
   const n = map.w * map.h;
   const g = new Float64Array(n).fill(Infinity);
   const f = new Float64Array(n).fill(Infinity);
@@ -193,9 +199,9 @@ function findPath(map, sx, sy, gx, gy) {
     for (const [dx, dy, cost] of DIRS) {
       const nx = cx + dx;
       const ny = cy + dy;
-      if (!isPassable(map, nx, ny)) continue;
+      if (!passable(nx, ny)) continue;
       if (dx !== 0 && dy !== 0) {
-        if (!isPassable(map, cx + dx, cy) || !isPassable(map, cx, cy + dy)) continue;
+        if (!passable(cx + dx, cy) || !passable(cx, cy + dy)) continue;
       }
       const ni = idx(map, nx, ny);
       const ng = g[cur] + cost;
@@ -209,6 +215,22 @@ function findPath(map, sx, sy, gx, gy) {
   }
   return null;
 }
+function findPathAvoiding(map, from, to, blockers) {
+  const blocked = new Uint8Array(map.w * map.h);
+  for (const b of blockers) {
+    for (let y = b.gy; y < b.gy + b.h; y++) {
+      for (let x = b.gx; x < b.gx + b.w; x++) {
+        if (inBounds(map, x, y)) blocked[idx(map, x, y)] = 1;
+      }
+    }
+  }
+  const passable = (x, y) => isPassable(map, x, y) && !blocked[idx(map, x, y)];
+  const s = nearestPassable(map, from.x, from.y, passable);
+  const g = nearestPassable(map, to.x, to.y, passable);
+  if (!s || !g) return null;
+  if (s.x === g.x && s.y === g.y) return [];
+  return astar(map, s.x, s.y, g.x, g.y, passable);
+}
 function reconstruct(map, came, start, goal) {
   const path = [];
   let cur = goal;
@@ -220,7 +242,10 @@ function reconstruct(map, came, start, goal) {
   return path;
 }
 function snapToPassable(map, x, y, maxRadius = 8) {
-  if (isPassable(map, x, y)) return { x, y };
+  return nearestPassable(map, x, y, terrainPassable(map), maxRadius);
+}
+function nearestPassable(map, x, y, passable, maxRadius = 8) {
+  if (passable(x, y)) return { x, y };
   for (let r = 1; r <= maxRadius; r++) {
     let best = null;
     let bestD = Infinity;
@@ -229,7 +254,7 @@ function snapToPassable(map, x, y, maxRadius = 8) {
         if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
         const nx = x + dx;
         const ny = y + dy;
-        if (!isPassable(map, nx, ny)) continue;
+        if (!passable(nx, ny)) continue;
         const d = dx * dx + dy * dy;
         if (d < bestD) {
           bestD = d;
@@ -306,6 +331,79 @@ test("snapToPassable returns nearest passable tile", () => {
   assert.ok(snapped);
   assert.ok(isPassable(m, snapped.x, snapped.y));
   assert.equal(Math.max(Math.abs(snapped.x - 3), Math.abs(snapped.y - 3)), 1);
+});
+function inAny(blockers, t) {
+  return blockers.some((b) => t.x >= b.gx && t.x < b.gx + b.w && t.y >= b.gy && t.y < b.gy + b.h);
+}
+test("findPathAvoiding detours around a continuous building wall", () => {
+  const m = makeMap(10, 10);
+  const wall = [
+    { gx: 4, gy: 0, w: 1, h: 4 },
+    { gx: 4, gy: 4, w: 1, h: 4 }
+  ];
+  const path = findPathAvoiding(m, { x: 2, y: 3 }, { x: 7, y: 3 }, wall);
+  assert.ok(path);
+  assert.deepEqual(path.at(-1), { x: 7, y: 3 });
+  assert.ok(path.some((t) => t.y >= 8));
+  for (const t of path) {
+    assert.ok(isPassable(m, t.x, t.y));
+    assert.ok(!inAny(wall, t), `path enters blocker at ${t.x},${t.y}`);
+  }
+});
+test("findPathAvoiding returns null when the goal is sealed off", () => {
+  const m = makeMap(7, 7);
+  const wall = [{ gx: 3, gy: 0, w: 1, h: 7 }];
+  assert.equal(findPathAvoiding(m, { x: 1, y: 3 }, { x: 5, y: 3 }, wall), null);
+});
+test("findPathAvoiding snaps a start inside a building out of it", () => {
+  const m = makeMap(10, 10);
+  const hq = [{ gx: 2, gy: 2, w: 3, h: 3 }];
+  const path = findPathAvoiding(m, { x: 3, y: 3 }, { x: 8, y: 8 }, hq);
+  assert.ok(path);
+  assert.deepEqual(path.at(-1), { x: 8, y: 8 });
+  for (const t of path) {
+    assert.ok(isPassable(m, t.x, t.y));
+    assert.ok(!inAny(hq, t), `path enters blocker at ${t.x},${t.y}`);
+  }
+});
+test("findPathAvoiding snaps a goal inside a building to its edge", () => {
+  const m = makeMap(10, 10);
+  const hq = [{ gx: 6, gy: 6, w: 3, h: 3 }];
+  const path = findPathAvoiding(m, { x: 1, y: 1 }, { x: 7, y: 7 }, hq);
+  assert.ok(path);
+  const goal = path.at(-1);
+  assert.ok(isPassable(m, goal.x, goal.y));
+  assert.ok(!inAny(hq, goal));
+  assert.equal(Math.max(Math.abs(goal.x - 7), Math.abs(goal.y - 7)), 2);
+  for (const t of path) assert.ok(!inAny(hq, t));
+});
+test("findPathAvoiding never cuts a building corner diagonally", () => {
+  const m = makeMap(4, 3);
+  const blockers = [
+    { gx: 1, gy: 1, w: 1, h: 1 },
+    { gx: 2, gy: 0, w: 1, h: 1 }
+  ];
+  const path = findPathAvoiding(m, { x: 1, y: 0 }, { x: 2, y: 1 }, blockers);
+  assert.ok(path);
+  assert.deepEqual(path.at(-1), { x: 2, y: 1 });
+  const steps = [{ x: 1, y: 0 }, ...path];
+  for (let i = 1; i < steps.length; i++) {
+    const a = steps[i - 1];
+    const b = steps[i];
+    assert.ok(!inAny(blockers, b));
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    if (dx !== 0 && dy !== 0) {
+      assert.ok(!inAny(blockers, { x: a.x + dx, y: a.y }), `corner cut at ${a.x},${a.y}`);
+      assert.ok(!inAny(blockers, { x: a.x, y: a.y + dy }), `corner cut at ${a.x},${a.y}`);
+    }
+  }
+});
+test("findPathAvoiding with no blockers matches findPath", () => {
+  const m = makeMap(10, 10, [[5, 2], [5, 3]]);
+  const a = findPath(m, 1, 1, 8, 1);
+  const b = findPathAvoiding(m, { x: 1, y: 1 }, { x: 8, y: 1 }, []);
+  assert.deepEqual(b, a);
 });
 test("generated map: center is pathable to a distant grass tile", () => {
   const m = generateMap(1337);
