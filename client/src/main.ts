@@ -29,6 +29,7 @@ import {
   screenToWorld,
   selectGroup,
   selectUnits,
+  SIGHT_RADIUS,
   snapToPassable,
   spawnDamageText,
   spawnExplosion,
@@ -60,6 +61,29 @@ import {
 } from './game/index.ts';
 import { DIFFICULTY, type Difficulty } from './game/balance.js';
 import {
+  DEFAULT_BINDINGS,
+  commandCard,
+  normalizeKey,
+  resolve,
+  type CommandState,
+} from './game/hotkeys.js';
+import {
+  contactAge,
+  createRadar,
+  radarAvailable,
+  stepRadar,
+  type Radar,
+} from './game/radar.js';
+import {
+  createWeather,
+  dayPhase,
+  stepWeather,
+  weatherEffects,
+  type Weather,
+  type WeatherKind,
+} from './game/weather.js';
+import { computePower, isLowPower } from './game/power.js';
+import {
   latestSlot,
   loadSlot,
   saveSlot,
@@ -75,6 +99,7 @@ import {
 } from './render/buildings.js';
 import { drawEffects } from './render/effects.js';
 import { bakeFog, createFogLayer, drawFog, type FogLayer } from './render/fog.js';
+import { drawNightOverlay, drawRain, drawSandstorm } from './render/weather.js';
 import {
   actionButtonAt,
   buildBarHit,
@@ -82,6 +107,7 @@ import {
   computeHudLayout,
   drawActionBar,
   drawBuildBar,
+  drawHotkeyCard,
   drawHud,
   drawMessages,
   drawMinimap,
@@ -118,6 +144,7 @@ import {
 } from './render/menu.js';
 import { createGestureRecognizer, type Gesture } from './input/gestures.js';
 import { createSfx } from './audio/sfx.js';
+import { createMusic, type Music, type MusicTrack } from './audio/music.js';
 import { loadSettings, saveSettings } from './settings.js';
 
 const MAP_SEED = 1337;
@@ -161,6 +188,68 @@ const attackMove = new Map<number, Point>();
 
 let paused = false;
 let speedIdx = 0;
+
+// ------------------------------------------------ wired modules (F601) ----
+
+// Radar pulse: the HQ doubles as the radar dish — the scan centres on it and
+// dies with it; a deficit power grid also takes it offline.
+const RADAR_RADIUS = 26 * TILE_SIZE; // world px reach of the HQ dish
+const RADAR_SWEEP_SECONDS = 6;
+const RADAR_CONTACT_TTL = 9;
+let radar: Radar = createRadar({
+  radius: RADAR_RADIUS,
+  sweepSeconds: RADAR_SWEEP_SECONDS,
+  contactTtl: RADAR_CONTACT_TTL,
+});
+let radarOn = false;
+
+let weather: Weather = createWeather(MAP_SEED);
+let hotkeyCard = false;
+
+// BGM owns a separate AudioContext so its volume never touches the sfx bus.
+const MUSIC_VOL = 0.22;
+const MUSIC_DUCK = 0.07; // paused-game level
+let audioArmed = false; // first user gesture unlocks WebAudio
+let musicCtx: AudioContext | null = null;
+let music: Music | null = null;
+let musicTrack: MusicTrack | null = null;
+
+function ensureMusic(): void {
+  if (music) return;
+  const AC =
+    window.AudioContext ??
+    (window as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AC) return;
+  musicCtx = new AC();
+  if (musicCtx.state === 'suspended') void musicCtx.resume();
+  music = createMusic(musicCtx);
+}
+
+const armAudio = (): void => {
+  audioArmed = true;
+  ensureMusic();
+};
+window.addEventListener('pointerdown', armAudio);
+window.addEventListener('keydown', armAudio);
+
+/** Keep track choice + volume in step with screen/pause/mute — idempotent. */
+function syncMusic(): void {
+  if (!audioArmed) return;
+  ensureMusic();
+  if (!music || !musicCtx) return;
+  if (musicCtx.state === 'suspended') {
+    void musicCtx.resume();
+    return;
+  }
+  const track: MusicTrack =
+    screen === 'playing' && game.phase === 'playing' ? 'battle' : 'menu';
+  if (musicTrack !== track) {
+    musicTrack = track;
+    music.crossfade(track, 0.8);
+  }
+  const v = settings.mute ? 0 : screen === 'playing' && paused ? MUSIC_DUCK : MUSIC_VOL;
+  if (Math.abs(music.volume - v) > 1e-3) music.setVolume(v);
+}
 
 function resize(): void {
   // Cap DPR on touch devices — full-res retina rendering burns GPU/battery.
@@ -344,6 +433,14 @@ function applyGame(g: GameState): void {
   fogT = 0;
   fog = createFog(map);
   fogLayer = createFogLayer(fog);
+  radar = createRadar({
+    radius: RADAR_RADIUS,
+    sweepSeconds: RADAR_SWEEP_SECONDS,
+    contactTtl: RADAR_CONTACT_TTL,
+  });
+  radarOn = false;
+  weather = createWeather(g.seed);
+  hotkeyCard = false;
   refreshFog();
 }
 
@@ -490,9 +587,15 @@ function activateBarItem(i: number): void {
   else pendingBuild = pendingBuild === d.kind ? null : (d.kind as BuildingKind);
 }
 
+/** Effect multiplier for the current weather, ramped by segment intensity. */
+function weatherMul(key: 'sight' | 'speed'): number {
+  return 1 + (weatherEffects(weather)[key] - 1) * weather.intensity;
+}
+
 function refreshFog(): void {
+  const sight = weatherMul('sight');
   updateFog(fog, map, [
-    ...game.units.map(unitSource),
+    ...game.units.map((u) => ({ ...unitSource(u), sight: SIGHT_RADIUS[u.kind] * sight })),
     ...game.buildings.filter((b) => b.done).map(buildingSource),
   ]);
   bakeFog(fog, fogLayer);
@@ -602,6 +705,13 @@ function guideAdvance(skip: boolean): void {
   }
 }
 
+function toggleFullscreen(): void {
+  const p = fullscreenOn
+    ? document.exitFullscreen?.()
+    : document.documentElement.requestFullscreen?.();
+  void p?.catch(() => {}); // iOS etc. — fail silently
+}
+
 function handleAction(id: ActionId): void {
   switch (id) {
     case 'build':
@@ -613,13 +723,9 @@ function handleAction(id: ActionId): void {
     case 'stop':
       stopSelected();
       break;
-    case 'fullscreen': {
-      const p = fullscreenOn
-        ? document.exitFullscreen?.()
-        : document.documentElement.requestFullscreen?.();
-      void p?.catch(() => {}); // iOS etc. — fail silently
+    case 'fullscreen':
+      toggleFullscreen();
       break;
-    }
   }
 }
 
@@ -1114,6 +1220,95 @@ canvas.addEventListener(
   { passive: false },
 );
 
+/** Live state the binding table's availability check runs against. */
+function commandState(): CommandState {
+  return {
+    credits: game.economy.credits,
+    hasBarracks: game.buildings.some((b) => b.kind === 'barracks' && b.done),
+    hasPower: computePower(game.buildings).produced > 0,
+    selectionCount: game.units.reduce((n, u) => n + (u.selected ? 1 : 0), 0),
+  };
+}
+
+/**
+ * Run one binding-table action. Commands with requirements are gated through
+ * commandCard — a disabled entry surfaces its reason instead of executing.
+ */
+function dispatchAction(id: string, e: KeyboardEvent): void {
+  switch (id) {
+    case 'ui.pause':
+      paused = !paused;
+      e.preventDefault();
+      return;
+    case 'ui.speedUp':
+      speedIdx = Math.min(SPEEDS.length - 1, speedIdx + 1);
+      return;
+    case 'ui.speedDown':
+      speedIdx = Math.max(0, speedIdx - 1);
+      return;
+    case 'ui.fullscreen':
+      toggleFullscreen();
+      return;
+    case 'ui.minimap':
+      minimapCollapsed = !minimapCollapsed;
+      return;
+    case 'ui.menu':
+      if (hotkeyCard) {
+        hotkeyCard = false;
+      } else if (pendingBuild) {
+        pendingBuild = null;
+      } else {
+        persist(); // archive into the session slot before leaving the match
+        screen = 'menu';
+      }
+      return;
+    case 'cmd.hold':
+      hotkeyCard = !hotkeyCard;
+      return;
+    case 'cmd.attackMove':
+      return; // held key: modifies left-clicks, no action on keydown
+  }
+  if (id.startsWith('group.select')) {
+    const n = Number(id.slice('group.select'.length));
+    if (e.ctrlKey || e.metaKey) {
+      if (assignGroup(groups, n, game.units)) pushMessage(msgs, `编队 ${n} 已保存`);
+      e.preventDefault();
+    } else {
+      const picked = selectGroup(groups, n, game.units);
+      if (picked.length > 0) pushMessage(msgs, `编队 ${n}（${picked.length} 单位）`);
+    }
+    return;
+  }
+  const entry = commandCard('game', commandState()).find((c) => c.id === id);
+  if (entry?.disabled) {
+    pushMessage(msgs, `${entry.label}: ${entry.reason ?? '无法执行'}`);
+    return;
+  }
+  switch (id) {
+    case 'build.barracks':
+      pendingBuild = 'barracks';
+      break;
+    case 'build.refinery':
+      pendingBuild = 'refinery';
+      break;
+    case 'build.turret':
+      pendingBuild = 'turret';
+      break;
+    case 'train.infantry':
+      tryTrain('infantry');
+      break;
+    case 'train.tank':
+      tryTrain('tank');
+      break;
+    case 'train.harvester':
+      tryTrain('harvester');
+      break;
+    case 'cmd.stop':
+      stopSelected();
+      break;
+  }
+}
+
 window.addEventListener('keydown', (e) => {
   const k = e.key.toLowerCase();
   keys.add(k);
@@ -1134,62 +1329,17 @@ window.addEventListener('keydown', (e) => {
     else if (k === 'escape') screen = 'menu';
     return;
   }
-  if (k === ' ') {
-    paused = !paused;
-    e.preventDefault();
-    return;
-  }
-  if (k === '+' || k === '=') {
-    speedIdx = Math.min(SPEEDS.length - 1, speedIdx + 1);
-    return;
-  }
-  if (k === '-' || k === '_') {
-    speedIdx = Math.max(0, speedIdx - 1);
-    return;
-  }
-  if (k === 'escape') {
-    if (pendingBuild) {
-      pendingBuild = null;
-    } else {
-      persist(); // archive into the session slot before leaving the match
-      screen = 'menu';
-    }
-    return;
-  }
-  if (/^[1-9]$/.test(k)) {
-    const n = Number(k);
-    if (e.ctrlKey || e.metaKey) {
-      if (assignGroup(groups, n, game.units)) pushMessage(msgs, `编队 ${n} 已保存`);
-      e.preventDefault();
-    } else {
-      const picked = selectGroup(groups, n, game.units);
-      if (picked.length > 0) pushMessage(msgs, `编队 ${n}（${picked.length} 单位）`);
-    }
-    return;
-  }
-  switch (k) {
-    case 'b':
-      pendingBuild = 'barracks';
-      break;
-    case 'r':
-      pendingBuild = 'refinery';
-      break;
-    case 'q':
-      tryTrain('infantry');
-      break;
-    case 'w':
-      tryTrain('tank');
-      break;
-    case 'e':
-      tryTrain('harvester');
-      break;
-    case 's':
-      stopSelected();
-      break;
-    case 'g':
-      guardSelected();
-      break;
-  }
+  // Every in-game key resolves through the binding table. Ctrl+digit has no
+  // chord of its own, so retry the bare key: the resolved group slot carries
+  // the modifier (assign) vs plain press (recall). The retry is digits-only —
+  // Ctrl+W/Q/R/etc. are browser shortcuts, not group selects.
+  const action =
+    resolve(DEFAULT_BINDINGS, normalizeKey(e), 'game') ??
+    ((e.ctrlKey || e.metaKey) && /^[1-9]$/.test(e.key)
+      ? resolve(DEFAULT_BINDINGS, e.key, 'game')
+      : null);
+  if (action) dispatchAction(action, e);
+  else if (k === 'g') guardSelected(); // unbound fallback: 保持警戒
 });
 window.addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
 window.addEventListener('blur', () => {
@@ -1209,6 +1359,42 @@ function applyKeyPan(dt: number): void {
 }
 
 // ----------------------------------------------------------------- loop ----
+
+const WEATHER_LABEL: Record<WeatherKind, string> = {
+  clear: '天气转晴',
+  rain: '降雨来临',
+  sandstorm: '沙尘暴来袭',
+};
+
+/** Last-known-position markers for radar contacts, fading with contact age. */
+function drawRadarContacts(): void {
+  if (!radarOn || game.phase !== 'playing') return;
+  for (const c of radar.contacts.values()) {
+    const age = contactAge(radar, c);
+    const a = Math.max(0, 1 - age / radar.contactTtl);
+    const sx = (c.x - camera.x) * camera.zoom;
+    const sy = (c.y - camera.y) * camera.zoom;
+    if (sx < -24 || sy < -24 || sx > viewW + 24 || sy > viewH + 24) continue;
+    const r = Math.max(4, 7 * camera.zoom);
+    ctx.strokeStyle = `rgba(255, 107, 93, ${(0.25 + 0.75 * a).toFixed(3)})`;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(sx, sy - r);
+    ctx.lineTo(sx + r, sy);
+    ctx.lineTo(sx, sy + r);
+    ctx.lineTo(sx - r, sy);
+    ctx.closePath();
+    ctx.stroke();
+    // Fresh pings carry an expanding ring for the first second.
+    if (age < 1) {
+      ctx.strokeStyle = `rgba(255, 107, 93, ${(0.7 * (1 - age)).toFixed(3)})`;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(sx, sy, r + age * 26 * camera.zoom, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+}
 
 function drawMoveMarker(now: number): void {
   if (!moveMarker) return;
@@ -1339,6 +1525,8 @@ function frame(now: number): void {
   // Command strip auto-dismiss after 4s idle.
   if (touchMenu && now - touchMenuT > MENU_AUTO_CLOSE_MS) touchMenu = null;
 
+  syncMusic();
+
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = '#0b0e0a';
   ctx.fillRect(0, 0, viewW, viewH);
@@ -1378,11 +1566,29 @@ function frame(now: number): void {
 
   if (gameDt > 0 && game.phase === 'playing') {
     const prev = snapshotCombat();
+    const wEv = stepWeather(weather, gameDt);
+    if (wEv) pushMessage(msgs, WEATHER_LABEL[wEv.to]);
+    const speedMul = weatherMul('speed');
+    for (const u of game.units) u.speed = UNIT_STATS[u.kind].speed * speedMul;
+    for (const u of game.enemyUnits) u.speed = UNIT_STATS[u.kind].speed * speedMul;
+    // Harvesters read the stats table, not the unit field (harvest.stepAlong),
+    // so the kind row is scaled for the duration of this tick.
+    const harvestBase = UNIT_STATS.harvester.speed;
+    UNIT_STATS.harvester.speed = harvestBase * speedMul;
     updateOrders(orders, game.units, [...game.enemyUnits, ...game.enemyBuildings], gameDt);
     stepAttackMove();
     tickGame(game, gameDt);
+    UNIT_STATS.harvester.speed = harvestBase;
     diffCombat(prev);
     updateEffects(effects, gameDt);
+    // Radar pulse: the HQ dish scans while it stands and the grid holds.
+    const hq = game.buildings.find((b) => b.kind === 'hq' && b.done);
+    radarOn = radarAvailable(!isLowPower(computePower(game.buildings)), hq !== undefined);
+    if (radarOn && hq) {
+      radar.cx = hq.x;
+      radar.cy = hq.y;
+      stepRadar(radar, gameDt, game.enemyUnits, 'player');
+    }
     fogT += gameDt;
     if (fogT >= FOG_REFRESH) {
       fogT %= FOG_REFRESH;
@@ -1413,6 +1619,17 @@ function frame(now: number): void {
   drawMoveMarker(now);
   drawUnits(ctx, camera, game.units, now);
   drawUnitsColored(ctx, camera, visibleEnemies, '#e8765a', '#5a2018');
+  drawRadarContacts();
+
+  // Weather + day/night overlays sit on the world but under the HUD.
+  if (weather.kind === 'rain') {
+    drawRain(ctx, viewW, viewH, game.elapsed, weather.intensity);
+  } else if (weather.kind === 'sandstorm') {
+    ctx.globalAlpha = 0.35 + 0.65 * weather.intensity;
+    drawSandstorm(ctx, viewW, viewH, game.elapsed);
+    ctx.globalAlpha = 1;
+  }
+  drawNightOverlay(ctx, viewW, viewH, 1 - dayPhase(game.elapsed).light);
 
   if (pendingBuild) {
     const g = ghostAnchor(mouse);
@@ -1446,7 +1663,22 @@ function frame(now: number): void {
   drawTimer();
   drawMessages(ctx, msgs, lay);
   drawSelectionCard(ctx, game.units, lay);
-  drawMinimap(ctx, map, camera, game.units, lay, visibleEnemies, fog);
+  drawMinimap(
+    ctx,
+    map,
+    camera,
+    game.units,
+    lay,
+    visibleEnemies,
+    fog,
+    radarOn
+      ? [...radar.contacts.values()].map((c) => ({
+          x: c.x,
+          y: c.y,
+          a: Math.max(0, 1 - contactAge(radar, c) / radar.contactTtl),
+        }))
+      : undefined,
+  );
   drawActionBar(ctx, lay, {
     buildOpen: buildBarOpen,
     minimapOn: lay.minimap !== null,
@@ -1459,6 +1691,7 @@ function frame(now: number): void {
   drawTapRings(now);
   if (touchMenu) drawTouchMenu(ctx, touchMenu, pressedMenu);
   if (guideStep >= 0) drawTouchGuide(ctx, viewW, viewH, guideStep);
+  if (hotkeyCard) drawHotkeyCard(ctx, viewW, viewH, commandCard('game', commandState()));
   if (isTouch && now < hintUntil) {
     drawTouchHint(ctx, lay, TOUCH_HINT, Math.min(1, (hintUntil - now) / 600));
   }
@@ -1477,6 +1710,8 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     loopRunning = false;
     cancelAnimationFrame(rafId);
+    music?.stop();
+    musicTrack = null;
   } else {
     startLoop();
   }

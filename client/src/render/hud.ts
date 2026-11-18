@@ -671,6 +671,13 @@ export function drawSelectBox(ctx: CanvasRenderingContext2D, r: Rect): void {
 const MM_TILE: readonly string[] = ['#3e7f30', '#1a4882', '#8a6d1e'];
 const MM_TILE_DIM: readonly string[] = ['#1a2b14', '#0e2038', '#38290f'];
 
+/** A radar contact blip on the minimap: world-px position + 0–1 fade. */
+export interface MinimapPing {
+  x: number;
+  y: number;
+  a: number;
+}
+
 export function drawMinimap(
   ctx: CanvasRenderingContext2D,
   map: GameMap,
@@ -679,6 +686,7 @@ export function drawMinimap(
   layout: HudLayout,
   enemies: readonly Unit[] = [],
   fog?: Fog,
+  pings?: readonly MinimapPing[],
 ): void {
   const r = layout.minimap;
   if (!r) return;
@@ -707,6 +715,13 @@ export function drawMinimap(
   for (const u of enemies) {
     ctx.fillStyle = '#ff6b5d';
     ctx.fillRect(r.x + u.x * sx - 1.5, r.y + u.y * sy - 1.5, 3, 3);
+  }
+  // Radar contacts: slightly larger soft-alpha blips, fading with age.
+  if (pings) {
+    for (const p of pings) {
+      ctx.fillStyle = `rgba(255, 107, 93, ${(0.25 + 0.75 * p.a).toFixed(3)})`;
+      ctx.fillRect(r.x + p.x * sx - 2, r.y + p.y * sy - 2, 4, 4);
+    }
   }
 
   // View frame: exact camera region, clipped to the map and pixel-snapped
@@ -1156,6 +1171,62 @@ export function drawTouchGuide(
   ctx.font = '12px ui-monospace, Menlo, Consolas, monospace';
   ctx.fillStyle = TEXT_DIM;
   ctx.fillText(`${step + 1}/${TOUCH_GUIDE_STEPS.length}`, g.card.x + g.card.w - 52, g.card.y + 20);
+}
+
+// ------------------------------------------------------------ hotkey card ----
+
+/** One row of the hotkey card: pre-composed "KEY — label" + availability. */
+export interface HotkeyCardRow {
+  hint: string;
+  disabled?: boolean;
+  reason?: string;
+}
+
+/**
+ * Modal hotkey cheat-sheet (desktop): dims the field and lists every binding
+ * in two columns; unavailable commands render dimmed with their reason.
+ */
+export function drawHotkeyCard(
+  ctx: CanvasRenderingContext2D,
+  viewW: number,
+  viewH: number,
+  rows: readonly HotkeyCardRow[],
+): void {
+  const cols = 2;
+  const lineH = 20;
+  const pad = 18;
+  const perCol = Math.ceil(rows.length / cols);
+  const w = Math.min(viewW - 32, 470);
+  const h = pad * 2 + 32 + perCol * lineH;
+  const x = (viewW - w) / 2;
+  const y = (viewH - h) / 2;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(0, 0, viewW, viewH);
+  panel(ctx, x, y, w, h);
+
+  ctx.textBaseline = 'alphabetic';
+  ctx.font = 'bold 15px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillStyle = ACCENT;
+  ctx.fillText('快捷键', x + pad, y + pad + 6);
+  ctx.font = '11px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillStyle = TEXT_DIM;
+  ctx.textAlign = 'right';
+  ctx.fillText('H / Esc 关闭', x + w - pad, y + pad + 6);
+  ctx.textAlign = 'left';
+
+  ctx.font = '12px ui-monospace, Menlo, Consolas, monospace';
+  const colW = (w - pad * 2) / cols;
+  rows.forEach((row, i) => {
+    const cx = x + pad + Math.floor(i / perCol) * colW;
+    const cy = y + pad + 32 + (i % perCol) * lineH;
+    ctx.fillStyle = row.disabled ? TEXT_DIM : TEXT_MAIN;
+    ctx.fillText(row.hint, cx, cy);
+    if (row.disabled && row.reason) {
+      ctx.fillStyle = BAD;
+      ctx.fillText(`(${row.reason})`, cx + ctx.measureText(row.hint).width + 6, cy);
+    }
+  });
 }
 
 // ------------------------------------------------------------- touch hint ----
