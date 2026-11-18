@@ -36,14 +36,31 @@ export const ORE_RESERVE = 350; // credits stored in one fresh ore tile
 export const STUCK_SECONDS = 3; // no-displacement budget before re-planning
 
 const STUCK_EPS = 1; // px of travel per tick that still counts as "stuck"
+const MAX_MINERS_PER_TILE = 1; // simultaneous claimants allowed on one ore tile
+const CLAIM_PENALTY = 4; // score multiplier per claimant already on a vein
+const REPLAN_BEFORE_SWITCH = 1; // failed re-plans on a vein before trying others
 
 export type HarvesterState = 'idle' | 'toOre' | 'mining' | 'toRefinery' | 'unloading';
+
+/**
+ * Coarse status for UI badges:
+ * - 'mining'    采矿中：开往矿脉或正在装载
+ * - 'hauling'   运矿中：满载/载货返回卸载点
+ * - 'unloading' 卸载：正在向经济账户卸货
+ * - 'standby'   待命：空闲，随时可被重新分配
+ * - 'depleted'  无矿可采：找不到任何可到达且有储量的矿脉
+ */
+export type HarvesterStatus = 'mining' | 'hauling' | 'unloading' | 'standby' | 'depleted';
 
 export interface Harvester {
   unit: Unit;
   state: HarvesterState;
   cargo: number; // credits aboard, 0..HARVEST_CAPACITY
   target: Point | null; // ore tile while toOre/mining, dropoff tile while toRefinery
+  /** True after a dispatch attempt found no reachable ore with reserve left. */
+  noOre?: boolean;
+  /** Consecutive watchdog re-plans aimed at the same vein. */
+  replans?: number;
   // Watchdog bookkeeping owned by updateHarvesters.
   stuckT?: number; // consecutive seconds without displacement
   lastX?: number; // position sampled on the previous tick
@@ -51,7 +68,32 @@ export interface Harvester {
 }
 
 export function createHarvester(unit: Unit): Harvester {
-  return { unit, state: 'idle', cargo: 0, target: null, stuckT: 0, lastX: unit.x, lastY: unit.y };
+  return {
+    unit,
+    state: 'idle',
+    cargo: 0,
+    target: null,
+    noOre: false,
+    replans: 0,
+    stuckT: 0,
+    lastX: unit.x,
+    lastY: unit.y,
+  };
+}
+
+/** UI-facing status rollup; pure derivation, no side effects. */
+export function harvesterStatus(h: Harvester): HarvesterStatus {
+  switch (h.state) {
+    case 'toOre':
+    case 'mining':
+      return 'mining';
+    case 'toRefinery':
+      return 'hauling';
+    case 'unloading':
+      return 'unloading';
+    default:
+      return h.noOre ? 'depleted' : 'standby';
+  }
 }
 
 // Remaining ore per tile index, lazily initialized from the map. A tile at 0
@@ -140,6 +182,7 @@ function resetWatchdog(h: Harvester): void {
 function toIdle(h: Harvester): void {
   h.state = 'idle';
   h.target = null;
+  h.replans = 0;
   h.unit.path = [];
   resetWatchdog(h);
 }
@@ -179,19 +222,35 @@ function onOreEdge(ux: number, uy: number, ore: Point): boolean {
 }
 
 /**
- * Pick the nearest ore tile with reserve left that no other harvester has
- * claimed, and path to its closest standable neighbor while routing around
- * buildings. Tries candidates in distance order so an unreachable vein never
- * traps the harvester; returns false when nothing can be reached. On success
- * the chosen tile's claim is transferred to this harvester inside `claims`.
+ * Score an ore candidate: squared distance penalized by the harvesters
+ * already assigned to the vein and discounted for richer reserves, so a
+ * crowded or nearly dry vein loses to a free, fuller one slightly farther
+ * away. Lower is better.
+ */
+function oreScore(d2: number, claimants: number, reserve: number): number {
+  const crowd = 1 + claimants * CLAIM_PENALTY;
+  const richness = 0.25 + reserve / ORE_RESERVE;
+  return (d2 * crowd) / richness;
+}
+
+/**
+ * Pick the best ore tile with reserve left — scored by claimant count and
+ * remaining reserve, so harvesters spread across veins instead of piling
+ * onto the closest one — and path to its closest standable neighbor while
+ * routing around buildings. Tries candidates in score order so an
+ * unreachable vein never traps the harvester; returns false when nothing
+ * can be reached. `exclude` skips specific tile indexes (used when the
+ * watchdog gives up on a vein it could not reach). On success the chosen
+ * tile's claim is transferred to this harvester inside `claims`.
  */
 function sendToOre(
   h: Harvester,
   map: GameMap,
   reserves: Float64Array,
-  claims: Set<number>,
+  claims: Map<number, number>,
   blockers: readonly Blocker[],
   blocked: Uint8Array,
+  exclude?: ReadonlySet<number>,
 ): boolean {
   const ux = worldToTile(h.unit.x);
   const uy = worldToTile(h.unit.y);
@@ -200,13 +259,23 @@ function sendToOre(
     h.target && (h.state === 'toOre' || h.state === 'mining')
       ? idx(map, h.target.x, h.target.y)
       : -1;
-  const candidates = oreTiles(map)
-    .filter((t) => {
+  const scored = oreTiles(map)
+    .map((t) => {
       const i = idx(map, t.x, t.y);
-      return reserves[i]! > 0 && (!claims.has(i) || i === own);
+      const reserve = reserves[i]!;
+      const claimants = (claims.get(i) ?? 0) - (i === own ? 1 : 0);
+      const d2 = (t.x - ux) ** 2 + (t.y - uy) ** 2;
+      return { t, i, reserve, claimants, score: oreScore(d2, claimants, reserve) };
     })
-    .sort((a, b) => (a.x - ux) ** 2 + (a.y - uy) ** 2 - ((b.x - ux) ** 2 + (b.y - uy) ** 2));
-  for (const ore of candidates) {
+    .filter((c) => c.reserve > 0 && !(exclude?.has(c.i) ?? false));
+  // 'depleted' means the field is empty (or only the excluded vein remains);
+  // veins that exist but are fully claimed by others leave the flag alone —
+  // the harvester is waiting, not out of work forever.
+  if (scored.length === 0) h.noOre = true;
+  const candidates = scored
+    .filter((c) => c.claimants < MAX_MINERS_PER_TILE)
+    .sort((a, b) => a.score - b.score);
+  for (const { t: ore, i } of candidates) {
     if (onOreEdge(ux, uy, ore)) {
       h.target = { x: ore.x, y: ore.y };
       h.state = 'mining';
@@ -217,8 +286,10 @@ function sendToOre(
       h.target = { x: ore.x, y: ore.y };
       h.state = 'toOre';
     }
-    if (own >= 0) claims.delete(own);
-    claims.add(idx(map, ore.x, ore.y));
+    if (own >= 0) claims.set(own, (claims.get(own) ?? 1) - 1);
+    claims.set(i, (claims.get(i) ?? 0) + 1);
+    if (i !== own) h.replans = 0; // moved to a different vein: fresh budget
+    h.noOre = false;
     resetWatchdog(h);
     return true;
   }
@@ -300,10 +371,11 @@ export function updateHarvesters(
   const reserves = reserveTable(map);
   const blockers = buildingBlockers(obstacles ?? buildings);
   const blocked = blockedTiles(map, blockers);
-  // One claim per ore tile: a vein targeted by a toOre/mining harvester is
-  // off-limits to the others. The set is kept current as harvesters re-pick
-  // during this very tick, so two idle harvesters never grab the same tile.
-  const claims = new Set<number>();
+  // Claims per ore tile: a vein is scored down by every harvester already
+  // assigned to it, and capped at MAX_MINERS_PER_TILE claimants. The map is
+  // kept current as harvesters re-pick during this very tick, so two idle
+  // harvesters never pile onto the same tile.
+  const claims = new Map<number, number>();
   for (const h of hs) {
     if (
       h.unit.kind === 'harvester' &&
@@ -311,7 +383,8 @@ export function updateHarvesters(
       h.target !== null &&
       isOre(map, h.target.x, h.target.y)
     ) {
-      claims.add(idx(map, h.target.x, h.target.y));
+      const i = idx(map, h.target.x, h.target.y);
+      claims.set(i, (claims.get(i) ?? 0) + 1);
     }
   }
   for (const h of hs) {
@@ -328,10 +401,20 @@ export function updateHarvesters(
       h.lastY = h.unit.y;
       if (stuckT >= STUCK_SECONDS) {
         h.unit.path = [];
-        const ok =
-          h.state === 'toOre'
-            ? sendToOre(h, map, reserves, claims, blockers, blocked)
-            : sendToRefinery(h, map, buildings, blockers);
+        let ok: boolean;
+        if (h.state === 'toOre') {
+          // First strike: re-plan a route to the same vein. Repeated strikes
+          // on that vein: prefer any other reachable vein before retrying it.
+          h.replans = (h.replans ?? 0) + 1;
+          const cur = h.target !== null ? idx(map, h.target.x, h.target.y) : -1;
+          ok = false;
+          if (h.replans > REPLAN_BEFORE_SWITCH && cur >= 0) {
+            ok = sendToOre(h, map, reserves, claims, blockers, blocked, new Set([cur]));
+          }
+          if (!ok) ok = sendToOre(h, map, reserves, claims, blockers, blocked);
+        } else {
+          ok = sendToRefinery(h, map, buildings, blockers);
+        }
         if (!ok) toIdle(h);
         continue;
       }
