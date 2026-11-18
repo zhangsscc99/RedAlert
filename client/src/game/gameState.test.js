@@ -550,6 +550,7 @@ function tickQueue(q, dt) {
 }
 
 // src/game/unitRoles.ts
+var ARMOR_TYPES = ["infantry", "vehicle", "building"];
 var DAMAGE_MATRIX = {
   bullet: { infantry: 1, vehicle: 0.5, building: 0.5 },
   rocket: { infantry: 0.5, vehicle: 2, building: 2.5 }
@@ -557,6 +558,56 @@ var DAMAGE_MATRIX = {
 function damageMultiplier(weapon, armor) {
   return DAMAGE_MATRIX[weapon]?.[armor] ?? 0;
 }
+var ROLE_STATS = {
+  rocket: {
+    hp: 80,
+    speed: 45,
+    range: 140,
+    damage: 60,
+    cost: 300,
+    buildTime: 8,
+    sight: 160,
+    armor: "infantry",
+    weapon: "rocket",
+    canAttack: true,
+    canCapture: false,
+    canRepair: false,
+    rare: false,
+    requires: ["barracks"]
+  },
+  engineer: {
+    hp: 40,
+    speed: 65,
+    range: 0,
+    damage: 0,
+    cost: 500,
+    buildTime: 10,
+    sight: 120,
+    armor: "infantry",
+    weapon: null,
+    canAttack: false,
+    canCapture: true,
+    canRepair: true,
+    rare: true,
+    requires: ["barracks"]
+  },
+  scout: {
+    hp: 30,
+    speed: 110,
+    range: 90,
+    damage: 8,
+    cost: 200,
+    buildTime: 5,
+    sight: 260,
+    armor: "infantry",
+    weapon: "bullet",
+    canAttack: true,
+    canCapture: false,
+    canRepair: false,
+    rare: true,
+    requires: ["barracks"]
+  }
+};
 
 // src/game/combat.ts
 function dist(a, b) {
@@ -709,66 +760,6 @@ var DIFFICULTY = {
   easy: { label: "Easy", startCredits: 7e3, waveIntervalScale: 1.35, enemyStrengthScale: 0.8, enemyStartInfantry: 2 },
   normal: { label: "Normal", startCredits: 5e3, waveIntervalScale: 1, enemyStrengthScale: 1, enemyStartInfantry: 4 },
   hard: { label: "Hard", startCredits: 3500, waveIntervalScale: 0.75, enemyStrengthScale: 1.25, enemyStartInfantry: 6 }
-};
-
-// src/game/unitRoles.ts
-var ARMOR_TYPES = ["infantry", "vehicle", "building"];
-var DAMAGE_MATRIX = {
-  bullet: { infantry: 1, vehicle: 0.5, building: 0.5 },
-  rocket: { infantry: 0.5, vehicle: 2, building: 2.5 }
-};
-function damageMultiplier(weapon, armor) {
-  return DAMAGE_MATRIX[weapon]?.[armor] ?? 0;
-}
-var ROLE_STATS = {
-  rocket: {
-    hp: 80,
-    speed: 45,
-    range: 140,
-    damage: 60,
-    cost: 300,
-    buildTime: 8,
-    sight: 160,
-    armor: "infantry",
-    weapon: "rocket",
-    canAttack: true,
-    canCapture: false,
-    canRepair: false,
-    rare: false,
-    requires: ["barracks"]
-  },
-  engineer: {
-    hp: 40,
-    speed: 65,
-    range: 0,
-    damage: 0,
-    cost: 500,
-    buildTime: 10,
-    sight: 120,
-    armor: "infantry",
-    weapon: null,
-    canAttack: false,
-    canCapture: true,
-    canRepair: true,
-    rare: true,
-    requires: ["barracks"]
-  },
-  scout: {
-    hp: 30,
-    speed: 110,
-    range: 90,
-    damage: 8,
-    cost: 200,
-    buildTime: 5,
-    sight: 260,
-    armor: "infantry",
-    weapon: "bullet",
-    canAttack: true,
-    canCapture: false,
-    canRepair: false,
-    rare: true,
-    requires: ["barracks"]
-  }
 };
 
 // src/game/enemyAI.ts
