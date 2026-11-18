@@ -54,7 +54,8 @@ function createCamera(map2, viewW, viewH) {
   return {
     x: (worldW - viewW) / 2,
     y: (worldH - viewH) / 2,
-    zoom: 1
+    zoom: 1,
+    bounds: { worldW, worldH, viewW, viewH }
   };
 }
 function screenToWorld(cam, sx, sy) {
@@ -73,14 +74,33 @@ function zoomAt(cam, sx, sy, factor) {
   cam.x = before.x - sx / cam.zoom;
   cam.y = before.y - sy / cam.zoom;
 }
-function clampToMap(cam, map2, viewW, viewH) {
-  const worldW = map2.w * TILE_SIZE;
-  const worldH = map2.h * TILE_SIZE;
+function clampView(cam, worldW, worldH, viewW, viewH) {
   const margin = 200;
   const vw = viewW / cam.zoom;
   const vh = viewH / cam.zoom;
   cam.x = Math.min(worldW - margin, Math.max(margin - vw, cam.x));
   cam.y = Math.min(worldH - margin, Math.max(margin - vh, cam.y));
+}
+function clampToMap(cam, map2, viewW, viewH) {
+  clampView(cam, map2.w * TILE_SIZE, map2.h * TILE_SIZE, viewW, viewH);
+}
+function edgePanVelocity(pointer, viewW, viewH, margin = 24) {
+  const x = pointer.x < margin ? -1 : pointer.x >= viewW - margin ? 1 : 0;
+  const y = pointer.y < margin ? -1 : pointer.y >= viewH - margin ? 1 : 0;
+  if (x !== 0 && y !== 0) return { x: x * Math.SQRT1_2, y: y * Math.SQRT1_2 };
+  return { x, y };
+}
+function applyEdgePan(cam, vel, dt, speed = 480) {
+  cam.x += vel.x * speed * dt / cam.zoom;
+  cam.y += vel.y * speed * dt / cam.zoom;
+  if (cam.bounds) clampView(cam, cam.bounds.worldW, cam.bounds.worldH, cam.bounds.viewW, cam.bounds.viewH);
+}
+function smoothPan(cam, target, dt, stiffness = 12) {
+  const t = 1 - Math.exp(-stiffness * dt);
+  cam.x += (target.x - cam.x) * t;
+  cam.y += (target.y - cam.y) * t;
+  if (Math.abs(target.x - cam.x) < 0.5) cam.x = target.x;
+  if (Math.abs(target.y - cam.y) < 0.5) cam.y = target.y;
 }
 
 // src/game/camera.test.ts
@@ -128,4 +148,54 @@ test("clampToMap keeps the viewport near the map", () => {
   assert.ok(cam.x <= worldW - 200);
   assert.ok(cam.y >= 200 - 600);
   assert.ok(cam.y <= worldH - 200);
+});
+test("edgePanVelocity: left edge pushes left, center is zero", () => {
+  const left = edgePanVelocity({ x: 0, y: 300 }, 800, 600);
+  assert.ok(left.x < 0);
+  assert.equal(left.y, 0);
+  const center = edgePanVelocity({ x: 400, y: 300 }, 800, 600);
+  assert.equal(center.x, 0);
+  assert.equal(center.y, 0);
+  const right = edgePanVelocity({ x: 799, y: 300 }, 800, 600);
+  assert.ok(right.x > 0);
+  const top = edgePanVelocity({ x: 400, y: 5 }, 800, 600);
+  assert.ok(top.y < 0);
+});
+test("edgePanVelocity: corners produce both axes (unit length)", () => {
+  const v = edgePanVelocity({ x: 0, y: 0 }, 800, 600);
+  assert.ok(v.x < 0 && v.y < 0);
+  assert.ok(Math.abs(Math.hypot(v.x, v.y) - 1) < 1e-9);
+  const v2 = edgePanVelocity({ x: 799, y: 599 }, 800, 600);
+  assert.ok(v2.x > 0 && v2.y > 0);
+});
+test("applyEdgePan moves the camera and stays in bounds", () => {
+  const cam = createCamera(map, 800, 600);
+  const x0 = cam.x;
+  applyEdgePan(cam, edgePanVelocity({ x: 0, y: 300 }, 800, 600), 0.1);
+  assert.ok(cam.x < x0);
+  for (let i = 0; i < 1e3; i++) applyEdgePan(cam, { x: -1, y: -1 }, 0.1);
+  assert.ok(cam.x >= 200 - 800 / cam.zoom);
+  assert.ok(cam.y >= 200 - 600 / cam.zoom);
+  for (let i = 0; i < 1e3; i++) applyEdgePan(cam, { x: 1, y: 1 }, 0.1);
+  assert.ok(cam.x <= map.w * TILE_SIZE - 200);
+  assert.ok(cam.y <= map.h * TILE_SIZE - 200);
+});
+test("smoothPan converges within 3s (\xB11px), monotonic, no overshoot", () => {
+  const cam = { x: 0, y: 0, zoom: 1 };
+  const target = { x: 500, y: -300 };
+  let prevX = cam.x;
+  let prevY = cam.y;
+  const dt = 1 / 60;
+  for (let t = 0; t < 3; t += dt) {
+    smoothPan(cam, target, dt);
+    assert.ok(cam.x >= prevX && cam.x <= target.x);
+    assert.ok(cam.y <= prevY && cam.y >= target.y);
+    prevX = cam.x;
+    prevY = cam.y;
+  }
+  assert.ok(Math.abs(cam.x - target.x) <= 1);
+  assert.ok(Math.abs(cam.y - target.y) <= 1);
+  smoothPan(cam, target, dt);
+  assert.equal(cam.x, target.x);
+  assert.equal(cam.y, target.y);
 });
