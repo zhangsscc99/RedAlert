@@ -72,3 +72,23 @@
 - [x] F408 新手引导状态机：game/onboarding.ts（采矿→建兵营→出兵→摧毁敌基地，事件驱动推进、可跳过、步骤高亮文案）｜verify: bash scripts/build-tests.sh && node --test client/src/game/onboarding.test.js && (cd client && npx tsc --noEmit)｜risk: low
 - [x] F409 三档难度曲线：balance.ts 增加 difficulty（easy/normal/hard：初始资金、波次间隔、敌方强度倍率）+ 一致性校验｜verify: bash scripts/build-tests.sh && node --test client/src/game/balance.test.js && (cd client && npx tsc --noEmit)｜risk: low
 - [x] F410 帧率与实体护栏：game/perf.ts（帧时间 EMA、实体上限、慢帧降级建议、断线判定，纯逻辑）｜verify: bash scripts/build-tests.sh && node --test client/src/game/perf.test.js && (cd client && npx tsc --noEmit)｜risk: low
+
+## M5 并行车道批（2026-11-18 16:10 UTC）— 产品外壳与深度
+
+> 现状判断：M4 已把内核接进主循环（经济/迷雾/特效/面板），但产品外壳仍是「打开即开局」：
+> `balance.difficulty` 无任何引用、三槽存档（saveload.ts）没接线、没有设置项，
+> 也缺少「再来一局」的理由（战报/战役/回放）。上轮触屏改造（input/gestures.ts + HUD TouchMenu）
+> 在 main 上留下未提交且 tsc 报错的半成品，已存到分支 wip/touch-ui，本轮由 F501 单独收口。
+> F501 是唯一允许改 `main.ts` / `index.html` / `render/hud.ts` / `input/gestures.ts` 的车道；
+> 其余九条各自独占新文件，互不重叠，禁止改 FEATURES.md。
+
+- [ ] F501 客户端外壳收口：修掉触屏半成品的 tsc 报错，接线「开始菜单（三档难度）→ 开局 / 继续存档（三槽）/ 设置（静音·网格）」半屏遮罩 UI（唯一改 main.ts、index.html、render/hud.ts、input/gestures.ts）｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client && bash scripts/build-tests.sh && node --test client/src/input/ && node --test client/src/game/｜risk: med
+- [ ] F502 兵种扩展与克制：新增 game/unitRoles.ts（火箭兵/工程师/侦察兵定义、护甲类型与伤害克制矩阵，纯逻辑可确定性测试），不改 units.ts 旧签名｜verify: bash scripts/build-tests.sh && node --test client/src/game/unitRoles.test.js && (cd client && npx tsc --noEmit)｜risk: low
+- [ ] F503 建筑升级与出售：新增 game/upgrades.ts（三级升级表、升级耗时与费用、出售退款率、不可升级原因），纯逻辑不碰 buildings.ts 旧签名｜verify: bash scripts/build-tests.sh && node --test client/src/game/upgrades.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F504 修理与工程师维修：新增 game/repair.ts（受损建筑/载具维修队列、工程师占用、费用与速率、可修复判定）｜verify: bash scripts/build-tests.sh && node --test client/src/game/repair.test.js && (cd client && npx tsc --noEmit)｜risk: low
+- [ ] F505 雷达与侦查脉冲：新增 game/radar.ts（按 tick 周期扫描揭示范围内敌方单位、接触点保留时长、无雷达时降级）｜verify: bash scripts/build-tests.sh && node --test client/src/game/radar.test.js && (cd client && npx tsc --noEmit)｜risk: low
+- [ ] F506 战报与战绩：新增 game/stats.ts（击杀/建造/采矿/时长统计、结算报告文本、历史最佳记录，storage 注入可测）｜verify: bash scripts/build-tests.sh && node --test client/src/game/stats.test.js && (cd client && npx tsc --noEmit)｜risk: low
+- [ ] F507 程序化 BGM：新增 audio/music.ts（振荡器+包络生成两段循环 BGM、交叉淡入淡出、音量与静音接口，无外部素材）｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F508 快捷键与指令卡：新增 game/hotkeys.ts（键位表、冲突检测、按上下文过滤可用指令、提示文案数据，纯逻辑）｜verify: bash scripts/build-tests.sh && node --test client/src/game/hotkeys.test.js && (cd client && npx tsc --noEmit)｜risk: low
+- [ ] F509 战斗回放：新增 game/replay.ts（按 tick 记录指令流、序列化/反序列化、确定性回放校验、快进倍率）｜verify: bash scripts/build-tests.sh && node --test client/src/game/replay.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F510 天气与昼夜：新增 game/weather.ts（雨/沙尘状态机随时间演进，影响视野与移速倍率，可确定性测试）+ render/weather.ts（Canvas 雨丝/暗角绘制）｜verify: bash scripts/build-tests.sh && node --test client/src/game/weather.test.js && (cd client && npx tsc --noEmit)｜risk: low
