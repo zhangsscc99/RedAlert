@@ -66,7 +66,7 @@ export const DIFFICULTY: Record<Difficulty, DifficultyBalance> = {
   hard: { label: 'Hard', startCredits: 3500, waveIntervalScale: 0.75, enemyStrengthScale: 1.25, enemyStartInfantry: 6 },
 };
 
-const DIFFICULTY_ORDER: Difficulty[] = ['easy', 'normal', 'hard'];
+export const DIFFICULTY_ORDER: Difficulty[] = ['easy', 'normal', 'hard'];
 
 // Fields that must not decrease as difficulty rises.
 const ASCENDING_FIELDS = ['enemyStrengthScale', 'enemyStartInfantry'] as const;

@@ -34,7 +34,18 @@ import {
   type QueueItem,
 } from './economy.js';
 import { stepCombat } from './combat.js';
-import { createAIState, stepAI, type AICommand, type AIPhase, type AIState } from './enemyAI.js';
+import {
+  createAIState,
+  stepAI,
+  armorOfUnitKind,
+  AI_CONTACT_RANGE,
+  type AICommand,
+  type AIIntel,
+  type AIPhase,
+  type AIState,
+} from './enemyAI.js';
+import { DIFFICULTY_ORDER, type Difficulty } from './balance.js';
+import type { ArmorType } from './unitRoles.js';
 import { createHarvester, updateHarvesters, type Harvester } from './harvest.js';
 import { computePower, powerFactor } from './power.js';
 import type { Point } from './selection.js';
@@ -55,6 +66,7 @@ export interface GUnit extends Unit {
   cooldown: number;
   cooldownMax: number;
   repathT: number; // throttle for idle re-pathing (used by the enemy side)
+  retreating: boolean; // pulled back by the deep AI until the next wave
 }
 
 /** Building extended with a world-space center + Combatant fields. */
@@ -88,6 +100,10 @@ export interface GameOpts {
   enemyStrength?: number;
   /** Multiplies the gap between AI waves: <1 attacks sooner, default 1. */
   waveIntervalScale?: number;
+  /** Enable the deeper enemy AI (scout/muster/counter/retreat), default false. */
+  deepAI?: boolean;
+  /** Tier the AI muster size and wave gap scale with, default 'normal'. */
+  aiDifficulty?: Difficulty;
 }
 
 export interface GameState {
@@ -140,6 +156,7 @@ function makeGUnit(
     cooldown: 0,
     cooldownMax: c.cooldownMax,
     repathT: 0,
+    retreating: false,
   };
 }
 
@@ -230,6 +247,8 @@ export function createGame(seed: number, opts: GameOpts = {}): GameState {
     enemyBase: opts.enemyBase ?? true,
     enemyStrength: opts.enemyStrength ?? 1,
     waveIntervalScale: opts.waveIntervalScale ?? 1,
+    deepAI: opts.deepAI ?? false,
+    aiDifficulty: opts.aiDifficulty ?? 'normal',
   };
   const map = generateMap(seed);
   const g: GameState = {
@@ -244,7 +263,10 @@ export function createGame(seed: number, opts: GameOpts = {}): GameState {
     economy: createEconomy(o.credits),
     queue: createQueue(),
     // A shorter waveIntervalScale banks AI income faster → waves land sooner.
-    ai: createAIState(seed, 1 / Math.max(0.01, o.waveIntervalScale)),
+    ai: createAIState(seed, 1 / Math.max(0.01, o.waveIntervalScale), {
+      deep: o.deepAI,
+      difficulty: o.aiDifficulty,
+    }),
     phase: 'playing',
     elapsed: 0,
     nextId: 1,
@@ -373,12 +395,61 @@ function nearestPlayerAnchor(g: GameState, u: GUnit): Point | null {
   return best;
 }
 
+/** Per-tick observations for the deep AI, derived deterministically. */
+function buildAIIntel(g: GameState): AIIntel {
+  const playerArmor: Partial<Record<ArmorType, number>> = {};
+  for (const u of g.units) {
+    const a = armorOfUnitKind(u.kind);
+    playerArmor[a] = (playerArmor[a] ?? 0) + 1;
+  }
+  let lowHp = 0;
+  let contact = false;
+  const r2 = AI_CONTACT_RANGE * AI_CONTACT_RANGE;
+  for (const u of g.enemyUnits) {
+    if (u.hp < u.maxHp * g.ai.retreatRatio) lowHp++;
+    if (!contact) {
+      for (const p of g.units) {
+        const dx = p.x - u.x;
+        const dy = p.y - u.y;
+        if (dx * dx + dy * dy <= r2) {
+          contact = true;
+          break;
+        }
+      }
+    }
+  }
+  return {
+    playerArmor,
+    contact,
+    lowHp,
+    anchor: { x: tileCenter(g.enemyAnchor.x), y: tileCenter(g.enemyAnchor.y) },
+  };
+}
+
 function applyAICommand(g: GameState, cmd: AICommand): void {
   if (cmd.type === 'train') {
     spawnEnemy(g, cmd.kind);
   } else if (cmd.type === 'move') {
     g.aiTarget = cmd.to;
-    for (const u of g.enemyUnits) pathTo(g, u, cmd.to);
+    for (const u of g.enemyUnits) {
+      u.retreating = false; // a fresh wave re-absorbs units waiting at home
+      pathTo(g, u, cmd.to);
+    }
+  } else if (cmd.type === 'rally') {
+    // Regroup at base: redirect the repath anchor without waking the battered.
+    g.aiTarget = cmd.to;
+    for (const u of g.enemyUnits) if (!u.retreating) pathTo(g, u, cmd.to);
+  } else if (cmd.type === 'scout') {
+    // The recon order targets the newest spawn only — the rest keep mustering.
+    const u = g.enemyUnits[g.enemyUnits.length - 1];
+    if (u) pathTo(g, u, cmd.to);
+  } else if (cmd.type === 'retreat') {
+    for (const u of g.enemyUnits) {
+      if (u.hp < u.maxHp * g.ai.retreatRatio) {
+        u.retreating = true;
+        pathTo(g, u, cmd.to);
+      }
+    }
   }
   // 'attack': engagements resolve automatically in stepCombat.
 }
@@ -411,13 +482,15 @@ export function tickGame(g: GameState, dt: number): void {
 
   // Enemy AI emits commands; the AI dies with its base.
   if (g.enemyBuildings.length > 0) {
-    for (const cmd of stepAI(g.ai, dt)) applyAICommand(g, cmd);
+    const intel = g.ai.deep ? buildAIIntel(g) : undefined;
+    for (const cmd of stepAI(g.ai, dt, intel)) applyAICommand(g, cmd);
   }
 
   // Once a wave has launched, idle enemies keep marching on the player's base.
+  // Retreating units wait for the next wave instead of re-engaging.
   for (const u of g.enemyUnits) {
     u.repathT -= dt;
-    if (u.path.length === 0 && u.repathT <= 0) {
+    if (u.path.length === 0 && u.repathT <= 0 && !u.retreating) {
       u.repathT = ENEMY_REPATH_SECONDS;
       if (g.aiTarget) {
         const t = nearestPlayerAnchor(g, u) ?? g.aiTarget;
@@ -484,13 +557,16 @@ export function snapshotGame(g: GameState, camera?: { x: number; y: number; zoom
       enemyBase: g.opts.enemyBase,
       enemyStrength: g.opts.enemyStrength,
       waveIntervalScale: g.opts.waveIntervalScale,
+      deepAI: g.opts.deepAI,
+      aiDifficulty: DIFFICULTY_ORDER.indexOf(g.opts.aiDifficulty),
     },
   });
 }
 
 const isUnitKind = (k: string): k is UnitKind => k in UNIT_STATS;
 const isBuildingKind = (k: string): k is BuildingKind => k in BUILDING_DEFS;
-const isAIPhase = (p: string): p is AIPhase => p === 'gather' || p === 'build' || p === 'attack';
+const isAIPhase = (p: string): p is AIPhase =>
+  p === 'gather' || p === 'build' || p === 'scout' || p === 'muster' || p === 'attack';
 
 /** Rebuild a GBuilding at an explicit id (restore path bypasses nextId). */
 function restoreBuilding(
@@ -546,6 +622,11 @@ export function restoreGame(s: SaveState): GameState | null {
   if (typeof o.enemyBase === 'boolean') opts.enemyBase = o.enemyBase;
   if (typeof o.enemyStrength === 'number') opts.enemyStrength = o.enemyStrength;
   if (typeof o.waveIntervalScale === 'number') opts.waveIntervalScale = o.waveIntervalScale;
+  if (typeof o.deepAI === 'boolean') opts.deepAI = o.deepAI;
+  if (typeof o.aiDifficulty === 'number') {
+    const d = DIFFICULTY_ORDER[o.aiDifficulty];
+    if (d) opts.aiDifficulty = d;
+  }
 
   const g = createGame(s.seed ?? 0, opts);
   g.units = [];
@@ -575,6 +656,8 @@ export function restoreGame(s: SaveState): GameState | null {
   g.elapsed = s.elapsed ?? 0;
   if (s.ai) {
     if (isAIPhase(s.ai.phase)) g.ai.phase = s.ai.phase;
+    // Deep-only phases degrade to the legacy builder on a legacy machine.
+    if (!g.ai.deep && (g.ai.phase === 'scout' || g.ai.phase === 'muster')) g.ai.phase = 'build';
     g.ai.credits = s.ai.credits;
     g.ai.army = s.ai.army;
     g.ai.wave = s.ai.wave;
