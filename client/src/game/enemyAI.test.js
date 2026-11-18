@@ -6,6 +6,9 @@ import assert from "node:assert/strict";
 var TILE_SIZE = 32;
 var MAP_W = 64;
 var MAP_H = 64;
+var GRASS = 0;
+var WATER = 1;
+var ORE = 2;
 function mulberry32(seed) {
   let a = seed >>> 0;
   return () => {
@@ -22,6 +25,17 @@ function worldToTile(px) {
 function tileCenter(t) {
   return t * TILE_SIZE + TILE_SIZE / 2;
 }
+
+// src/game/pathfind.ts
+var ROAD = 3;
+var TERRAIN_COSTS = {
+  [ROAD]: 0.6,
+  [GRASS]: 1,
+  [ORE]: 3,
+  [WATER]: Infinity
+};
+var COST_GRASS = TERRAIN_COSTS[GRASS];
+var MIN_TERRAIN_COST = Math.min(TERRAIN_COSTS[ROAD], COST_GRASS, TERRAIN_COSTS[ORE]);
 
 // src/game/units.ts
 var UNIT_STATS = {

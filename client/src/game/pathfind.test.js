@@ -112,22 +112,17 @@ function countTerrain(map, t) {
 
 // src/game/pathfind.ts
 var ROAD = 3;
-var COST_ROAD = 0.6;
-var COST_GRASS = 1;
-var COST_ORE = 3;
-var MIN_TERRAIN_COST = COST_ROAD;
+var TERRAIN_COSTS = {
+  [ROAD]: 0.6,
+  [GRASS]: 1,
+  [ORE]: 3,
+  [WATER]: Infinity
+};
+var COST_GRASS = TERRAIN_COSTS[GRASS];
+var MIN_TERRAIN_COST = Math.min(TERRAIN_COSTS[ROAD], COST_GRASS, TERRAIN_COSTS[ORE]);
 var CROWD_COST = 1;
 function tileCost(t) {
-  switch (t) {
-    case ROAD:
-      return COST_ROAD;
-    case GRASS:
-      return COST_GRASS;
-    case ORE:
-      return COST_ORE;
-    default:
-      return Infinity;
-  }
+  return TERRAIN_COSTS[t] ?? Infinity;
 }
 var SQRT2 = Math.SQRT2;
 var DIRS = [
@@ -174,10 +169,9 @@ var Heap = class {
       for (; ; ) {
         const l = i * 2 + 1;
         const r = l + 1;
-        let m = i;
-        if (l < items.length && this.f[items[l]] < this.f[items[m]]) m = l;
-        if (r < items.length && this.f[items[r]] < this.f[items[m]]) m = r;
-        if (m === i) break;
+        if (l >= items.length) break;
+        const m = r < items.length && this.f[items[r]] < this.f[items[l]] ? r : l;
+        if (this.f[items[m]] >= this.f[last]) break;
         items[i] = items[m];
         i = m;
       }
@@ -195,7 +189,7 @@ function findPath(map, sx, sy, gx, gy) {
   if (!isPassable(map, gx, gy)) return null;
   return astar(map, sx, sy, gx, gy, terrainPassable(map));
 }
-function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget, hScale = 1) {
+function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget, hScale = 1, heur) {
   const n = map.w * map.h;
   const g = new Float64Array(n).fill(Infinity);
   const f = new Float64Array(n).fill(Infinity);
@@ -204,7 +198,8 @@ function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget, hSca
   const start = idx(map, sx, sy);
   const goal = idx(map, gx, gy);
   g[start] = 0;
-  f[start] = octile(sx, sy, gx, gy) * hScale;
+  f[start] = heur ? heur[start] : octile(sx, sy, gx, gy) * hScale;
+  if (f[start] === Infinity || heur && heur[goal] === Infinity) return null;
   const open = new Heap(f);
   open.push(start);
   while (open.size > 0) {
@@ -227,8 +222,10 @@ function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget, hSca
       const ni = idx(map, nx, ny);
       const ng = g[cur] + cost + (enterCost ? enterCost(nx, ny, cost) : 0);
       if (ng < g[ni]) {
+        const h = heur ? heur[ni] : octile(nx, ny, gx, gy) * hScale;
+        if (h === Infinity) continue;
         g[ni] = ng;
-        f[ni] = ng + octile(nx, ny, gx, gy) * hScale;
+        f[ni] = ng + h;
         came[ni] = cur;
         open.push(ni);
       }
@@ -293,24 +290,56 @@ function findPathSmooth(map, sx, sy, gx, gy, opts = {}) {
   const costMode = opts.terrainCost === true;
   const blocked = blockedMask(map, opts.blockers ?? [], costMode);
   const nav = navFns(map, blocked, opts.radius ?? 0);
-  if (!nav.clear(gx, gy)) return null;
   const counts = crowdCounts(map, opts.crowd, opts.crowdRadius ?? 1);
+  const snapR = opts.snapRadius ?? 0;
+  const free = freeTile(map, nav.clear, counts);
+  const ox = gx;
+  const oy = gy;
+  const goalTaken = counts !== null && counts[idx(map, gx, gy)] > 0;
+  if (!nav.clear(gx, gy) || snapR > 0 && goalTaken) {
+    if (snapR <= 0) return null;
+    const alt = nearestPassable(map, gx, gy, free, snapR);
+    if (!alt) return null;
+    gx = alt.x;
+    gy = alt.y;
+  }
   const enterCost = makeEnterCost(map, costMode, counts, opts.crowdCost ?? CROWD_COST);
-  const raw = astar(
-    map,
-    sx,
-    sy,
-    gx,
-    gy,
-    nav.clear,
-    nav.step,
-    enterCost,
-    void 0,
-    costMode ? MIN_TERRAIN_COST : 1
-  );
+  const hScale = costMode ? MIN_TERRAIN_COST : 1;
+  const tried = /* @__PURE__ */ new Set([idx(map, gx, gy)]);
+  let raw = astar(map, sx, sy, gx, gy, nav.clear, nav.step, enterCost, void 0, hScale);
+  for (let r = 1; !raw && r <= snapR; r++) {
+    const ring = [];
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+        const nx = ox + dx;
+        const ny = oy + dy;
+        const ni = idx(map, nx, ny);
+        if (tried.has(ni) || !free(nx, ny)) continue;
+        tried.add(ni);
+        ring.push({ x: nx, y: ny });
+      }
+    }
+    ring.sort(
+      (a, b) => (a.x - ox) ** 2 + (a.y - oy) ** 2 - ((b.x - ox) ** 2 + (b.y - oy) ** 2) || a.y - b.y || a.x - b.x
+    );
+    for (const alt of ring) {
+      raw = astar(map, sx, sy, alt.x, alt.y, nav.clear, nav.step, enterCost, void 0, hScale);
+      if (raw) {
+        gx = alt.x;
+        gy = alt.y;
+        break;
+      }
+    }
+  }
   if (!raw) return null;
   const los = costAwareLos(map, nav.los, costMode, counts);
-  return pullString({ x: sx, y: sy }, raw, los);
+  return pullString(
+    { x: sx, y: sy },
+    raw,
+    los,
+    costMode ? pullCap(map, { x: sx, y: sy }, raw) : void 0
+  );
 }
 function makeEnterCost(map, costMode, counts, per) {
   if (!costMode && !counts) return void 0;
@@ -335,6 +364,10 @@ function crowdCounts(map, units, r) {
   }
   return counts;
 }
+function freeTile(map, clear, counts) {
+  if (!counts) return clear;
+  return (x, y) => clear(x, y) && counts[idx(map, x, y)] === 0;
+}
 function navFns(map, blocked, radius) {
   if (radius > 0) {
     return {
@@ -349,17 +382,63 @@ function navFns(map, blocked, radius) {
     los: (a, b) => supercoverClear(map, blocked, a.x, a.y, b.x, b.y)
   };
 }
-function pullString(start, raw, los) {
+function pullString(start, raw, los, cap) {
   const pts = [start, ...raw];
   const out = [];
   let i = 0;
   while (i < pts.length - 1) {
     let j = pts.length - 1;
-    while (j > i + 1 && !los(pts[i], pts[j])) j--;
+    while (j > i + 1 && !(los(pts[i], pts[j]) && (!cap || cap.segCost(pts[i], pts[j]) <= cap.cum[j] - cap.cum[i] + EPS))) {
+      j--;
+    }
     out.push(pts[j]);
     i = j;
   }
   return out;
+}
+function pullCap(map, start, raw) {
+  const pts = [start, ...raw];
+  const cum = new Array(pts.length).fill(0);
+  for (let k = 1; k < pts.length; k++) {
+    const a = pts[k - 1];
+    const b = pts[k];
+    cum[k] = cum[k - 1] + (a.x !== b.x && a.y !== b.y ? SQRT2 : 1) * tileCost(map.tiles[idx(map, b.x, b.y)]);
+  }
+  return {
+    cum,
+    segCost: (a, b) => segmentTileCost(map, a.x, a.y, b.x, b.y)
+  };
+}
+function segmentTileCost(map, ax, ay, bx, by) {
+  let x = ax;
+  let y = ay;
+  let cost = 0;
+  const sx = Math.sign(bx - ax);
+  const sy = Math.sign(by - ay);
+  const adx = Math.abs(bx - ax);
+  const ady = Math.abs(by - ay);
+  let nx = 1;
+  let ny = 1;
+  while (x !== bx || y !== by) {
+    const tx = nx * ady;
+    const ty = ny * adx;
+    if (tx < ty) {
+      x += sx;
+      nx += 2;
+      cost += tileCost(map.tiles[idx(map, x, y)]);
+    } else if (ty < tx) {
+      y += sy;
+      ny += 2;
+      cost += tileCost(map.tiles[idx(map, x, y)]);
+    } else {
+      x += sx;
+      y += sy;
+      nx += 2;
+      ny += 2;
+      cost += SQRT2 * tileCost(map.tiles[idx(map, x, y)]);
+    }
+  }
+  return cost;
 }
 function blockedMask(map, blockers, costMode = false) {
   const blocked = new Uint8Array(map.w * map.h);
@@ -494,13 +573,13 @@ function segBoxDist(px, py, qx, qy, bx, by) {
 }
 var GROUP_NODE_BUDGET = 2e5;
 var GROUP_AVOID_COST = 1.5;
-function formationSlots(target, count, map, radius = 0, shape = "ring") {
+function formationSlots(target, count, map, radius = 0, shape = "ring", dir) {
   if (count <= 0) return [];
   const blocked = blockedMask(map, []);
   const nav = navFns(map, blocked, radius);
-  return ringSlots(map, target, count, nav.clear, shape);
+  return ringSlots(map, target, count, nav.clear, shape, dir);
 }
-function ringSlots(map, target, count, passable, shape = "ring") {
+function ringSlots(map, target, count, passable, shape = "ring", dir) {
   const out = [];
   const maxR = Math.max(map.w, map.h);
   if (shape !== "ring") {
@@ -510,10 +589,22 @@ function ringSlots(map, target, count, passable, shape = "ring") {
         if (passable(x, y)) all.push({ x, y });
       }
     }
-    const off = (t) => shape === "wide" ? Math.abs(t.y - target.y) : Math.abs(t.x - target.x);
-    all.sort(
-      (a, b) => off(a) - off(b) || (a.x - target.x) ** 2 + (a.y - target.y) ** 2 - ((b.x - target.x) ** 2 + (b.y - target.y) ** 2) || a.y - b.y || a.x - b.x
-    );
+    const dist2 = (t) => (t.x - target.x) ** 2 + (t.y - target.y) ** 2;
+    if (shape === "wedge") {
+      const d = snapDir8(dir ?? { x: 1, y: 0 });
+      const fwd = (t) => (t.x - target.x) * d.x + (t.y - target.y) * d.y;
+      const lat = (t) => Math.abs((t.x - target.x) * -d.y + (t.y - target.y) * d.x);
+      const depth = (t) => {
+        const f = fwd(t);
+        const behind = Math.max(0, -f);
+        const outside = f > 0 ? f * 8 + lat(t) : Math.max(0, lat(t) - behind);
+        return behind + outside * 64;
+      };
+      all.sort((a, b) => depth(a) - depth(b) || lat(a) - lat(b) || dist2(a) - dist2(b) || a.y - b.y || a.x - b.x);
+    } else {
+      const off = (t) => shape === "wide" ? Math.abs(t.y - target.y) : Math.abs(t.x - target.x);
+      all.sort((a, b) => off(a) - off(b) || dist2(a) - dist2(b) || a.y - b.y || a.x - b.x);
+    }
     for (const t of all) {
       if (out.length >= count) break;
       out.push(t);
@@ -542,7 +633,11 @@ function ringSlots(map, target, count, passable, shape = "ring") {
   for (let i = 0; out.length < count && have > 0; i++) out.push(out[i % have]);
   return out;
 }
-function findPathGroup(map, starts, target, opts = {}) {
+function snapDir8(d) {
+  const angle = Math.round(Math.atan2(d.y, d.x) / (Math.PI / 4)) * (Math.PI / 4);
+  return { x: Math.cos(angle), y: Math.sin(angle) };
+}
+function findPathsGroup(map, starts, target, opts = {}) {
   const n = starts.length;
   if (n === 0) return { paths: [], slots: [], degraded: false };
   const none = (slots2) => ({
@@ -554,7 +649,8 @@ function findPathGroup(map, starts, target, opts = {}) {
   const costMode = opts.terrainCost === true;
   const blocked = blockedMask(map, opts.blockers ?? [], costMode);
   const nav = navFns(map, blocked, opts.radius ?? 0);
-  const slots = ringSlots(map, target, n, nav.clear, opts.formation ?? "ring");
+  const dir = opts.dir ?? (opts.formation === "wedge" ? groupHeading(starts, target) : void 0);
+  const slots = ringSlots(map, target, n, nav.clear, opts.formation ?? "ring", dir);
   if (slots.length === 0) return none([]);
   const free = slots.slice();
   const assigned = starts.map((s) => {
@@ -574,24 +670,46 @@ function findPathGroup(map, starts, target, opts = {}) {
   const occupied = new Uint16Array(map.w * map.h);
   const counts = crowdCounts(map, opts.crowd, opts.crowdRadius ?? 1);
   const soft = makeEnterCost(map, costMode, counts, opts.crowdCost ?? CROWD_COST);
-  const hScale = costMode ? MIN_TERRAIN_COST : 1;
-  const los = costAwareLos(map, nav.los, costMode, counts);
+  const losBase = costAwareLos(map, nav.los, costMode, counts);
+  const los = (a, b) => losBase(a, b) && supercoverWalk(map, a.x, a.y, b.x, b.y, (x, y) => !occupied[idx(map, x, y)]);
   const enterCost = (x, y, base) => occupied[idx(map, x, y)] * avoid + (soft ? soft(x, y, base) : 0);
+  const field = slotField(map, assigned, nav, costMode, budget);
+  const clearFree = freeTile(map, nav.clear, counts);
+  const snapR = opts.snapRadius ?? 0;
   const paths = new Array(n).fill(null);
-  let degraded = false;
-  for (let i = 0; i < n; i++) {
+  let degraded = field === null;
+  for (let i = 0; !degraded && i < n; i++) {
     const s = starts[i];
     let g = assigned[i];
     if (!inBounds(map, s.x, s.y)) continue;
+    if (snapR > 0 && counts && counts[idx(map, g.x, g.y)] > 0) {
+      const alt = nearestPassable(map, g.x, g.y, clearFree, snapR);
+      if (alt) {
+        g = alt;
+        assigned[i] = alt;
+      }
+    }
     let raw = null;
     if (s.x === g.x && s.y === g.y) {
       raw = [];
     } else {
-      raw = astar(map, s.x, s.y, g.x, g.y, nav.clear, nav.step, enterCost, budget, hScale);
+      raw = astar(map, s.x, s.y, g.x, g.y, nav.clear, nav.step, enterCost, budget, 1, field);
       if (!raw && budget.left > 0) {
         const alt = nearestPassable(map, target.x, target.y, nav.clear);
         if (alt && (alt.x !== g.x || alt.y !== g.y)) {
-          raw = astar(map, s.x, s.y, alt.x, alt.y, nav.clear, nav.step, enterCost, budget, hScale);
+          raw = astar(
+            map,
+            s.x,
+            s.y,
+            alt.x,
+            alt.y,
+            nav.clear,
+            nav.step,
+            enterCost,
+            budget,
+            1,
+            field
+          );
           if (raw) {
             g = alt;
             assigned[i] = alt;
@@ -606,7 +724,7 @@ function findPathGroup(map, starts, target, opts = {}) {
       }
       continue;
     }
-    const path = pullString(s, raw, los);
+    const path = pullString(s, raw, los, costMode ? pullCap(map, s, raw) : void 0);
     paths[i] = path;
     markPathTiles(map, occupied, s, path);
   }
@@ -617,6 +735,55 @@ function findPathGroup(map, starts, target, opts = {}) {
     }
   }
   return { paths, slots: assigned, degraded };
+}
+function findPathGroup(map, starts, target, opts = {}) {
+  return findPathsGroup(map, starts, target, opts);
+}
+function groupHeading(starts, target) {
+  let cx = 0;
+  let cy = 0;
+  for (const s of starts) {
+    cx += s.x;
+    cy += s.y;
+  }
+  return { x: target.x - cx / starts.length, y: target.y - cy / starts.length };
+}
+function slotField(map, slots, nav, costMode, budget) {
+  const dist = new Float64Array(map.w * map.h).fill(Infinity);
+  const closed = new Uint8Array(map.w * map.h);
+  const open = new Heap(dist);
+  for (const s of slots) {
+    const i = idx(map, s.x, s.y);
+    if (dist[i] !== 0) {
+      dist[i] = 0;
+      open.push(i);
+    }
+  }
+  while (open.size > 0) {
+    if (budget.left <= 0) return null;
+    const cur = open.pop();
+    if (closed[cur]) continue;
+    closed[cur] = 1;
+    budget.left--;
+    const cx = cur % map.w;
+    const cy = cur / map.w | 0;
+    for (const [dx, dy, base] of DIRS) {
+      const nx = cx + dx;
+      const ny = cy + dy;
+      if (!nav.clear(nx, ny)) continue;
+      if (dx !== 0 && dy !== 0) {
+        if (!nav.clear(cx + dx, cy) || !nav.clear(cx, cy + dy)) continue;
+      }
+      if (nav.step && !nav.step(cx, cy, nx, ny)) continue;
+      const ni = idx(map, nx, ny);
+      const nd = dist[cur] + base * (costMode ? tileCost(map.tiles[ni]) : 1);
+      if (nd < dist[ni]) {
+        dist[ni] = nd;
+        open.push(ni);
+      }
+    }
+  }
+  return dist;
 }
 function markPathTiles(map, occupied, from, path) {
   if (path.length === 0) {
@@ -1208,4 +1375,160 @@ test("findPathGroup honors the wide formation", () => {
   assert.equal(res.slots.length, 3);
   assert.equal(new Set(res.slots.map((s) => `${s.x},${s.y}`)).size, 3);
   for (const s of res.slots) assert.equal(s.y, 10);
+});
+test("TERRAIN_COSTS orders the tiers: road < grass < ore < water", () => {
+  assert.ok(TERRAIN_COSTS[ROAD] < TERRAIN_COSTS[GRASS]);
+  assert.ok(TERRAIN_COSTS[GRASS] < TERRAIN_COSTS[ORE]);
+  assert.equal(TERRAIN_COSTS[WATER], Infinity);
+  const m = stamp(makeMap(9, 9), ORE, []);
+  const road = [];
+  for (let x = 0; x < 9; x++) road.push([x, 6]);
+  stamp(m, ORE, road.map(([x]) => [x, 4]));
+  stamp(m, ROAD, road);
+  const path = findPathSmooth(m, 0, 5, 8, 5, { terrainCost: true });
+  assert.ok(path);
+  const swept = sweptTiles({ x: 0, y: 5 }, path);
+  const ridden = road.filter(([x, y]) => swept.has(`${x},${y}`)).length;
+  assert.ok(ridden >= road.length - 2, `expected the path to ride the road, swept ${ridden}/9`);
+  for (const key of swept) {
+    const [tx, ty] = key.split(",").map(Number);
+    assert.notEqual(m.tiles[ty * m.w + tx], ORE, `path crossed ore at ${tx},${ty}`);
+  }
+});
+test("findPathsGroup stays consistent with per-unit findPathSmooth", () => {
+  const m = makeMap(20, 20);
+  const starts = [
+    { x: 2, y: 2 },
+    { x: 3, y: 2 },
+    { x: 4, y: 2 },
+    { x: 5, y: 2 }
+  ];
+  const res = findPathsGroup(m, starts, { x: 15, y: 15 });
+  assert.equal(res.degraded, false);
+  assert.equal(res.paths.length, starts.length);
+  assert.equal(res.slots.length, starts.length);
+  for (let i = 0; i < starts.length; i++) {
+    const p = res.paths[i];
+    const slot = res.slots[i];
+    assert.ok(p, `unit ${i} reached its slot`);
+    const end = p.length ? p.at(-1) : starts[i];
+    assert.deepEqual(end, slot);
+    const solo = findPathSmooth(m, starts[i].x, starts[i].y, slot.x, slot.y);
+    assert.ok(solo, `unit ${i} is individually reachable to its slot`);
+    assert.deepEqual(solo.length ? solo.at(-1) : starts[i], slot);
+  }
+});
+test("findPathsGroup and findPathGroup are the same export surface", () => {
+  const m = makeMap(12, 12);
+  const starts = [
+    { x: 1, y: 1 },
+    { x: 2, y: 1 }
+  ];
+  assert.deepEqual(
+    findPathsGroup(m, starts, { x: 9, y: 9 }),
+    findPathGroup(m, starts, { x: 9, y: 9 })
+  );
+});
+test("findPathsGroup soft-avoid spreads units across a narrow gap", () => {
+  const wall = [];
+  for (let y = 0; y <= 4; y++) wall.push([10, y]);
+  for (let y = 8; y <= 19; y++) wall.push([10, y]);
+  const m = makeMap(20, 20, wall);
+  const starts = [
+    { x: 4, y: 5 },
+    { x: 4, y: 6 },
+    { x: 4, y: 7 },
+    { x: 5, y: 6 }
+  ];
+  const res = findPathsGroup(m, starts, { x: 16, y: 6 });
+  assert.equal(res.degraded, false);
+  const gapTiles = /* @__PURE__ */ new Set();
+  for (let i = 0; i < starts.length; i++) {
+    const p = res.paths[i];
+    assert.ok(p, `unit ${i} routed through the gap`);
+    assertSegmentsPassable(m, [], starts[i], p);
+    for (const key of sweptTiles(starts[i], p)) {
+      if (key.startsWith("10,")) gapTiles.add(key);
+    }
+  }
+  assert.ok(gapTiles.size >= 2, `expected spread lanes, got ${[...gapTiles].join(" ")}`);
+});
+test("formationSlots wedge fills a V trailing the facing direction", () => {
+  const m = makeMap(16, 16);
+  const slots = formationSlots({ x: 8, y: 8 }, 7, m, 0, "wedge", { x: 1, y: 0 });
+  assert.equal(slots.length, 7);
+  assert.equal(new Set(slots.map((s) => `${s.x},${s.y}`)).size, 7);
+  assert.deepEqual(slots[0], { x: 8, y: 8 });
+  for (const s of slots.slice(1)) {
+    assert.ok(s.x < 8, `slot ${s.x},${s.y} should trail behind the tip`);
+    assert.ok(Math.abs(s.y - 8) <= 8 - s.x, `slot ${s.x},${s.y} outside the V`);
+  }
+  assert.ok(new Set(slots.map((s) => s.x)).size > 1);
+  assert.ok(new Set(slots.map((s) => s.y)).size > 1);
+});
+test("formationSlots wedge faces the other way when dir flips", () => {
+  const m = makeMap(16, 16);
+  const slots = formationSlots({ x: 8, y: 8 }, 4, m, 0, "wedge", { x: -1, y: 0 });
+  assert.equal(slots.length, 4);
+  assert.equal(new Set(slots.map((s) => `${s.x},${s.y}`)).size, 4);
+  for (const s of slots.slice(1)) {
+    assert.ok(s.x > 8, `slot ${s.x},${s.y} should trail behind the -x facing`);
+  }
+});
+test("findPathsGroup honors the wedge formation", () => {
+  const m = makeMap(20, 20);
+  const starts = [
+    { x: 2, y: 9 },
+    { x: 2, y: 10 },
+    { x: 2, y: 11 },
+    { x: 3, y: 10 },
+    { x: 1, y: 10 }
+  ];
+  const res = findPathsGroup(m, starts, { x: 15, y: 10 }, { formation: "wedge" });
+  assert.equal(res.degraded, false);
+  assert.equal(res.slots.length, 5);
+  assert.equal(new Set(res.slots.map((s) => `${s.x},${s.y}`)).size, 5);
+  const backRanks = res.slots.filter((s) => s.x < 15);
+  assert.ok(backRanks.length >= 3);
+  for (let i = 0; i < starts.length; i++) {
+    assert.ok(res.paths[i], `unit ${i} reached its wedge slot`);
+  }
+});
+test("snapRadius snaps a blocked goal to the nearest walkable tile", () => {
+  const m = makeMap(9, 9, [[5, 5]]);
+  assert.equal(findPathSmooth(m, 2, 5, 5, 5), null);
+  const path = findPathSmooth(m, 2, 5, 5, 5, { snapRadius: 2 });
+  assert.ok(path);
+  const end = path.at(-1);
+  assert.ok(isPassable(m, end.x, end.y));
+  const d = Math.max(Math.abs(end.x - 5), Math.abs(end.y - 5));
+  assert.ok(d >= 1 && d <= 2, `endpoint ${end.x},${end.y} not within tolerance`);
+});
+test("snapRadius snaps a goal taken by a crowd unit", () => {
+  const m = makeMap(9, 9);
+  const crowd = [{ x: 5, y: 5 }];
+  const path = findPathSmooth(m, 2, 5, 5, 5, { crowd, snapRadius: 2 });
+  assert.ok(path);
+  const end = path.at(-1);
+  assert.ok(isPassable(m, end.x, end.y));
+  assert.notDeepEqual(end, { x: 5, y: 5 }, "goal still lands on the crowded tile");
+  assert.ok(Math.max(Math.abs(end.x - 5), Math.abs(end.y - 5)) <= 2);
+});
+test("snapRadius returns null when nothing walkable sits inside it", () => {
+  const m = makeMap(9, 9, [
+    [3, 3],
+    [4, 3],
+    [5, 3],
+    [3, 4],
+    [5, 4],
+    [3, 5],
+    [4, 5],
+    [5, 5]
+  ]);
+  assert.equal(findPathSmooth(m, 1, 4, 4, 4, { snapRadius: 1 }), null);
+  const far = findPathSmooth(m, 1, 4, 4, 4, { snapRadius: 2 });
+  assert.ok(far);
+  const end = far.at(-1);
+  assert.ok(isPassable(m, end.x, end.y));
+  assert.equal(Math.max(Math.abs(end.x - 4), Math.abs(end.y - 4)), 2);
 });

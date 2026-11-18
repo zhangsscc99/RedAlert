@@ -11,10 +11,12 @@ import {
 } from './grid.js';
 import {
   ROAD,
+  TERRAIN_COSTS,
   findPath,
   findPathAvoiding,
   findPathGroup,
   findPathSmooth,
+  findPathsGroup,
   formationSlots,
   snapToPassable,
   type Blocker,
@@ -701,4 +703,191 @@ test('findPathGroup honors the wide formation', () => {
   assert.equal(res.slots.length, 3);
   assert.equal(new Set(res.slots.map((s) => `${s.x},${s.y}`)).size, 3);
   for (const s of res.slots) assert.equal(s.y, 10);
+});
+
+// ------------------------------------------------- F1005: cost table ----
+
+test('TERRAIN_COSTS orders the tiers: road < grass < ore < water', () => {
+  assert.ok(TERRAIN_COSTS[ROAD]! < TERRAIN_COSTS[GRASS]!);
+  assert.ok(TERRAIN_COSTS[GRASS]! < TERRAIN_COSTS[ORE]!);
+  assert.equal(TERRAIN_COSTS[WATER], Infinity);
+  // The table drives the search: a road detour beats the grass shortcut.
+  const m = stamp(makeMap(9, 9), ORE, []);
+  const road: [number, number][] = [];
+  for (let x = 0; x < 9; x++) road.push([x, 6]);
+  stamp(m, ORE, road.map(([x]) => [x, 4] as [number, number]));
+  stamp(m, ROAD, road);
+  const path = findPathSmooth(m, 0, 5, 8, 5, { terrainCost: true });
+  assert.ok(path);
+  const swept = sweptTiles({ x: 0, y: 5 }, path);
+  // The route enters and leaves the road diagonally, so the two end cells
+  // may be missed — but the cheap lane carries most of the run.
+  const ridden = road.filter(([x, y]) => swept.has(`${x},${y}`)).length;
+  assert.ok(ridden >= road.length - 2, `expected the path to ride the road, swept ${ridden}/9`);
+  for (const key of swept) {
+    const [tx, ty] = key.split(',').map(Number) as [number, number];
+    assert.notEqual(m.tiles[ty * m.w + tx], ORE, `path crossed ore at ${tx},${ty}`);
+  }
+});
+
+// ------------------------------------------------ F1005: group batch ----
+
+test('findPathsGroup stays consistent with per-unit findPathSmooth', () => {
+  const m = makeMap(20, 20);
+  const starts: Tile[] = [
+    { x: 2, y: 2 },
+    { x: 3, y: 2 },
+    { x: 4, y: 2 },
+    { x: 5, y: 2 },
+  ];
+  const res = findPathsGroup(m, starts, { x: 15, y: 15 });
+  assert.equal(res.degraded, false);
+  assert.equal(res.paths.length, starts.length);
+  assert.equal(res.slots.length, starts.length);
+  for (let i = 0; i < starts.length; i++) {
+    const p = res.paths[i]!;
+    const slot = res.slots[i]!;
+    assert.ok(p, `unit ${i} reached its slot`);
+    // The batch path ends exactly where the slot assignment says — same
+    // endpoint contract as a solo findPathSmooth call to that slot.
+    const end = p.length ? p.at(-1)! : starts[i]!;
+    assert.deepEqual(end, slot);
+    const solo = findPathSmooth(m, starts[i]!.x, starts[i]!.y, slot.x, slot.y);
+    assert.ok(solo, `unit ${i} is individually reachable to its slot`);
+    assert.deepEqual(solo.length ? solo.at(-1)! : starts[i]!, slot);
+  }
+});
+
+test('findPathsGroup and findPathGroup are the same export surface', () => {
+  const m = makeMap(12, 12);
+  const starts: Tile[] = [
+    { x: 1, y: 1 },
+    { x: 2, y: 1 },
+  ];
+  assert.deepEqual(
+    findPathsGroup(m, starts, { x: 9, y: 9 }),
+    findPathGroup(m, starts, { x: 9, y: 9 }),
+  );
+});
+
+test('findPathsGroup soft-avoid spreads units across a narrow gap', () => {
+  // Wall at x=10 rows 0..4 and 8..19: a 3-wide funnel at rows 5..7.
+  const wall: [number, number][] = [];
+  for (let y = 0; y <= 4; y++) wall.push([10, y]);
+  for (let y = 8; y <= 19; y++) wall.push([10, y]);
+  const m = makeMap(20, 20, wall);
+  const starts: Tile[] = [
+    { x: 4, y: 5 },
+    { x: 4, y: 6 },
+    { x: 4, y: 7 },
+    { x: 5, y: 6 },
+  ];
+  const res = findPathsGroup(m, starts, { x: 16, y: 6 });
+  assert.equal(res.degraded, false);
+  const gapTiles = new Set<string>();
+  for (let i = 0; i < starts.length; i++) {
+    const p = res.paths[i];
+    assert.ok(p, `unit ${i} routed through the gap`);
+    assertSegmentsPassable(m, [], starts[i]!, p);
+    for (const key of sweptTiles(starts[i]!, p)) {
+      if (key.startsWith('10,')) gapTiles.add(key);
+    }
+  }
+  // Soft avoidance pushed the queue onto more than one gap lane.
+  assert.ok(gapTiles.size >= 2, `expected spread lanes, got ${[...gapTiles].join(' ')}`);
+});
+
+// ------------------------------------------------- F1005: formations ----
+
+test('formationSlots wedge fills a V trailing the facing direction', () => {
+  const m = makeMap(16, 16);
+  const slots = formationSlots({ x: 8, y: 8 }, 7, m, 0, 'wedge', { x: 1, y: 0 });
+  assert.equal(slots.length, 7);
+  assert.equal(new Set(slots.map((s) => `${s.x},${s.y}`)).size, 7);
+  // Tip on the target; every other rank trails behind the +x facing.
+  assert.deepEqual(slots[0], { x: 8, y: 8 });
+  for (const s of slots.slice(1)) {
+    assert.ok(s.x < 8, `slot ${s.x},${s.y} should trail behind the tip`);
+    assert.ok(Math.abs(s.y - 8) <= 8 - s.x, `slot ${s.x},${s.y} outside the V`);
+  }
+  // A wedge, not a line: multiple distinct rows and columns.
+  assert.ok(new Set(slots.map((s) => s.x)).size > 1);
+  assert.ok(new Set(slots.map((s) => s.y)).size > 1);
+});
+
+test('formationSlots wedge faces the other way when dir flips', () => {
+  const m = makeMap(16, 16);
+  const slots = formationSlots({ x: 8, y: 8 }, 4, m, 0, 'wedge', { x: -1, y: 0 });
+  assert.equal(slots.length, 4);
+  assert.equal(new Set(slots.map((s) => `${s.x},${s.y}`)).size, 4);
+  for (const s of slots.slice(1)) {
+    assert.ok(s.x > 8, `slot ${s.x},${s.y} should trail behind the -x facing`);
+  }
+});
+
+test('findPathsGroup honors the wedge formation', () => {
+  const m = makeMap(20, 20);
+  const starts: Tile[] = [
+    { x: 2, y: 9 },
+    { x: 2, y: 10 },
+    { x: 2, y: 11 },
+    { x: 3, y: 10 },
+    { x: 1, y: 10 },
+  ];
+  const res = findPathsGroup(m, starts, { x: 15, y: 10 }, { formation: 'wedge' });
+  assert.equal(res.degraded, false);
+  assert.equal(res.slots.length, 5);
+  assert.equal(new Set(res.slots.map((s) => `${s.x},${s.y}`)).size, 5);
+  // Advancing +x: the wedge trails its wings toward the group (x < 15).
+  const backRanks = res.slots.filter((s) => s.x < 15);
+  assert.ok(backRanks.length >= 3);
+  for (let i = 0; i < starts.length; i++) {
+    assert.ok(res.paths[i], `unit ${i} reached its wedge slot`);
+  }
+});
+
+// -------------------------------------------------- F1005: tolerance ----
+
+test('snapRadius snaps a blocked goal to the nearest walkable tile', () => {
+  const m = makeMap(9, 9, [[5, 5]]);
+  // Strict default: blocked goal still fails.
+  assert.equal(findPathSmooth(m, 2, 5, 5, 5), null);
+  const path = findPathSmooth(m, 2, 5, 5, 5, { snapRadius: 2 });
+  assert.ok(path);
+  const end = path.at(-1)!;
+  assert.ok(isPassable(m, end.x, end.y));
+  const d = Math.max(Math.abs(end.x - 5), Math.abs(end.y - 5));
+  assert.ok(d >= 1 && d <= 2, `endpoint ${end.x},${end.y} not within tolerance`);
+});
+
+test('snapRadius snaps a goal taken by a crowd unit', () => {
+  const m = makeMap(9, 9);
+  const crowd: Tile[] = [{ x: 5, y: 5 }];
+  const path = findPathSmooth(m, 2, 5, 5, 5, { crowd, snapRadius: 2 });
+  assert.ok(path);
+  const end = path.at(-1)!;
+  assert.ok(isPassable(m, end.x, end.y));
+  assert.notDeepEqual(end, { x: 5, y: 5 }, 'goal still lands on the crowded tile');
+  assert.ok(Math.max(Math.abs(end.x - 5), Math.abs(end.y - 5)) <= 2);
+});
+
+test('snapRadius returns null when nothing walkable sits inside it', () => {
+  // (4,4) is walled in by a full ring of water one tile out; radius 1 finds
+  // no free cell but radius 2 reaches the open ring beyond.
+  const m = makeMap(9, 9, [
+    [3, 3],
+    [4, 3],
+    [5, 3],
+    [3, 4],
+    [5, 4],
+    [3, 5],
+    [4, 5],
+    [5, 5],
+  ]);
+  assert.equal(findPathSmooth(m, 1, 4, 4, 4, { snapRadius: 1 }), null);
+  const far = findPathSmooth(m, 1, 4, 4, 4, { snapRadius: 2 });
+  assert.ok(far);
+  const end = far.at(-1)!;
+  assert.ok(isPassable(m, end.x, end.y));
+  assert.equal(Math.max(Math.abs(end.x - 4), Math.abs(end.y - 4)), 2);
 });

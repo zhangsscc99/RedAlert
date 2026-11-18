@@ -36,6 +36,15 @@ function tileCenter(t) {
 }
 
 // src/game/pathfind.ts
+var ROAD = 3;
+var TERRAIN_COSTS = {
+  [ROAD]: 0.6,
+  [GRASS]: 1,
+  [ORE]: 3,
+  [WATER]: Infinity
+};
+var COST_GRASS = TERRAIN_COSTS[GRASS];
+var MIN_TERRAIN_COST = Math.min(TERRAIN_COSTS[ROAD], COST_GRASS, TERRAIN_COSTS[ORE]);
 var SQRT2 = Math.SQRT2;
 var DIRS = [
   [1, 0, 1],
@@ -81,10 +90,9 @@ var Heap = class {
       for (; ; ) {
         const l = i * 2 + 1;
         const r = l + 1;
-        let m = i;
-        if (l < items.length && this.f[items[l]] < this.f[items[m]]) m = l;
-        if (r < items.length && this.f[items[r]] < this.f[items[m]]) m = r;
-        if (m === i) break;
+        if (l >= items.length) break;
+        const m = r < items.length && this.f[items[r]] < this.f[items[l]] ? r : l;
+        if (this.f[items[m]] >= this.f[last]) break;
         items[i] = items[m];
         i = m;
       }
@@ -93,7 +101,7 @@ var Heap = class {
     return top;
   }
 };
-function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget, hScale = 1) {
+function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget, hScale = 1, heur) {
   const n = map.w * map.h;
   const g = new Float64Array(n).fill(Infinity);
   const f = new Float64Array(n).fill(Infinity);
@@ -102,7 +110,8 @@ function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget, hSca
   const start = idx(map, sx, sy);
   const goal = idx(map, gx, gy);
   g[start] = 0;
-  f[start] = octile(sx, sy, gx, gy) * hScale;
+  f[start] = heur ? heur[start] : octile(sx, sy, gx, gy) * hScale;
+  if (f[start] === Infinity || heur && heur[goal] === Infinity) return null;
   const open = new Heap(f);
   open.push(start);
   while (open.size > 0) {
@@ -125,8 +134,10 @@ function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget, hSca
       const ni = idx(map, nx, ny);
       const ng = g[cur] + cost + (enterCost ? enterCost(nx, ny, cost) : 0);
       if (ng < g[ni]) {
+        const h = heur ? heur[ni] : octile(nx, ny, gx, gy) * hScale;
+        if (h === Infinity) continue;
         g[ni] = ng;
-        f[ni] = ng + octile(nx, ny, gx, gy) * hScale;
+        f[ni] = ng + h;
         came[ni] = cur;
         open.push(ni);
       }
