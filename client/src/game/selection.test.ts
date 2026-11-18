@@ -50,7 +50,7 @@ test('selectUnits replaces selection unless additive', () => {
 });
 
 function mkKindUnit(id: number, speed: number): Unit {
-  return { id, x: 0, y: 0, angle: 0, speed, path: [], selected: false };
+  return { id, kind: 'infantry', hp: 1, maxHp: 1, x: 0, y: 0, angle: 0, speed, path: [], selected: false };
 }
 
 test('selectSameKind selects all units of the same kind', () => {

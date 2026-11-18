@@ -89,7 +89,7 @@ test("selectUnits replaces selection unless additive", () => {
   assert.deepEqual(units.map((u) => u.selected), [false, false, false]);
 });
 function mkKindUnit(id, speed) {
-  return { id, x: 0, y: 0, angle: 0, speed, path: [], selected: false };
+  return { id, kind: "infantry", hp: 1, maxHp: 1, x: 0, y: 0, angle: 0, speed, path: [], selected: false };
 }
 test("selectSameKind selects all units of the same kind", () => {
   const units = [mkKindUnit(1, 70), mkKindUnit(2, 120), mkKindUnit(3, 70)];
