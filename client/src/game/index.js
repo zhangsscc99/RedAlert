@@ -14,6 +14,7 @@ import "./gameState.test.js";
 import "./grid.test.js";
 import "./harvest.test.js";
 import "./hotkeys.test.js";
+import "./missions.test.js";
 import "./onboarding.test.js";
 import "./panel.test.js";
 import "./pathfind.test.js";
