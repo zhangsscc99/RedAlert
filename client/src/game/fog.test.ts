@@ -2,7 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   SIGHT_RADIUS,
+  RADAR_SIGHT_BONUS,
+  SOURCE_FADE_SECONDS,
   createFog,
+  revealScan,
   updateFog,
   isVisible,
   isExplored,
@@ -38,22 +41,77 @@ test('tiles inside sight radius are visible, outside are not', () => {
   const fog = createFog(map);
   updateFog(fog, map, [src(10, 10)]);
   assert.ok(isVisible(fog, 10, 10)); // center
-  assert.ok(isVisible(fog, 16, 10)); // exactly radius 6 east
-  assert.ok(isVisible(fog, 10, 4)); // radius 6 north
-  assert.ok(!isVisible(fog, 17, 10)); // one tile beyond radius
-  assert.ok(!isVisible(fog, 15, 15)); // diag dist ~7.07 > 6
+  assert.ok(isVisible(fog, 14, 10)); // exactly radius 4 east
+  assert.ok(isVisible(fog, 10, 6)); // radius 4 north
+  assert.ok(!isVisible(fog, 15, 10)); // one tile beyond radius
+  assert.ok(!isVisible(fog, 13, 13)); // diag dist ~4.24 > 4
   assert.ok(!isVisible(fog, 0, 0));
 });
 
 test('sight radius follows SIGHT_RADIUS per kind', () => {
   const fog = createFog(map);
-  updateFog(fog, map, [src(10, 10, 'tank')]); // radius 7
-  assert.ok(isVisible(fog, 17, 10));
-  assert.ok(!isVisible(fog, 18, 10));
-  assert.equal(SIGHT_RADIUS.infantry, 6);
-  assert.equal(SIGHT_RADIUS.tank, 7);
-  assert.equal(SIGHT_RADIUS.harvester, 5);
+  updateFog(fog, map, [src(10, 10, 'tank')]); // radius 6
+  assert.ok(isVisible(fog, 16, 10));
+  assert.ok(!isVisible(fog, 17, 10));
+  assert.equal(SIGHT_RADIUS.infantry, 4);
+  assert.equal(SIGHT_RADIUS.tank, 6);
+  assert.equal(SIGHT_RADIUS.harvester, 6);
   assert.equal(SIGHT_RADIUS.hq, 8);
+});
+
+test('sight tiers are ordered: buildings > vehicles > infantry', () => {
+  for (const k of ['hq', 'barracks', 'refinery', 'power', 'turret', 'wall'] as const) {
+    assert.ok(SIGHT_RADIUS[k] > SIGHT_RADIUS.tank, `${k} should out-see tank`);
+    assert.ok(SIGHT_RADIUS[k] > SIGHT_RADIUS.infantry, `${k} should out-see infantry`);
+  }
+  assert.ok(SIGHT_RADIUS.tank > SIGHT_RADIUS.infantry);
+  assert.ok(SIGHT_RADIUS.harvester > SIGHT_RADIUS.infantry);
+});
+
+test('radar flag extends sight by RADAR_SIGHT_BONUS', () => {
+  const fog = createFog(map);
+  const s = src(10, 10, 'hq');
+  s.radar = true;
+  updateFog(fog, map, [s]);
+  const r = SIGHT_RADIUS.hq + RADAR_SIGHT_BONUS;
+  assert.ok(isVisible(fog, 10 + r, 10));
+  assert.ok(!isVisible(fog, 10 + r + 1, 10));
+});
+
+test('revealScan temporarily reveals an area and expires on TTL', () => {
+  const fog = createFog(map);
+  updateFog(fog, map, [src(2, 2)]);
+  revealScan(fog, 20 * TILE_SIZE, 20 * TILE_SIZE, 3, 1.0);
+
+  updateFog(fog, map, [src(2, 2)], 0.5); // ttl 1.0 → 0.5 remaining
+  assert.ok(isVisible(fog, 20, 20));
+  assert.ok(isVisible(fog, 23, 20));
+  assert.ok(!isVisible(fog, 24, 20));
+
+  updateFog(fog, map, [src(2, 2)], 0.6); // ttl exhausted → auto-recalled
+  assert.ok(!isVisible(fog, 20, 20));
+  assert.ok(isExplored(fog, 20, 20)); // explored layer keeps it
+});
+
+test('removed sight source shrinks smoothly instead of popping', () => {
+  const fog = createFog(map);
+  const b = { id: 7, kind: 'hq' as const, gx: 16, gy: 16, hp: 1, maxHp: 1, done: true };
+  updateFog(fog, map, [buildingSource(b)], 0.1);
+  assert.ok(isVisible(fog, 25, 17)); // edge of radius 8 (center ~18,17)
+
+  // Destroyed: source dropped from the list; vision collapses over SOURCE_FADE_SECONDS.
+  updateFog(fog, map, [], 0.1);
+  assert.ok(isVisible(fog, 25, 17)); // still nearly full radius
+  assert.equal(fog.fading.length, 1);
+
+  updateFog(fog, map, [], SOURCE_FADE_SECONDS / 2); // half faded → radius ~4
+  assert.ok(!isVisible(fog, 25, 17));
+  assert.ok(isVisible(fog, 20, 17));
+
+  updateFog(fog, map, [], SOURCE_FADE_SECONDS); // fully faded
+  assert.ok(!isVisible(fog, 20, 17));
+  assert.equal(fog.fading.length, 0);
+  assert.ok(isExplored(fog, 25, 17));
 });
 
 test('visible clears after the unit leaves, explored is kept', () => {
@@ -75,7 +133,7 @@ test('multiple sources union their sight areas', () => {
   updateFog(fog, map, [src(5, 5), src(26, 26)]);
   assert.ok(isVisible(fog, 5, 5));
   assert.ok(isVisible(fog, 26, 26));
-  assert.ok(isVisible(fog, 11, 5)); // in first unit's radius only
+  assert.ok(isVisible(fog, 9, 5)); // in first unit's radius only
   assert.ok(!isVisible(fog, 16, 16)); // between the two, out of both radii
 });
 
@@ -83,7 +141,7 @@ test('out-of-bounds queries return false and edge sources do not throw', () => {
   const fog = createFog(map);
   updateFog(fog, map, [src(0, 0)]); // circle spills off the map edge
   assert.ok(isVisible(fog, 0, 0));
-  assert.ok(isVisible(fog, 6, 0));
+  assert.ok(isVisible(fog, 4, 0));
   assert.equal(isVisible(fog, -1, 0), false);
   assert.equal(isVisible(fog, 0, -1), false);
   assert.equal(isVisible(fog, map.w, 0), false);

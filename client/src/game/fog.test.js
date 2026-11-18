@@ -21,9 +21,9 @@ var RADAR_SCAN = { radius: 12 * TILE_SIZE, period: 5 };
 
 // src/game/fog.ts
 var SIGHT_RADIUS = {
-  infantry: 6,
-  tank: 7,
-  harvester: 5,
+  infantry: 4,
+  tank: 6,
+  harvester: 6,
   hq: 8,
   barracks: 8,
   refinery: 8,
@@ -31,45 +31,94 @@ var SIGHT_RADIUS = {
   turret: 8,
   wall: 8
 };
+var RADAR_SIGHT_BONUS = 4;
+var SOURCE_FADE_SECONDS = 1.5;
 function createFog(map2) {
-  return { w: map2.w, h: map2.h, explored: new Uint8Array(map2.w * map2.h), visible: new Uint8Array(map2.w * map2.h) };
+  return {
+    w: map2.w,
+    h: map2.h,
+    explored: new Uint8Array(map2.w * map2.h),
+    visible: new Uint8Array(map2.w * map2.h),
+    scans: [],
+    prevSources: [],
+    fading: []
+  };
 }
 function unitSource(u) {
-  return { x: u.x, y: u.y, kind: u.kind };
+  return { x: u.x, y: u.y, kind: u.kind, id: u.id };
 }
 function buildingSource(b) {
   const def = BUILDING_DEFS[b.kind];
   return {
     x: (b.gx + def.w / 2) * TILE_SIZE,
     y: (b.gy + def.h / 2) * TILE_SIZE,
-    kind: b.kind
+    kind: b.kind,
+    id: b.id
   };
 }
 function sightRadius(s) {
-  if (s.sight !== void 0) return s.sight;
-  if (s.kind !== void 0) return SIGHT_RADIUS[s.kind];
-  return 0;
+  const base = s.sight !== void 0 ? s.sight : s.kind !== void 0 ? SIGHT_RADIUS[s.kind] : 0;
+  return base + (s.radar ? RADAR_SIGHT_BONUS : 0);
 }
-function updateFog(fog, map2, sources) {
+function sourceKey(s, tx, ty) {
+  if (s.id !== void 0) return `id:${s.id}`;
+  return `${s.kind ?? "?"}@${tx},${ty}`;
+}
+function revealScan(fog, wx, wy, radiusTiles, ttlSeconds) {
+  fog.scans.push({ x: worldToTile(wx), y: worldToTile(wy), r: radiusTiles, ttl: ttlSeconds });
+}
+function stamp(fog, map2, cx, cy, r) {
+  if (r <= 0) return;
+  const ri = Math.ceil(r);
+  const r2 = r * r;
+  for (let dy = -ri; dy <= ri; dy++) {
+    for (let dx = -ri; dx <= ri; dx++) {
+      if (dx * dx + dy * dy > r2) continue;
+      const x = cx + dx;
+      const y = cy + dy;
+      if (x < 0 || y < 0 || x >= map2.w || y >= map2.h) continue;
+      const i = y * map2.w + x;
+      fog.visible[i] = 1;
+      fog.explored[i] = 1;
+    }
+  }
+}
+function updateFog(fog, map2, sources, dt = 0) {
   fog.visible.fill(0);
+  const next = [];
   for (const s of sources) {
     const r = sightRadius(s);
     if (r <= 0) continue;
     const cx = worldToTile(s.x);
     const cy = worldToTile(s.y);
-    const r2 = r * r;
-    for (let dy = -r; dy <= r; dy++) {
-      for (let dx = -r; dx <= r; dx++) {
-        if (dx * dx + dy * dy > r2) continue;
-        const x = cx + dx;
-        const y = cy + dy;
-        if (x < 0 || y < 0 || x >= map2.w || y >= map2.h) continue;
-        const i = y * map2.w + x;
-        fog.visible[i] = 1;
-        fog.explored[i] = 1;
+    stamp(fog, map2, cx, cy, r);
+    next.push({ key: sourceKey(s, cx, cy), x: cx, y: cy, r });
+  }
+  if (dt > 0) {
+    const currentKeys = new Set(next.map((n) => n.key));
+    for (const prev of fog.prevSources) {
+      if (!currentKeys.has(prev.key)) {
+        fog.fading.push({ x: prev.x, y: prev.y, r: prev.r, ttl: SOURCE_FADE_SECONDS });
       }
     }
   }
+  fog.prevSources = next;
+  const fading = [];
+  for (const f of fog.fading) {
+    f.ttl -= dt;
+    if (f.ttl <= 0) continue;
+    stamp(fog, map2, f.x, f.y, f.r * f.ttl / SOURCE_FADE_SECONDS);
+    fading.push(f);
+  }
+  fog.fading = fading;
+  const scans = [];
+  for (const sc of fog.scans) {
+    sc.ttl -= dt;
+    if (sc.ttl <= 0) continue;
+    stamp(fog, map2, sc.x, sc.y, sc.r);
+    scans.push(sc);
+  }
+  fog.scans = scans;
 }
 function isVisible(fog, x, y) {
   if (x < 0 || y < 0 || x >= fog.w || y >= fog.h) return false;
@@ -107,21 +156,66 @@ test("tiles inside sight radius are visible, outside are not", () => {
   const fog = createFog(map);
   updateFog(fog, map, [src(10, 10)]);
   assert.ok(isVisible(fog, 10, 10));
-  assert.ok(isVisible(fog, 16, 10));
-  assert.ok(isVisible(fog, 10, 4));
-  assert.ok(!isVisible(fog, 17, 10));
-  assert.ok(!isVisible(fog, 15, 15));
+  assert.ok(isVisible(fog, 14, 10));
+  assert.ok(isVisible(fog, 10, 6));
+  assert.ok(!isVisible(fog, 15, 10));
+  assert.ok(!isVisible(fog, 13, 13));
   assert.ok(!isVisible(fog, 0, 0));
 });
 test("sight radius follows SIGHT_RADIUS per kind", () => {
   const fog = createFog(map);
   updateFog(fog, map, [src(10, 10, "tank")]);
-  assert.ok(isVisible(fog, 17, 10));
-  assert.ok(!isVisible(fog, 18, 10));
-  assert.equal(SIGHT_RADIUS.infantry, 6);
-  assert.equal(SIGHT_RADIUS.tank, 7);
-  assert.equal(SIGHT_RADIUS.harvester, 5);
+  assert.ok(isVisible(fog, 16, 10));
+  assert.ok(!isVisible(fog, 17, 10));
+  assert.equal(SIGHT_RADIUS.infantry, 4);
+  assert.equal(SIGHT_RADIUS.tank, 6);
+  assert.equal(SIGHT_RADIUS.harvester, 6);
   assert.equal(SIGHT_RADIUS.hq, 8);
+});
+test("sight tiers are ordered: buildings > vehicles > infantry", () => {
+  for (const k of ["hq", "barracks", "refinery", "power", "turret", "wall"]) {
+    assert.ok(SIGHT_RADIUS[k] > SIGHT_RADIUS.tank, `${k} should out-see tank`);
+    assert.ok(SIGHT_RADIUS[k] > SIGHT_RADIUS.infantry, `${k} should out-see infantry`);
+  }
+  assert.ok(SIGHT_RADIUS.tank > SIGHT_RADIUS.infantry);
+  assert.ok(SIGHT_RADIUS.harvester > SIGHT_RADIUS.infantry);
+});
+test("radar flag extends sight by RADAR_SIGHT_BONUS", () => {
+  const fog = createFog(map);
+  const s = src(10, 10, "hq");
+  s.radar = true;
+  updateFog(fog, map, [s]);
+  const r = SIGHT_RADIUS.hq + RADAR_SIGHT_BONUS;
+  assert.ok(isVisible(fog, 10 + r, 10));
+  assert.ok(!isVisible(fog, 10 + r + 1, 10));
+});
+test("revealScan temporarily reveals an area and expires on TTL", () => {
+  const fog = createFog(map);
+  updateFog(fog, map, [src(2, 2)]);
+  revealScan(fog, 20 * TILE_SIZE, 20 * TILE_SIZE, 3, 1);
+  updateFog(fog, map, [src(2, 2)], 0.5);
+  assert.ok(isVisible(fog, 20, 20));
+  assert.ok(isVisible(fog, 23, 20));
+  assert.ok(!isVisible(fog, 24, 20));
+  updateFog(fog, map, [src(2, 2)], 0.6);
+  assert.ok(!isVisible(fog, 20, 20));
+  assert.ok(isExplored(fog, 20, 20));
+});
+test("removed sight source shrinks smoothly instead of popping", () => {
+  const fog = createFog(map);
+  const b = { id: 7, kind: "hq", gx: 16, gy: 16, hp: 1, maxHp: 1, done: true };
+  updateFog(fog, map, [buildingSource(b)], 0.1);
+  assert.ok(isVisible(fog, 25, 17));
+  updateFog(fog, map, [], 0.1);
+  assert.ok(isVisible(fog, 25, 17));
+  assert.equal(fog.fading.length, 1);
+  updateFog(fog, map, [], SOURCE_FADE_SECONDS / 2);
+  assert.ok(!isVisible(fog, 25, 17));
+  assert.ok(isVisible(fog, 20, 17));
+  updateFog(fog, map, [], SOURCE_FADE_SECONDS);
+  assert.ok(!isVisible(fog, 20, 17));
+  assert.equal(fog.fading.length, 0);
+  assert.ok(isExplored(fog, 25, 17));
 });
 test("visible clears after the unit leaves, explored is kept", () => {
   const fog = createFog(map);
@@ -140,14 +234,14 @@ test("multiple sources union their sight areas", () => {
   updateFog(fog, map, [src(5, 5), src(26, 26)]);
   assert.ok(isVisible(fog, 5, 5));
   assert.ok(isVisible(fog, 26, 26));
-  assert.ok(isVisible(fog, 11, 5));
+  assert.ok(isVisible(fog, 9, 5));
   assert.ok(!isVisible(fog, 16, 16));
 });
 test("out-of-bounds queries return false and edge sources do not throw", () => {
   const fog = createFog(map);
   updateFog(fog, map, [src(0, 0)]);
   assert.ok(isVisible(fog, 0, 0));
-  assert.ok(isVisible(fog, 6, 0));
+  assert.ok(isVisible(fog, 4, 0));
   assert.equal(isVisible(fog, -1, 0), false);
   assert.equal(isVisible(fog, 0, -1), false);
   assert.equal(isVisible(fog, map.w, 0), false);

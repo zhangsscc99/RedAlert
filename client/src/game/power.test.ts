@@ -1,6 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { computePower, powerFactor, isLowPower, type Power } from './power.js';
+import {
+  computePower,
+  powerFactor,
+  isLowPower,
+  powerLevel,
+  productionSpeedMultiplier,
+  turretChargeMultiplier,
+  powerAlarmEvent,
+  type Power,
+  type PowerLevel,
+} from './power.js';
 import type { Building, BuildingKind } from './buildings.js';
 
 let nextId = 1;
@@ -64,4 +74,50 @@ test('half-ratio case: hq (50) vs two refineries (100) → 0.6', () => {
   assert.equal(p.ratio, 0.5);
   assert.equal(powerFactor(p), 0.6);
   assert.equal(isLowPower(p), true);
+});
+
+const mk = (ratio: number, consumed = 100): Power => ({ produced: ratio * consumed, consumed, ratio });
+
+test('powerLevel boundaries: deficit 0 / 25% / 50% / beyond', () => {
+  assert.equal(powerLevel(mk(Infinity, 0)), 'ample');
+  assert.equal(powerLevel(mk(1)), 'ample');
+  assert.equal(powerLevel(mk(2)), 'ample');
+  assert.equal(powerLevel(mk(0.999)), 'tight');
+  assert.equal(powerLevel(mk(0.75)), 'tight'); // exactly 25% deficit
+  assert.equal(powerLevel(mk(0.749)), 'severe');
+  assert.equal(powerLevel(mk(0.5)), 'severe'); // exactly 50% deficit
+  assert.equal(powerLevel(mk(0.499)), 'critical');
+  assert.equal(powerLevel(mk(0)), 'critical');
+});
+
+test('powerLevel accepts a raw building list', () => {
+  assert.equal(powerLevel([b('hq'), b('power')]), 'ample');
+  assert.equal(powerLevel([b('hq'), b('refinery'), b('refinery')]), 'severe');
+});
+
+test('production and turret multipliers are monotonic across levels', () => {
+  const levels: PowerLevel[] = ['ample', 'tight', 'severe', 'critical'];
+  const prod = levels.map((l) => productionSpeedMultiplier(mk({ ample: 1, tight: 0.9, severe: 0.6, critical: 0.4 }[l])));
+  const turret = levels.map((l) => turretChargeMultiplier(mk({ ample: 1, tight: 0.9, severe: 0.6, critical: 0.4 }[l])));
+  for (let i = 1; i < levels.length; i++) {
+    assert.ok(prod[i] < prod[i - 1], `production ${levels[i]} < ${levels[i - 1]}`);
+    assert.ok(turret[i] < turret[i - 1], `turret ${levels[i]} < ${levels[i - 1]}`);
+  }
+  assert.equal(productionSpeedMultiplier(mk(1)), 1);
+  assert.equal(turretChargeMultiplier(mk(1)), 1);
+  assert.equal(turretChargeMultiplier(mk(0)), 0); // grid down → turrets offline
+});
+
+test('powerAlarmEvent fires only on level change', () => {
+  const tight = mk(0.9);
+  const severe = mk(0.6);
+  // First observation alarms (no previous level).
+  assert.equal(powerAlarmEvent(undefined, tight), 'tight');
+  // Same level again → silent.
+  assert.equal(powerAlarmEvent('tight', tight), null);
+  assert.equal(powerAlarmEvent('tight', mk(0.8)), null); // still tight
+  // Transition → alarm with the new level.
+  assert.equal(powerAlarmEvent('tight', severe), 'severe');
+  // Recovery also alarms once.
+  assert.equal(powerAlarmEvent('severe', mk(1)), 'ample');
 });
