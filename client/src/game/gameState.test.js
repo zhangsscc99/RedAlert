@@ -131,22 +131,17 @@ function tileCenter(t) {
 
 // src/game/pathfind.ts
 var ROAD = 3;
-var COST_ROAD = 0.6;
-var COST_GRASS = 1;
-var COST_ORE = 3;
-var MIN_TERRAIN_COST = COST_ROAD;
+var TERRAIN_COSTS = {
+  [ROAD]: 0.6,
+  [GRASS]: 1,
+  [ORE]: 3,
+  [WATER]: Infinity
+};
+var COST_GRASS = TERRAIN_COSTS[GRASS];
+var MIN_TERRAIN_COST = Math.min(TERRAIN_COSTS[ROAD], COST_GRASS, TERRAIN_COSTS[ORE]);
 var CROWD_COST = 1;
 function tileCost(t) {
-  switch (t) {
-    case ROAD:
-      return COST_ROAD;
-    case GRASS:
-      return COST_GRASS;
-    case ORE:
-      return COST_ORE;
-    default:
-      return Infinity;
-  }
+  return TERRAIN_COSTS[t] ?? Infinity;
 }
 var SQRT2 = Math.SQRT2;
 var DIRS = [
@@ -193,10 +188,9 @@ var Heap = class {
       for (; ; ) {
         const l = i * 2 + 1;
         const r = l + 1;
-        let m = i;
-        if (l < items.length && this.f[items[l]] < this.f[items[m]]) m = l;
-        if (r < items.length && this.f[items[r]] < this.f[items[m]]) m = r;
-        if (m === i) break;
+        if (l >= items.length) break;
+        const m = r < items.length && this.f[items[r]] < this.f[items[l]] ? r : l;
+        if (this.f[items[m]] >= this.f[last]) break;
         items[i] = items[m];
         i = m;
       }
@@ -208,7 +202,7 @@ var Heap = class {
 function terrainPassable(map) {
   return (x, y) => isPassable(map, x, y);
 }
-function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget, hScale = 1) {
+function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget, hScale = 1, heur) {
   const n = map.w * map.h;
   const g = new Float64Array(n).fill(Infinity);
   const f = new Float64Array(n).fill(Infinity);
@@ -217,7 +211,8 @@ function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget, hSca
   const start = idx(map, sx, sy);
   const goal = idx(map, gx, gy);
   g[start] = 0;
-  f[start] = octile(sx, sy, gx, gy) * hScale;
+  f[start] = heur ? heur[start] : octile(sx, sy, gx, gy) * hScale;
+  if (f[start] === Infinity || heur && heur[goal] === Infinity) return null;
   const open = new Heap(f);
   open.push(start);
   while (open.size > 0) {
@@ -240,8 +235,10 @@ function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget, hSca
       const ni = idx(map, nx, ny);
       const ng = g[cur] + cost + (enterCost ? enterCost(nx, ny, cost) : 0);
       if (ng < g[ni]) {
+        const h = heur ? heur[ni] : octile(nx, ny, gx, gy) * hScale;
+        if (h === Infinity) continue;
         g[ni] = ng;
-        f[ni] = ng + octile(nx, ny, gx, gy) * hScale;
+        f[ni] = ng + h;
         came[ni] = cur;
         open.push(ni);
       }
@@ -306,24 +303,56 @@ function findPathSmooth(map, sx, sy, gx, gy, opts = {}) {
   const costMode = opts.terrainCost === true;
   const blocked = blockedMask(map, opts.blockers ?? [], costMode);
   const nav = navFns(map, blocked, opts.radius ?? 0);
-  if (!nav.clear(gx, gy)) return null;
   const counts = crowdCounts(map, opts.crowd, opts.crowdRadius ?? 1);
+  const snapR = opts.snapRadius ?? 0;
+  const free = freeTile(map, nav.clear, counts);
+  const ox = gx;
+  const oy = gy;
+  const goalTaken = counts !== null && counts[idx(map, gx, gy)] > 0;
+  if (!nav.clear(gx, gy) || snapR > 0 && goalTaken) {
+    if (snapR <= 0) return null;
+    const alt = nearestPassable(map, gx, gy, free, snapR);
+    if (!alt) return null;
+    gx = alt.x;
+    gy = alt.y;
+  }
   const enterCost = makeEnterCost(map, costMode, counts, opts.crowdCost ?? CROWD_COST);
-  const raw = astar(
-    map,
-    sx,
-    sy,
-    gx,
-    gy,
-    nav.clear,
-    nav.step,
-    enterCost,
-    void 0,
-    costMode ? MIN_TERRAIN_COST : 1
-  );
+  const hScale = costMode ? MIN_TERRAIN_COST : 1;
+  const tried = /* @__PURE__ */ new Set([idx(map, gx, gy)]);
+  let raw = astar(map, sx, sy, gx, gy, nav.clear, nav.step, enterCost, void 0, hScale);
+  for (let r = 1; !raw && r <= snapR; r++) {
+    const ring = [];
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+        const nx = ox + dx;
+        const ny = oy + dy;
+        const ni = idx(map, nx, ny);
+        if (tried.has(ni) || !free(nx, ny)) continue;
+        tried.add(ni);
+        ring.push({ x: nx, y: ny });
+      }
+    }
+    ring.sort(
+      (a, b) => (a.x - ox) ** 2 + (a.y - oy) ** 2 - ((b.x - ox) ** 2 + (b.y - oy) ** 2) || a.y - b.y || a.x - b.x
+    );
+    for (const alt of ring) {
+      raw = astar(map, sx, sy, alt.x, alt.y, nav.clear, nav.step, enterCost, void 0, hScale);
+      if (raw) {
+        gx = alt.x;
+        gy = alt.y;
+        break;
+      }
+    }
+  }
   if (!raw) return null;
   const los = costAwareLos(map, nav.los, costMode, counts);
-  return pullString({ x: sx, y: sy }, raw, los);
+  return pullString(
+    { x: sx, y: sy },
+    raw,
+    los,
+    costMode ? pullCap(map, { x: sx, y: sy }, raw) : void 0
+  );
 }
 function makeEnterCost(map, costMode, counts, per) {
   if (!costMode && !counts) return void 0;
@@ -348,6 +377,10 @@ function crowdCounts(map, units, r) {
   }
   return counts;
 }
+function freeTile(map, clear, counts) {
+  if (!counts) return clear;
+  return (x, y) => clear(x, y) && counts[idx(map, x, y)] === 0;
+}
 function navFns(map, blocked, radius) {
   if (radius > 0) {
     return {
@@ -362,17 +395,63 @@ function navFns(map, blocked, radius) {
     los: (a, b) => supercoverClear(map, blocked, a.x, a.y, b.x, b.y)
   };
 }
-function pullString(start, raw, los) {
+function pullString(start, raw, los, cap) {
   const pts = [start, ...raw];
   const out = [];
   let i = 0;
   while (i < pts.length - 1) {
     let j = pts.length - 1;
-    while (j > i + 1 && !los(pts[i], pts[j])) j--;
+    while (j > i + 1 && !(los(pts[i], pts[j]) && (!cap || cap.segCost(pts[i], pts[j]) <= cap.cum[j] - cap.cum[i] + EPS))) {
+      j--;
+    }
     out.push(pts[j]);
     i = j;
   }
   return out;
+}
+function pullCap(map, start, raw) {
+  const pts = [start, ...raw];
+  const cum = new Array(pts.length).fill(0);
+  for (let k = 1; k < pts.length; k++) {
+    const a = pts[k - 1];
+    const b = pts[k];
+    cum[k] = cum[k - 1] + (a.x !== b.x && a.y !== b.y ? SQRT2 : 1) * tileCost(map.tiles[idx(map, b.x, b.y)]);
+  }
+  return {
+    cum,
+    segCost: (a, b) => segmentTileCost(map, a.x, a.y, b.x, b.y)
+  };
+}
+function segmentTileCost(map, ax, ay, bx, by) {
+  let x = ax;
+  let y = ay;
+  let cost = 0;
+  const sx = Math.sign(bx - ax);
+  const sy = Math.sign(by - ay);
+  const adx = Math.abs(bx - ax);
+  const ady = Math.abs(by - ay);
+  let nx = 1;
+  let ny = 1;
+  while (x !== bx || y !== by) {
+    const tx = nx * ady;
+    const ty = ny * adx;
+    if (tx < ty) {
+      x += sx;
+      nx += 2;
+      cost += tileCost(map.tiles[idx(map, x, y)]);
+    } else if (ty < tx) {
+      y += sy;
+      ny += 2;
+      cost += tileCost(map.tiles[idx(map, x, y)]);
+    } else {
+      x += sx;
+      y += sy;
+      nx += 2;
+      ny += 2;
+      cost += SQRT2 * tileCost(map.tiles[idx(map, x, y)]);
+    }
+  }
+  return cost;
 }
 function blockedMask(map, blockers, costMode = false) {
   const blocked = new Uint8Array(map.w * map.h);

@@ -1,7 +1,16 @@
 // A* pathfinding on the tile grid. 8 directions, diagonal cost sqrt(2),
 // and no diagonal "corner cutting" through blocked orthogonal neighbors.
 
-import { GRASS, ORE, idx, inBounds, isPassable, type GameMap, type Tile } from './grid.js';
+import {
+  GRASS,
+  ORE,
+  WATER,
+  idx,
+  inBounds,
+  isPassable,
+  type GameMap,
+  type Tile,
+} from './grid.js';
 
 /**
  * Tile value a map may use for paved road. generateMap never emits it, but
@@ -11,25 +20,28 @@ import { GRASS, ORE, idx, inBounds, isPassable, type GameMap, type Tile } from '
  */
 export const ROAD = 3;
 
-const COST_ROAD = 0.6;
-const COST_GRASS = 1;
-const COST_ORE = 3;
-const MIN_TERRAIN_COST = COST_ROAD;
+/**
+ * Enter-cost multiplier per tile value — the cost table behind
+ * {@link SmoothPathOptions.terrainCost} and group pathing. ROAD is the fast
+ * lane (< 1), GRASS the baseline, ORE (rocky ground) costly but crossable,
+ * WATER and every unlisted tile Infinity — impassable, so units always
+ * detour around them.
+ */
+export const TERRAIN_COSTS: Readonly<Record<number, number>> = {
+  [ROAD]: 0.6,
+  [GRASS]: 1,
+  [ORE]: 3,
+  [WATER]: Infinity,
+};
+
+const COST_GRASS = TERRAIN_COSTS[GRASS]!;
+const MIN_TERRAIN_COST = Math.min(TERRAIN_COSTS[ROAD]!, COST_GRASS, TERRAIN_COSTS[ORE]!);
 /** Default soft cost per unit standing within `crowdRadius` of a tile. */
 const CROWD_COST = 1;
 
 /** Enter-cost multiplier for one tile value; Infinity = impassable. */
 function tileCost(t: number): number {
-  switch (t) {
-    case ROAD:
-      return COST_ROAD;
-    case GRASS:
-      return COST_GRASS;
-    case ORE:
-      return COST_ORE;
-    default:
-      return Infinity;
-  }
+  return TERRAIN_COSTS[t] ?? Infinity;
 }
 
 const SQRT2 = Math.SQRT2;
@@ -77,14 +89,16 @@ class Heap {
     const top = items[0]!;
     const last = items.pop()!;
     if (items.length > 0) {
+      // Sift the root hole down past any child smaller than `last`, then
+      // plant `last` in it. Comparing children to the hole's stale value
+      // instead of `last` would skip the sift entirely.
       let i = 0;
       for (;;) {
         const l = i * 2 + 1;
         const r = l + 1;
-        let m = i;
-        if (l < items.length && this.f[items[l]!]! < this.f[items[m]!]!) m = l;
-        if (r < items.length && this.f[items[r]!]! < this.f[items[m]!]!) m = r;
-        if (m === i) break;
+        if (l >= items.length) break;
+        const m = r < items.length && this.f[items[r]!]! < this.f[items[l]!]! ? r : l;
+        if (this.f[items[m]!]! >= this.f[last]!) break;
         items[i] = items[m]!;
         i = m;
       }
@@ -129,6 +143,9 @@ export function findPath(
  * decremented per expanded node and aborts the search with null once it hits
  * zero. `hScale` shrinks the octile heuristic when tiles can cost less than
  * the base step length (road terrain), keeping the heuristic admissible.
+ * `heur`, when given, replaces the octile estimate with a shared per-tile
+ * lower bound (findPathsGroup's multi-source distance field); tiles whose
+ * bound is Infinity are skipped outright since no slot can be reached.
  */
 function astar(
   map: GameMap,
@@ -141,6 +158,7 @@ function astar(
   enterCost?: (nx: number, ny: number, base: number) => number,
   budget?: { left: number },
   hScale = 1,
+  heur?: Float64Array,
 ): Tile[] | null {
   const n = map.w * map.h;
   const g = new Float64Array(n).fill(Infinity);
@@ -151,7 +169,8 @@ function astar(
   const start = idx(map, sx, sy);
   const goal = idx(map, gx, gy);
   g[start] = 0;
-  f[start] = octile(sx, sy, gx, gy) * hScale;
+  f[start] = heur ? heur[start]! : octile(sx, sy, gx, gy) * hScale;
+  if (f[start] === Infinity || (heur && heur[goal] === Infinity)) return null;
   const open = new Heap(f);
   open.push(start);
 
@@ -178,8 +197,10 @@ function astar(
       const ni = idx(map, nx, ny);
       const ng = g[cur]! + cost + (enterCost ? enterCost(nx, ny, cost) : 0);
       if (ng < g[ni]!) {
+        const h = heur ? heur[ni]! : octile(nx, ny, gx, gy) * hScale;
+        if (h === Infinity) continue;
         g[ni] = ng;
-        f[ni] = ng + octile(nx, ny, gx, gy) * hScale;
+        f[ni] = ng + h;
         came[ni] = cur;
         open.push(ni);
       }
@@ -304,6 +325,14 @@ export interface SmoothPathOptions {
   crowdRadius?: number;
   /** Soft cost per crowded unit. Default {@link CROWD_COST}. */
   crowdCost?: number;
+  /**
+   * Arrival tolerance: when > 0 and the goal tile is blocked or occupied
+   * (inside a blocker, impassable terrain, or covered by `crowd`), it snaps
+   * to the nearest reachable uncrowded tile within this Chebyshev distance —
+   * same ring search as {@link snapToPassable} — and the returned path ends
+   * there instead of returning null. Default 0 keeps the strict goal check.
+   */
+  snapRadius?: number;
 }
 
 /**
@@ -328,25 +357,65 @@ export function findPathSmooth(
   const costMode = opts.terrainCost === true;
   const blocked = blockedMask(map, opts.blockers ?? [], costMode);
   const nav = navFns(map, blocked, opts.radius ?? 0);
-  if (!nav.clear(gx, gy)) return null;
-
   const counts = crowdCounts(map, opts.crowd, opts.crowdRadius ?? 1);
+
+  const snapR = opts.snapRadius ?? 0;
+  const free = freeTile(map, nav.clear, counts);
+  const ox = gx;
+  const oy = gy;
+  const goalTaken = counts !== null && counts[idx(map, gx, gy)]! > 0;
+  if (!nav.clear(gx, gy) || (snapR > 0 && goalTaken)) {
+    if (snapR <= 0) return null;
+    const alt = nearestPassable(map, gx, gy, free, snapR);
+    if (!alt) return null;
+    gx = alt.x;
+    gy = alt.y;
+  }
+
   const enterCost = makeEnterCost(map, costMode, counts, opts.crowdCost ?? CROWD_COST);
-  const raw = astar(
-    map,
-    sx,
-    sy,
-    gx,
-    gy,
-    nav.clear,
-    nav.step,
-    enterCost,
-    undefined,
-    costMode ? MIN_TERRAIN_COST : 1,
-  );
+  const hScale = costMode ? MIN_TERRAIN_COST : 1;
+  const tried = new Set<number>([idx(map, gx, gy)]);
+  let raw = astar(map, sx, sy, gx, gy, nav.clear, nav.step, enterCost, undefined, hScale);
+  // The (possibly snapped) goal can't be reached — e.g. it sits inside a
+  // pocket of impassable terrain. Within the arrival tolerance around the
+  // requested goal, retry every free ring cell nearest-first and land on the
+  // closest reachable one.
+  for (let r = 1; !raw && r <= snapR; r++) {
+    const ring: Tile[] = [];
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+        const nx = ox + dx;
+        const ny = oy + dy;
+        const ni = idx(map, nx, ny);
+        if (tried.has(ni) || !free(nx, ny)) continue;
+        tried.add(ni);
+        ring.push({ x: nx, y: ny });
+      }
+    }
+    ring.sort(
+      (a, b) =>
+        (a.x - ox) ** 2 + (a.y - oy) ** 2 - ((b.x - ox) ** 2 + (b.y - oy) ** 2) ||
+        a.y - b.y ||
+        a.x - b.x,
+    );
+    for (const alt of ring) {
+      raw = astar(map, sx, sy, alt.x, alt.y, nav.clear, nav.step, enterCost, undefined, hScale);
+      if (raw) {
+        gx = alt.x;
+        gy = alt.y;
+        break;
+      }
+    }
+  }
   if (!raw) return null;
   const los = costAwareLos(map, nav.los, costMode, counts);
-  return pullString({ x: sx, y: sy }, raw, los);
+  return pullString(
+    { x: sx, y: sy },
+    raw,
+    los,
+    costMode ? pullCap(map, { x: sx, y: sy }, raw) : undefined,
+  );
 }
 
 /**
@@ -408,6 +477,15 @@ function crowdCounts(
   return counts;
 }
 
+/**
+ * `clear` extended to reject tiles covered by `counts` — used by arrival
+ * snapping so a "taken" goal cell is skipped for a genuinely free neighbor.
+ */
+function freeTile(map: GameMap, clear: Passable, counts: Uint16Array | null): Passable {
+  if (!counts) return clear;
+  return (x, y) => clear(x, y) && counts[idx(map, x, y)]! === 0;
+}
+
 /** The three walkability checks every search/smoothing pair shares. */
 interface NavFns {
   /** Tile-level predicate used by A*. */
@@ -441,17 +519,96 @@ function navFns(map: GameMap, blocked: Uint8Array, radius: number): NavFns {
  * later waypoint are dropped, so units walk straight segments instead of the
  * raw staircase. `los` must match the rules the path was searched with.
  */
-function pullString(start: Tile, raw: readonly Tile[], los: (a: Tile, b: Tile) => boolean): Tile[] {
+function pullString(
+  start: Tile,
+  raw: readonly Tile[],
+  los: (a: Tile, b: Tile) => boolean,
+  cap?: PullCap,
+): Tile[] {
   const pts: Tile[] = [start, ...raw];
   const out: Tile[] = [];
   let i = 0;
   while (i < pts.length - 1) {
     let j = pts.length - 1;
-    while (j > i + 1 && !los(pts[i]!, pts[j]!)) j--;
+    while (
+      j > i + 1 &&
+      !(
+        los(pts[i]!, pts[j]!) &&
+        (!cap || cap.segCost(pts[i]!, pts[j]!) <= cap.cum[j]! - cap.cum[i]! + EPS)
+      )
+    ) {
+      j--;
+    }
     out.push(pts[j]!);
     i = j;
   }
   return out;
+}
+
+/**
+ * Terrain-cost guard for string pulling in cost mode: `cum[k]` is the exact
+ * terrain cost the raw path paid to reach pts[k] (pts[0] is the start), and
+ * `segCost` prices a straight shortcut the same way. A shortcut may only
+ * replace the sub-path it spans when it costs no more — without this check
+ * smoothing would snap a cheap road detour right back onto the straight but
+ * pricier grass line.
+ */
+interface PullCap {
+  cum: number[];
+  segCost: (a: Tile, b: Tile) => number;
+}
+
+function pullCap(map: GameMap, start: Tile, raw: readonly Tile[]): PullCap {
+  const pts: Tile[] = [start, ...raw];
+  const cum: number[] = new Array(pts.length).fill(0);
+  for (let k = 1; k < pts.length; k++) {
+    const a = pts[k - 1]!;
+    const b = pts[k]!;
+    cum[k] =
+      cum[k - 1]! +
+      (a.x !== b.x && a.y !== b.y ? SQRT2 : 1) * tileCost(map.tiles[idx(map, b.x, b.y)]!);
+  }
+  return {
+    cum,
+    segCost: (a, b) => segmentTileCost(map, a.x, a.y, b.x, b.y),
+  };
+}
+
+/**
+ * Terrain cost of walking the supercover line between tile centers, charged
+ * per entered cell exactly like the A* enter cost (diagonal arrivals pay
+ * SQRT2x the entered tile; corner-touched side cells are not entered).
+ */
+function segmentTileCost(map: GameMap, ax: number, ay: number, bx: number, by: number): number {
+  let x = ax;
+  let y = ay;
+  let cost = 0;
+  const sx = Math.sign(bx - ax);
+  const sy = Math.sign(by - ay);
+  const adx = Math.abs(bx - ax);
+  const ady = Math.abs(by - ay);
+  let nx = 1;
+  let ny = 1;
+  while (x !== bx || y !== by) {
+    const tx = nx * ady;
+    const ty = ny * adx;
+    if (tx < ty) {
+      x += sx;
+      nx += 2;
+      cost += tileCost(map.tiles[idx(map, x, y)]!);
+    } else if (ty < tx) {
+      y += sy;
+      ny += 2;
+      cost += tileCost(map.tiles[idx(map, x, y)]!);
+    } else {
+      x += sx;
+      y += sy;
+      nx += 2;
+      ny += 2;
+      cost += SQRT2 * tileCost(map.tiles[idx(map, x, y)]!);
+    }
+  }
+  return cost;
 }
 
 /**
@@ -721,7 +878,12 @@ const GROUP_AVOID_COST = 1.5;
  * `shape` picks the slot layout: 'ring' (default) packs the nearest cells in
  * every direction, 'wide' fills along the x-axis first (a horizontal line —
  * units shoulder to shoulder), 'narrow' fills along the y-axis first (a
- * column for threading corridors).
+ * column for threading corridors), and 'wedge' fills a V trailing `dir`:
+ * the target is the tip and each successive rank is one step deeper and one
+ * tile wider on each wing.
+ *
+ * `dir` only matters for 'wedge': the facing direction the formation points
+ * (snapped to the nearest of the 8 compass directions). Default is +x.
  */
 export function formationSlots(
   target: Tile,
@@ -729,15 +891,16 @@ export function formationSlots(
   map: GameMap,
   radius = 0,
   shape: FormationShape = 'ring',
+  dir?: Tile,
 ): Tile[] {
   if (count <= 0) return [];
   const blocked = blockedMask(map, []);
   const nav = navFns(map, blocked, radius);
-  return ringSlots(map, target, count, nav.clear, shape);
+  return ringSlots(map, target, count, nav.clear, shape, dir);
 }
 
-/** Slot layout for {@link formationSlots} and {@link findPathGroup}. */
-export type FormationShape = 'ring' | 'wide' | 'narrow';
+/** Slot layout for {@link formationSlots} and {@link findPathsGroup}. */
+export type FormationShape = 'ring' | 'wide' | 'narrow' | 'wedge';
 
 /**
  * Ring-by-ring scan for `count` unique cells near `target` satisfying
@@ -751,29 +914,43 @@ function ringSlots(
   count: number,
   passable: Passable,
   shape: FormationShape = 'ring',
+  dir?: Tile,
 ): Tile[] {
   const out: Tile[] = [];
   const maxR = Math.max(map.w, map.h);
   if (shape !== 'ring') {
-    // Line formations rank by off-axis distance first, so a far on-axis cell
-    // beats a near off-axis one — the ring loop can't express that, gather
-    // every candidate and sort once.
+    // Ranked layouts can't be expressed as a ring scan, so gather every
+    // candidate and sort once. Line formations rank by off-axis distance
+    // first (a far on-axis cell beats a near off-axis one); the wedge ranks
+    // by V depth — how far behind the tip a cell trails its wings.
     const all: Tile[] = [];
     for (let y = 0; y < map.h; y++) {
       for (let x = 0; x < map.w; x++) {
         if (passable(x, y)) all.push({ x, y });
       }
     }
-    const off = (t: Tile) => (shape === 'wide' ? Math.abs(t.y - target.y) : Math.abs(t.x - target.x));
-    all.sort(
-      (a, b) =>
-        off(a) - off(b) ||
-        (a.x - target.x) ** 2 +
-          (a.y - target.y) ** 2 -
-          ((b.x - target.x) ** 2 + (b.y - target.y) ** 2) ||
-        a.y - b.y ||
-        a.x - b.x,
-    );
+    const dist2 = (t: Tile) => (t.x - target.x) ** 2 + (t.y - target.y) ** 2;
+    if (shape === 'wedge') {
+      const d = snapDir8(dir ?? { x: 1, y: 0 });
+      const fwd = (t: Tile) => (t.x - target.x) * d.x + (t.y - target.y) * d.y;
+      const lat = (t: Tile) => Math.abs((t.x - target.x) * -d.y + (t.y - target.y) * d.x);
+      // Depth of a V rank: how far the cell sits behind the tip. Only cells
+      // inside the chevron cone (no wider than they are deep) rank by that
+      // depth; everything outside — ahead of the tip, or flaring past the
+      // cone — pays a heavy surcharge so it fills in only once the V itself
+      // runs out of room.
+      const depth = (t: Tile) => {
+        const f = fwd(t);
+        const behind = Math.max(0, -f);
+        const outside = f > 0 ? f * 8 + lat(t) : Math.max(0, lat(t) - behind);
+        return behind + outside * 64;
+      };
+      all.sort((a, b) => depth(a) - depth(b) || lat(a) - lat(b) || dist2(a) - dist2(b) || a.y - b.y || a.x - b.x);
+    } else {
+      const off = (t: Tile) =>
+        shape === 'wide' ? Math.abs(t.y - target.y) : Math.abs(t.x - target.x);
+      all.sort((a, b) => off(a) - off(b) || dist2(a) - dist2(b) || a.y - b.y || a.x - b.x);
+    }
     for (const t of all) {
       if (out.length >= count) break;
       out.push(t);
@@ -809,12 +986,20 @@ function ringSlots(
   return out;
 }
 
-/** Options for {@link findPathGroup}; extends the findPathSmooth options. */
+/** Snap a vector to the nearest of the 8 compass directions (unit length). */
+function snapDir8(d: Tile): Tile {
+  const angle = Math.round(Math.atan2(d.y, d.x) / (Math.PI / 4)) * (Math.PI / 4);
+  return { x: Math.cos(angle), y: Math.sin(angle) };
+}
+
+/** Options for {@link findPathsGroup}; extends the findPathSmooth options. */
 export interface GroupPathOptions extends SmoothPathOptions {
   /**
    * Soft cost added when a path enters a tile an earlier group path already
-   * occupies. Positive values spread units across lanes without ever making
-   * a busy tile truly impassable. Default {@link GROUP_AVOID_COST}.
+   * occupies — a prediction of congestion, since those tiles will be taken
+   * by the time later units arrive. Positive values spread units across
+   * lanes without ever making a busy tile truly impassable. Default
+   * {@link GROUP_AVOID_COST}.
    */
   avoidCost?: number;
   /**
@@ -825,12 +1010,18 @@ export interface GroupPathOptions extends SmoothPathOptions {
   nodeBudget?: number;
   /**
    * Slot layout passed to formationSlots: 'ring' (default), 'wide' for a
-   * horizontal line, 'narrow' for a column.
+   * horizontal line, 'narrow' for a column, 'wedge' for a V facing `dir`.
    */
   formation?: FormationShape;
+  /**
+   * Facing direction for 'wedge' formations, snapped to the nearest compass
+   * direction. Defaults to the group's travel direction — from the centroid
+   * of `starts` toward `target` — so the V trails behind the advance.
+   */
+  dir?: Tile;
 }
 
-/** Result of {@link findPathGroup}. */
+/** Result of {@link findPathsGroup}. */
 export interface GroupPaths {
   /**
    * One path per start, aligned with `starts`, same contract as
@@ -847,14 +1038,17 @@ export interface GroupPaths {
 /**
  * Path a group of units toward one rally point without piling onto it: every
  * unit is assigned a distinct {@link formationSlots} destination, then routed
- * one after another through the shared A* core. Tiles a committed path sweeps
- * add a soft `avoidCost` penalty for later units so columns pick different
- * lanes instead of stacking on one corridor. A single node budget covers the
- * whole call; exceeding it discards the coordinated search and re-routes each
- * unit with plain findPathSmooth to its slot (`degraded: true`). No entry is
- * ever thrown — unreachable units get null.
+ * through the shared A* core. One multi-source Dijkstra flood from every slot
+ * builds a shared distance field — the exact terrain-aware cost to reach the
+ * nearest slot — that serves as each unit's A* heuristic, so a single full-
+ * map pass replaces most of the per-unit search work. Tiles a committed path
+ * sweeps add a soft `avoidCost` penalty for later units so columns pick
+ * different lanes instead of stacking on one corridor. A single node budget
+ * covers the whole call; exceeding it discards the coordinated search and
+ * re-routes each unit with plain findPathSmooth to its slot
+ * (`degraded: true`). No entry is ever thrown — unreachable units get null.
  */
-export function findPathGroup(
+export function findPathsGroup(
   map: GameMap,
   starts: readonly Tile[],
   target: Tile,
@@ -872,7 +1066,10 @@ export function findPathGroup(
   const costMode = opts.terrainCost === true;
   const blocked = blockedMask(map, opts.blockers ?? [], costMode);
   const nav = navFns(map, blocked, opts.radius ?? 0);
-  const slots = ringSlots(map, target, n, nav.clear, opts.formation ?? 'ring');
+  const dir =
+    opts.dir ??
+    (opts.formation === 'wedge' ? groupHeading(starts, target) : undefined);
+  const slots = ringSlots(map, target, n, nav.clear, opts.formation ?? 'ring', dir);
   if (slots.length === 0) return none([]);
 
   // Assign each unit its nearest free slot.
@@ -895,28 +1092,50 @@ export function findPathGroup(
   const occupied = new Uint16Array(map.w * map.h);
   const counts = crowdCounts(map, opts.crowd, opts.crowdRadius ?? 1);
   const soft = makeEnterCost(map, costMode, counts, opts.crowdCost ?? CROWD_COST);
-  const hScale = costMode ? MIN_TERRAIN_COST : 1;
-  const los = costAwareLos(map, nav.los, costMode, counts);
+  const losBase = costAwareLos(map, nav.los, costMode, counts);
+  // Smoothing must respect predicted congestion too: a pulled segment that
+  // sweeps a tile an earlier group path committed to would undo the detour
+  // the soft-avoid search just paid for.
+  const los = (a: Tile, b: Tile) =>
+    losBase(a, b) &&
+    supercoverWalk(map, a.x, a.y, b.x, b.y, (x, y) => !occupied[idx(map, x, y)]);
   const enterCost = (x: number, y: number, base: number) =>
     occupied[idx(map, x, y)]! * avoid + (soft ? soft(x, y, base) : 0);
+  // Shared heuristic: exact terrain-aware cost to the nearest slot, one
+  // flood fill for the whole group. Soft penalties only ever add to the
+  // true remaining cost, so the field stays admissible for every unit.
+  const field = slotField(map, assigned, nav, costMode, budget);
+  const clearFree = freeTile(map, nav.clear, counts);
+  const snapR = opts.snapRadius ?? 0;
   const paths: (Tile[] | null)[] = new Array(n).fill(null);
-  let degraded = false;
+  let degraded = field === null;
 
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; !degraded && i < n; i++) {
     const s = starts[i]!;
     let g = assigned[i]!;
     if (!inBounds(map, s.x, s.y)) continue;
+    if (snapR > 0 && counts && counts[idx(map, g.x, g.y)]! > 0) {
+      // Slot is predicted to be taken: re-attach to the nearest free tile
+      // inside the arrival tolerance.
+      const alt = nearestPassable(map, g.x, g.y, clearFree, snapR);
+      if (alt) {
+        g = alt;
+        assigned[i] = alt;
+      }
+    }
     let raw: Tile[] | null = null;
     if (s.x === g.x && s.y === g.y) {
       raw = [];
     } else {
-      raw = astar(map, s.x, s.y, g.x, g.y, nav.clear, nav.step, enterCost, budget, hScale);
+      raw = astar(map, s.x, s.y, g.x, g.y, nav.clear, nav.step, enterCost, budget, 1, field!);
       if (!raw && budget.left > 0) {
         // Slot sits in a pocket the unit can't reach: retry the walkable
         // tile nearest the original target.
         const alt = nearestPassable(map, target.x, target.y, nav.clear);
         if (alt && (alt.x !== g.x || alt.y !== g.y)) {
-          raw = astar(map, s.x, s.y, alt.x, alt.y, nav.clear, nav.step, enterCost, budget, hScale);
+          raw = astar(
+            map, s.x, s.y, alt.x, alt.y, nav.clear, nav.step, enterCost, budget, 1, field!,
+          );
           if (raw) {
             g = alt;
             assigned[i] = alt;
@@ -931,7 +1150,7 @@ export function findPathGroup(
       }
       continue;
     }
-    const path = pullString(s, raw, los);
+    const path = pullString(s, raw, los, costMode ? pullCap(map, s, raw) : undefined);
     paths[i] = path;
     markPathTiles(map, occupied, s, path);
   }
@@ -945,6 +1164,85 @@ export function findPathGroup(
     }
   }
   return { paths, slots: assigned, degraded };
+}
+
+/**
+ * Backwards-compatible alias for {@link findPathsGroup} — the original
+ * group-pathing export predates the pluralized name; both share one
+ * implementation and result contract.
+ */
+export function findPathGroup(
+  map: GameMap,
+  starts: readonly Tile[],
+  target: Tile,
+  opts: GroupPathOptions = {},
+): GroupPaths {
+  return findPathsGroup(map, starts, target, opts);
+}
+
+/** Wedge facing for {@link findPathsGroup}: from the start centroid to target. */
+function groupHeading(starts: readonly Tile[], target: Tile): Tile {
+  let cx = 0;
+  let cy = 0;
+  for (const s of starts) {
+    cx += s.x;
+    cy += s.y;
+  }
+  return { x: target.x - cx / starts.length, y: target.y - cy / starts.length };
+}
+
+/**
+ * Multi-source Dijkstra flood from every `slot`: dist[i] becomes the exact
+ * terrain-aware cost of walking tile i to the nearest slot under the same
+ * movement rules A* uses (no corner cutting, same step clearance). Used as
+ * a shared heuristic by every unit's search — one map-wide pass instead of
+ * a full A* per unit. Returns null when `budget` runs out mid-flood.
+ */
+function slotField(
+  map: GameMap,
+  slots: readonly Tile[],
+  nav: NavFns,
+  costMode: boolean,
+  budget: { left: number },
+): Float64Array | null {
+  const dist = new Float64Array(map.w * map.h).fill(Infinity);
+  const closed = new Uint8Array(map.w * map.h);
+  const open = new Heap(dist);
+  for (const s of slots) {
+    const i = idx(map, s.x, s.y);
+    if (dist[i] !== 0) {
+      dist[i] = 0;
+      open.push(i);
+    }
+  }
+  while (open.size > 0) {
+    if (budget.left <= 0) return null;
+    const cur = open.pop();
+    if (closed[cur]) continue;
+    closed[cur] = 1;
+    budget.left--;
+    const cx = cur % map.w;
+    const cy = (cur / map.w) | 0;
+    for (const [dx, dy, base] of DIRS) {
+      const nx = cx + dx;
+      const ny = cy + dy;
+      if (!nav.clear(nx, ny)) continue;
+      // Same no-corner-cutting rule as the A* core, so the field matches
+      // the reachability the unit searches will actually see.
+      if (dx !== 0 && dy !== 0) {
+        if (!nav.clear(cx + dx, cy) || !nav.clear(cx, cy + dy)) continue;
+      }
+      if (nav.step && !nav.step(cx, cy, nx, ny)) continue;
+      const ni = idx(map, nx, ny);
+      // Reverse-walking into (nx,ny) pays the forward enter cost of nx,ny.
+      const nd = dist[cur]! + base * (costMode ? tileCost(map.tiles[ni]!) : 1);
+      if (nd < dist[ni]!) {
+        dist[ni] = nd;
+        open.push(ni);
+      }
+    }
+  }
+  return dist;
 }
 
 /**

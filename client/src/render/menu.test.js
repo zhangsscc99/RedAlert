@@ -4,6 +4,20 @@ import assert from "node:assert/strict";
 
 // src/game/grid.ts
 var TILE_SIZE = 32;
+var GRASS = 0;
+var WATER = 1;
+var ORE = 2;
+
+// src/game/pathfind.ts
+var ROAD = 3;
+var TERRAIN_COSTS = {
+  [ROAD]: 0.6,
+  [GRASS]: 1,
+  [ORE]: 3,
+  [WATER]: Infinity
+};
+var COST_GRASS = TERRAIN_COSTS[GRASS];
+var MIN_TERRAIN_COST = Math.min(TERRAIN_COSTS[ROAD], COST_GRASS, TERRAIN_COSTS[ORE]);
 
 // src/game/units.ts
 var UNIT_STATS = {

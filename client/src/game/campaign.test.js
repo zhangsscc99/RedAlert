@@ -448,6 +448,17 @@ function bestStars(p, missionId) {
   return isStar(v) ? v : 0;
 }
 
+// src/game/pathfind.ts
+var ROAD = 3;
+var TERRAIN_COSTS = {
+  [ROAD]: 0.6,
+  [GRASS]: 1,
+  [ORE]: 3,
+  [WATER]: Infinity
+};
+var COST_GRASS = TERRAIN_COSTS[GRASS];
+var MIN_TERRAIN_COST = Math.min(TERRAIN_COSTS[ROAD], COST_GRASS, TERRAIN_COSTS[ORE]);
+
 // src/game/units.ts
 var UNIT_STATS = {
   infantry: { hp: 50, speed: 70, cost: 100, buildTime: 4, radius: 9, canHarvest: false },
