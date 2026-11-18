@@ -11,7 +11,8 @@ export type Gesture =
   | { type: 'longpress'; x: number; y: number }
   | { type: 'dragbox'; from: Point; to: Point } // single-finger drag → box select
   | { type: 'pan'; dx: number; dy: number } // two fingers moving together
-  | { type: 'pinch'; center: Point; scale: number }; // relative to previous frame
+  | { type: 'pinch'; center: Point; scale: number } // relative to previous frame
+  | { type: 'doubletap'; x: number; y: number }; // two quick taps — e.g. center camera
 
 export interface GestureRecognizerOpts {
   /** Single-finger displacement (px) that turns a pending touch into a dragbox. */
@@ -20,6 +21,10 @@ export interface GestureRecognizerOpts {
   longPressMs?: number;
   /** Max drift (px) that still allows a longpress to fire. */
   longPressMoveTolerance?: number;
+  /** Max gap (ms) between two taps for them to count as a doubletap. */
+  doubleTapMs?: number;
+  /** Max distance (px) between the two taps of a doubletap. */
+  doubleTapPx?: number;
 }
 
 type Phase = 'pending' | 'drag' | 'consumed';
@@ -55,10 +60,15 @@ export function createGestureRecognizer(opts: GestureRecognizerOpts = {}): Gestu
   const dragThreshold = opts.dragThresholdPx ?? 10;
   const longPressMs = opts.longPressMs ?? 500;
   const lpTolerance = opts.longPressMoveTolerance ?? 12;
+  const doubleTapMs = opts.doubleTapMs ?? 300;
+  const doubleTapPx = opts.doubleTapPx ?? 24;
 
   const pts = new Map<number, Tracked>(); // active pointers (max 2)
   const ignored = new Set<number>(); // 3rd+ fingers: counted, no-op
   let outbox: Gesture[] = []; // pan/pinch queued during move, drained by tick/up
+
+  // Last emitted tap — a second nearby tap inside the window is a doubletap.
+  let lastTap: { x: number; y: number; t: number } | null = null;
 
   // Two-finger reference frame (midpoint + spread from the previous move).
   let prevMid: Point = { x: 0, y: 0 };
@@ -144,8 +154,10 @@ export function createGestureRecognizer(opts: GestureRecognizerOpts = {}): Gestu
       // and the longpress tolerance. With the defaults (10 < 12) a hold that
       // wobbles 10-12px used to be claimed by box-select before the longpress
       // could fire; now the longpress keeps its full tolerance window.
+      // 'consumed' here means the longpress already fired — keep holding and
+      // dragging enters box-select anchored at the longpress point (长按框选).
       if (
-        p.phase === 'pending' &&
+        (p.phase === 'pending' || p.phase === 'consumed') &&
         dist({ x: p.sx, y: p.sy }, p) >= Math.max(dragThreshold, lpTolerance)
       ) {
         p.phase = 'drag'; // becomes a box-select drag; longpress is off the table
@@ -169,7 +181,19 @@ export function createGestureRecognizer(opts: GestureRecognizerOpts = {}): Gestu
       } else if (p.phase === 'pending') {
         const dur = t - p.downT;
         const d = dist({ x: p.sx, y: p.sy }, p);
-        if (d < dragThreshold && dur < longPressMs) out.push({ type: 'tap', x: p.x, y: p.y });
+        if (d < dragThreshold && dur < longPressMs) {
+          if (
+            lastTap &&
+            t - lastTap.t <= doubleTapMs &&
+            Math.hypot(p.x - lastTap.x, p.y - lastTap.y) <= doubleTapPx
+          ) {
+            lastTap = null; // consumed — a third tap starts a fresh pair
+            out.push({ type: 'doubletap', x: p.x, y: p.y });
+          } else {
+            lastTap = { x: p.x, y: p.y, t };
+            out.push({ type: 'tap', x: p.x, y: p.y });
+          }
+        }
         else if (d < lpTolerance && dur >= longPressMs)
           out.push({ type: 'longpress', x: p.x, y: p.y });
       }

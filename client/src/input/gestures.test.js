@@ -8,9 +8,12 @@ function createGestureRecognizer(opts = {}) {
   const dragThreshold = opts.dragThresholdPx ?? 10;
   const longPressMs = opts.longPressMs ?? 500;
   const lpTolerance = opts.longPressMoveTolerance ?? 12;
+  const doubleTapMs = opts.doubleTapMs ?? 300;
+  const doubleTapPx = opts.doubleTapPx ?? 24;
   const pts = /* @__PURE__ */ new Map();
   const ignored = /* @__PURE__ */ new Set();
   let outbox = [];
+  let lastTap = null;
   let prevMid = { x: 0, y: 0 };
   let prevSpread = 0;
   const twoFinger = () => pts.size === 2;
@@ -76,7 +79,7 @@ function createGestureRecognizer(opts = {}) {
         prevSpread = f.spread;
         return;
       }
-      if (p.phase === "pending" && dist({ x: p.sx, y: p.sy }, p) >= Math.max(dragThreshold, lpTolerance)) {
+      if ((p.phase === "pending" || p.phase === "consumed") && dist({ x: p.sx, y: p.sy }, p) >= Math.max(dragThreshold, lpTolerance)) {
         p.phase = "drag";
       }
     },
@@ -95,8 +98,15 @@ function createGestureRecognizer(opts = {}) {
       } else if (p.phase === "pending") {
         const dur = t - p.downT;
         const d = dist({ x: p.sx, y: p.sy }, p);
-        if (d < dragThreshold && dur < longPressMs) out.push({ type: "tap", x: p.x, y: p.y });
-        else if (d < lpTolerance && dur >= longPressMs)
+        if (d < dragThreshold && dur < longPressMs) {
+          if (lastTap && t - lastTap.t <= doubleTapMs && Math.hypot(p.x - lastTap.x, p.y - lastTap.y) <= doubleTapPx) {
+            lastTap = null;
+            out.push({ type: "doubletap", x: p.x, y: p.y });
+          } else {
+            lastTap = { x: p.x, y: p.y, t };
+            out.push({ type: "tap", x: p.x, y: p.y });
+          }
+        } else if (d < lpTolerance && dur >= longPressMs)
           out.push({ type: "longpress", x: p.x, y: p.y });
       }
       return out;
@@ -317,4 +327,52 @@ test("custom thresholds are honored", () => {
   assert.equal(g.dragBox, null);
   const out = g.up(1, 15, 0, T0 + 100);
   assert.equal(out[0].type, "tap");
+});
+test("longpress \u2192 keep holding and drag emits a box anchored at the press point", () => {
+  const g = createGestureRecognizer();
+  g.down(1, 50, 50, T0);
+  g.tick(T0 + 520);
+  g.move(1, 55, 52, T0 + 560);
+  assert.equal(g.dragBox, null);
+  g.move(1, 90, 80, T0 + 600);
+  assert.deepEqual(g.dragBox, { from: { x: 50, y: 50 }, to: { x: 90, y: 80 } });
+  const out = g.up(1, 90, 80, T0 + 650);
+  assert.equal(out.length, 1);
+  assert.deepEqual(out[0], {
+    type: "dragbox",
+    from: { x: 50, y: 50 },
+    to: { x: 90, y: 80 }
+  });
+});
+test("longpress \u2192 release without dragging still emits nothing extra", () => {
+  const g = createGestureRecognizer();
+  g.down(1, 50, 50, T0);
+  g.tick(T0 + 520);
+  assert.deepEqual(g.up(1, 55, 52, T0 + 560), []);
+});
+test("doubletap: second quick tap at the same spot emits doubletap, not tap", () => {
+  const g = createGestureRecognizer();
+  g.down(1, 100, 100, T0);
+  assert.equal(g.up(1, 100, 100, T0 + 80)[0].type, "tap");
+  g.down(1, 105, 98, T0 + 150);
+  const out = g.up(1, 104, 99, T0 + 220);
+  assert.equal(out.length, 1);
+  assert.deepEqual(out[0], { type: "doubletap", x: 104, y: 99 });
+});
+test("doubletap: too slow or too far apart stays two taps", () => {
+  const g = createGestureRecognizer();
+  g.down(1, 0, 0, T0);
+  assert.equal(g.up(1, 0, 0, T0 + 50)[0].type, "tap");
+  g.down(1, 0, 0, T0 + 500);
+  assert.equal(g.up(1, 0, 0, T0 + 560)[0].type, "tap");
+  g.down(1, 100, 0, T0 + 600);
+  assert.equal(g.up(1, 100, 0, T0 + 650)[0].type, "tap");
+});
+test("doubletap: a third quick tap starts a fresh pair", () => {
+  const g = createGestureRecognizer();
+  for (const [i, want] of ["tap", "doubletap", "tap"].entries()) {
+    g.down(1, 10, 10, T0 + i * 200);
+    const out = g.up(1, 10, 10, T0 + i * 200 + 60);
+    assert.equal(out[0].type, want);
+  }
 });
