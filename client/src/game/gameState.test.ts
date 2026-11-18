@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { WATER } from './grid.js';
+import { ORE, WATER, countTerrain } from './grid.js';
 import { UNIT_STATS } from './units.js';
 import { BUILDING_DEFS, canPlace, type BuildingKind } from './buildings.js';
 import {
@@ -32,6 +32,18 @@ function legalSpot(g: GameState, kind: BuildingKind): { x: number; y: number } {
     }
   }
   throw new Error('no legal spot found');
+}
+
+/** Tick `seconds` of game time in fixed `dt` steps. */
+function run(g: GameState, seconds: number, dt = 0.25): void {
+  for (let t = 0; t < seconds; t += dt) tickGame(g, dt);
+}
+
+/** Place `kind` at the first legal spot found; asserts the build succeeded. */
+function buildKind(g: GameState, kind: BuildingKind): void {
+  const s = legalSpot(g, kind);
+  const r = buildAt(g, kind, s.x, s.y);
+  assert.ok(r.ok, `buildAt ${kind} failed`);
 }
 
 test('createGame is deterministic for the same seed', () => {
@@ -226,4 +238,101 @@ test('restart returns a fresh playing state with the same seed', () => {
   assert.equal(g2.elapsed, 0);
   assert.equal(g2.economy.credits, 5000);
   assert.deepEqual(snap(g2), snap(createGame(7)));
+});
+
+test('refinery + harvester grows funds past the harvester cost and shrinks ore', () => {
+  // enemyBase off + one idle guard: a quiet sandbox that stays 'playing'.
+  const g = createGame(7, { credits: 50000, enemyBase: false, enemyInfantry: 1 });
+  assert.ok(g.enemyUnits.length > 0, 'sandbox guard keeps the game playing');
+  const ore0 = countTerrain(g.map, ORE);
+  assert.ok(ore0 > 0, 'map generated ore');
+
+  buildKind(g, 'power'); // keep the grid fed so construction runs at full speed
+  buildKind(g, 'barracks');
+  buildKind(g, 'refinery');
+  run(g, BUILDING_DEFS.refinery.buildTime + 1);
+  assert.ok(g.buildings.find((b) => b.kind === 'refinery')!.done);
+
+  assert.ok(trainUnit(g, 'harvester').ok);
+  run(g, UNIT_STATS.harvester.buildTime + 1);
+  const harv = g.units.find((u) => u.kind === 'harvester');
+  assert.ok(harv, 'harvester unit spawned');
+  assert.equal(g.harvesters.length, 1);
+  assert.equal(g.harvesters[0]!.unit.id, harv.id, 'harvester aligned by unit id');
+
+  const c0 = g.economy.credits; // post-spend: growth below is pure income
+  run(g, 240);
+  assert.ok(
+    g.economy.credits - c0 > UNIT_STATS.harvester.cost,
+    `expected funds to grow by more than ${UNIT_STATS.harvester.cost}, got ${g.economy.credits - c0}`,
+  );
+  assert.ok(countTerrain(g.map, ORE) < ore0, 'mining depleted at least one ore tile');
+});
+
+test('harvester without a refinery produces no income', () => {
+  const g = createGame(7, { credits: 50000, enemyBase: false, enemyInfantry: 1 });
+  buildKind(g, 'power');
+  buildKind(g, 'barracks');
+  run(g, BUILDING_DEFS.barracks.buildTime + 1);
+  assert.ok(trainUnit(g, 'harvester').ok);
+  run(g, UNIT_STATS.harvester.buildTime + 1);
+  assert.equal(g.harvesters.length, 1);
+
+  const earned0 = g.economy.earned;
+  const credits0 = g.economy.credits;
+  run(g, 120);
+  assert.equal(g.economy.earned, earned0, 'no refinery: no trickle, no unloading');
+  assert.equal(g.economy.credits, credits0);
+  assert.equal(g.harvesters[0]!.state, 'idle');
+});
+
+test('low power stretches production time vs a fed grid', () => {
+  const opts = { credits: 99999, enemyBase: false, enemyInfantry: 1 };
+
+  // Fed grid: HQ + power plant covers the barracks draw → factor 1.
+  const fast = createGame(11, opts);
+  buildKind(fast, 'power');
+  buildKind(fast, 'barracks');
+  run(fast, BUILDING_DEFS.barracks.buildTime + 1);
+
+  // Starved grid: HQ alone vs barracks + two refineries → factor 0.3.
+  const slow = createGame(11, opts);
+  buildKind(slow, 'barracks');
+  buildKind(slow, 'refinery');
+  buildKind(slow, 'refinery');
+  run(slow, BUILDING_DEFS.barracks.buildTime / 0.3 + 2);
+
+  assert.ok(fast.buildings.find((b) => b.kind === 'barracks')!.done);
+  assert.ok(slow.buildings.find((b) => b.kind === 'barracks')!.done);
+
+  const n0 = fast.units.length;
+  assert.equal(slow.units.length, n0, 'same seed and opts → same starting army');
+  assert.ok(trainUnit(fast, 'infantry').ok);
+  assert.ok(trainUnit(slow, 'infantry').ok);
+
+  // 5s of queue time: finishes at factor 1, only ~1/3 progress at factor 0.3.
+  run(fast, UNIT_STATS.infantry.buildTime + 1);
+  run(slow, UNIT_STATS.infantry.buildTime + 1);
+  assert.equal(fast.units.length, n0 + 1, 'fed grid finished the infantry');
+  assert.equal(slow.units.length, n0, 'brownout still working on it');
+
+  run(slow, UNIT_STATS.infantry.buildTime * 3); // comfortably past 4 / 0.3
+  assert.equal(slow.units.length, n0 + 1, 'brownout finishes eventually');
+});
+
+test('same seed and same inputs produce identical credits', () => {
+  const play = (): GameState => {
+    const g = createGame(31, { credits: 50000, enemyBase: false, enemyInfantry: 1 });
+    buildKind(g, 'power');
+    buildKind(g, 'barracks');
+    buildKind(g, 'refinery');
+    run(g, 30);
+    trainUnit(g, 'harvester');
+    run(g, 120);
+    return g;
+  };
+  const a = play();
+  const b = play();
+  assert.equal(a.economy.credits, b.economy.credits);
+  assert.deepEqual(snap(a), snap(b));
 });
