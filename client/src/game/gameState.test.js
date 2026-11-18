@@ -1436,6 +1436,22 @@ var AI_LEVEL_EXPAND_PACE = [1, 0.9, 0.8, 0.65];
 var AI_LEVEL_SCREEN = [0, 1, 2, 3];
 var AI_LEVEL_TANK_BIAS = [1, 1.15, 1.35, 1.6];
 var AI_LEVEL_RAID_PACE = [1, 0.8, 0.6, 0.45];
+var AI_FLANK_SHARE = 0.4;
+var AI_FLANK_MIN = 3;
+var AI_PIN_MIN = 4;
+var AI_HEAL_RATIO = 0.7;
+var AI_DENSITY_RADIUS = 6 * TILE_SIZE;
+var AI_DENSITY_WEIGHT = 0.5;
+var AI_OBJECTIVE_VALUE = {
+  refinery: 5,
+  barracks: 4,
+  power: 3,
+  hq: 6,
+  turret: 2,
+  wall: 0.5
+};
+var AI_ARTILLERY = { minLevel: 2, cooldown: 25, damage: 60, radius: 96 };
+var AI_AIRSTRIKE = { minLevel: 3, cooldown: 45, damage: 120, radius: 64 };
 var EXPAND_WANT = {
   refinery: [1, 1, 1, 2, 2, 2, 2],
   barracks: [0, 1, 1, 1, 1, 2, 2],
@@ -1458,8 +1474,11 @@ var AI_ARMOR = {
 function armorOfUnitKind(kind) {
   return AI_ARMOR[kind];
 }
+function isUnitKind(kind) {
+  return kind === "infantry" || kind === "tank" || kind === "harvester";
+}
 function armorOfKind(kind) {
-  return kind === "infantry" || kind === "tank" || kind === "harvester" ? AI_ARMOR[kind] : "building";
+  return isUnitKind(kind) ? AI_ARMOR[kind] : "building";
 }
 function createAIState(seed, incomeScale = 1, opts = {}) {
   const difficulty = opts.difficulty ?? "normal";
@@ -1469,7 +1488,8 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
   const musterSize = opts.musterSize ?? Math.max(2, Math.round(AI_ARMY_PER_WAVE * sizeScale));
   const rawLevel = opts.level ?? 0;
   const level = Number.isFinite(rawLevel) ? Math.max(0, Math.min(AI_MAX_LEVEL, Math.floor(rawLevel))) : 0;
-  const adaptive = (opts.adaptive ?? false) || level > 0;
+  const coordinated = opts.coordinated ?? false;
+  const adaptive = (opts.adaptive ?? false) || level > 0 || coordinated;
   const tactics = (opts.tactics ?? false) || adaptive;
   return {
     phase: "gather",
@@ -1489,7 +1509,9 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
     spotted: false,
     scoutSent: false,
     retreatSent: false,
-    retreatRatio: opts.retreatRatio ?? (tactics ? AI_RETREAT_BY_DIFFICULTY[difficulty] : AI_RETREAT_RATIO),
+    // Coordinated mode falls back at the flat 35% spec threshold; plain
+    // tactics keeps its per-difficulty scale.
+    retreatRatio: opts.retreatRatio ?? (coordinated || !tactics ? AI_RETREAT_RATIO : AI_RETREAT_BY_DIFFICULTY[difficulty]),
     expand: opts.expandBase ?? false,
     ticks: 0,
     buildings: { refinery: 0, barracks: 0, turret: 0 },
@@ -1518,7 +1540,15 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
     raiders: 0,
     raidRecalled: false,
     raidPos: null,
-    wavePeak: 0
+    wavePeak: 0,
+    coordinated,
+    flankers: 0,
+    healRatio: opts.healRatio ?? AI_HEAL_RATIO,
+    objective: null,
+    defenses: [],
+    map: opts.map ?? null,
+    artilleryCd: 0,
+    airstrikeCd: 0
   };
 }
 function stepAI(s, dt, intel) {
@@ -1547,6 +1577,11 @@ function stepAI(s, dt, intel) {
       maybeRaidRecall(s, intel, cmds);
       maybeRaid(s, intel, cmds);
     }
+    if (s.coordinated) {
+      syncFlankers(s, intel);
+      maybeFlankStrike(s, intel, cmds);
+      maybeSupport(s, cmds);
+    }
     switch (s.phase) {
       case "gather":
         if (s.credits >= AI_BUILD_CREDITS) s.phase = s.deep ? "scout" : "build";
@@ -1560,7 +1595,7 @@ function stepAI(s, dt, intel) {
           s.army += 1;
           cmds.push({ type: "train", kind });
         }
-        if (s.army >= AI_ARMY_PER_WAVE) launchWave(s, cmds);
+        if (s.army >= AI_ARMY_PER_WAVE) launchWave(s, cmds, intel);
         break;
       }
       case "scout": {
@@ -1592,7 +1627,7 @@ function stepAI(s, dt, intel) {
         const commit = Math.max(2, Math.ceil(goal / 3));
         const rested = !s.tactics || s.sinceWave >= wait * AI_MIN_REST_RATIO;
         if (ready || s.spotted && s.army >= commit && rested) {
-          launchWave(s, cmds);
+          launchWave(s, cmds, intel);
         } else {
           maybeRetreat(s, intel, cmds);
         }
@@ -1604,6 +1639,7 @@ function stepAI(s, dt, intel) {
           s.retreatSent = false;
           s.focus = null;
           s.wavePeak = 0;
+          s.flankers = 0;
           if (s.deep) cmds.push({ type: "rally", to: anchorOf(intel) });
         } else if (!maybeRout(s, intel, cmds)) {
           cmds.push({ type: "attack" });
@@ -1670,7 +1706,7 @@ function recordIntel(s, intel) {
   let x = 0;
   let y = 0;
   for (const it of seen) {
-    if (it.kind === "infantry" || it.kind === "tank" || it.kind === "harvester") {
+    if (isUnitKind(it.kind)) {
       units[it.kind] = (units[it.kind] ?? 0) + 1;
       if (it.kind === "harvester") harv ??= it;
     } else {
@@ -1689,6 +1725,12 @@ function recordIntel(s, intel) {
   s.spotted = true;
   const eco = harv ?? ref;
   if (s.adaptive && eco) s.raidPos = { x: eco.x, y: eco.y };
+  if (s.coordinated) {
+    const d = defenseBlockers(seen);
+    if (d.length > 0) s.defenses = d;
+    const o = pickObjective(seen);
+    if (o) s.objective = o;
+  }
 }
 function maybeRecon(s, intel, cmds) {
   if (s.phase === "gather" || s.phase === "scout" || s.saving) return;
@@ -1744,13 +1786,22 @@ function maybeRetreat(s, intel, cmds) {
   }
   if (s.retreatSent) return;
   s.retreatSent = true;
-  cmds.push({ type: "retreat", to: anchorOf(intel), count: stranded });
+  const retreat = {
+    type: "retreat",
+    to: repairAnchor(s, intel),
+    count: stranded
+  };
+  if (s.coordinated) retreat.healTo = s.healRatio;
+  cmds.push(retreat);
   if (s.tactics) s.healing += stranded;
 }
 function anchorOf(intel) {
   return intel?.anchor ?? { x: tileCenter(MAP_W * 3 >> 2), y: tileCenter(MAP_H >> 2) };
 }
-function launchWave(s, cmds) {
+function repairAnchor(s, intel) {
+  return s.coordinated && intel?.repairPad || anchorOf(intel);
+}
+function launchWave(s, cmds, intel) {
   s.phase = "attack";
   s.wave += 1;
   s.sinceWave = 0;
@@ -1761,18 +1812,23 @@ function launchWave(s, cmds) {
   s.wavePeak = s.army;
   s.raiders = 0;
   s.raidRecalled = false;
-  cmds.push({ type: "move", to: attackTarget(s) }, { type: "attack" });
+  s.flankers = 0;
+  const to = attackTarget(s);
+  cmds.push({ type: "move", to }, { type: "attack" });
+  if (s.coordinated) maybeLaunchFlank(s, intel, cmds, to);
 }
 function attackTarget(s) {
-  if (s.tactics && s.known.pos) {
-    const tx = Math.floor(worldToTile(s.known.pos.x) + (s.rng() * 2 - 1) * ATTACK_JITTER_TILES);
-    const ty = Math.floor(worldToTile(s.known.pos.y) + (s.rng() * 2 - 1) * ATTACK_JITTER_TILES);
-    return {
-      x: tileCenter(Math.min(MAP_W - 1, Math.max(0, tx))),
-      y: tileCenter(Math.min(MAP_H - 1, Math.max(0, ty)))
-    };
-  }
+  const pos = s.coordinated ? s.objective ?? s.known.pos : s.tactics ? s.known.pos : null;
+  if (pos) return jitterAround(s, pos, ATTACK_JITTER_TILES);
   return jitterTarget(s, ATTACK_JITTER_TILES);
+}
+function jitterAround(s, pos, jitterTiles) {
+  const tx = Math.floor(worldToTile(pos.x) + (s.rng() * 2 - 1) * jitterTiles);
+  const ty = Math.floor(worldToTile(pos.y) + (s.rng() * 2 - 1) * jitterTiles);
+  return {
+    x: tileCenter(Math.min(MAP_W - 1, Math.max(0, tx))),
+    y: tileCenter(Math.min(MAP_H - 1, Math.max(0, ty)))
+  };
 }
 function jitterTarget(s, jitterTiles) {
   const tx = MAP_W / 2 + (s.rng() * 2 - 1) * jitterTiles;
@@ -1864,7 +1920,14 @@ function maybeRout(s, intel, cmds) {
   s.spotted = false;
   s.retreatSent = true;
   s.healing += low;
-  cmds.push({ type: "retreat", to: anchorOf(intel), count: s.army });
+  s.flankers = 0;
+  const rout = {
+    type: "retreat",
+    to: repairAnchor(s, intel),
+    count: s.army
+  };
+  if (s.coordinated) rout.healTo = s.healRatio;
+  cmds.push(rout);
   return true;
 }
 function expandLevel(s) {
@@ -1971,6 +2034,93 @@ function rectHitsAny(rects, gx, gy, w, h) {
     if (gx < r.gx + r.w && gx + w > r.gx && gy < r.gy + r.h && gy + h > r.gy) return true;
   }
   return false;
+}
+function defenseBlockers(seen) {
+  const out = [];
+  for (const it of seen) {
+    if (isUnitKind(it.kind)) continue;
+    const def = BUILDING_DEFS[it.kind];
+    const gx = worldToTile(it.x) - (def.w >> 1);
+    const gy = worldToTile(it.y) - (def.h >> 1);
+    out.push({ gx, gy, w: def.w, h: def.h });
+    const pad = Math.ceil((def.range ?? 0) / TILE_SIZE);
+    if (pad > 0) out.push({ gx: gx - pad, gy: gy - pad, w: def.w + pad * 2, h: def.h + pad * 2 });
+  }
+  return out;
+}
+function pickObjective(sightings) {
+  let best = null;
+  let bestScore = -Infinity;
+  const r2 = AI_DENSITY_RADIUS * AI_DENSITY_RADIUS;
+  for (const it of sightings) {
+    let score = isUnitKind(it.kind) ? 0 : AI_OBJECTIVE_VALUE[it.kind];
+    for (const u of sightings) {
+      if (!isUnitKind(u.kind)) continue;
+      const dx = u.x - it.x;
+      const dy = u.y - it.y;
+      if (dx * dx + dy * dy <= r2) score += AI_DENSITY_WEIGHT;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = { x: it.x, y: it.y };
+    }
+  }
+  return best;
+}
+function maybeLaunchFlank(s, intel, cmds, to) {
+  const n = Math.min(Math.floor(s.army * AI_FLANK_SHARE), s.army - AI_PIN_MIN);
+  if (n < AI_FLANK_MIN) return;
+  s.flankers = n;
+  cmds.push({ type: "flank", to: { x: to.x, y: to.y }, count: n, path: flankPath(s, intel, to) });
+}
+function flankPath(s, intel, to) {
+  if (!s.map) return null;
+  const a = anchorOf(intel);
+  const path = findPathAvoiding(
+    s.map,
+    { x: worldToTile(a.x), y: worldToTile(a.y) },
+    { x: worldToTile(to.x), y: worldToTile(to.y) },
+    s.defenses
+  );
+  if (!path) return null;
+  return path.map((t) => ({ x: tileCenter(t.x), y: tileCenter(t.y) }));
+}
+function syncFlankers(s, intel) {
+  if (intel?.flankers === void 0) return;
+  s.flankers = Math.max(0, Math.min(s.army, Math.floor(intel.flankers)));
+}
+function maybeFlankStrike(s, intel, cmds) {
+  if (s.flankers <= 0 || !intel?.flankArrived) return;
+  const at = s.focus ?? s.objective ?? s.known.pos ?? attackTarget(s);
+  cmds.push({ type: "strike", to: { x: at.x, y: at.y }, count: s.flankers });
+  s.flankers = 0;
+}
+function maybeSupport(s, cmds) {
+  s.artilleryCd = Math.max(0, s.artilleryCd - AI_TICK);
+  s.airstrikeCd = Math.max(0, s.airstrikeCd - AI_TICK);
+  if (s.phase !== "attack" || s.army <= 0) return;
+  const at = s.focus ?? s.objective ?? s.known.pos;
+  if (!at) return;
+  if (s.level >= AI_ARTILLERY.minLevel && s.artilleryCd <= 0) {
+    s.artilleryCd = AI_ARTILLERY.cooldown;
+    cmds.push({
+      type: "support",
+      kind: "artillery",
+      to: { x: at.x, y: at.y },
+      radius: AI_ARTILLERY.radius,
+      damage: AI_ARTILLERY.damage
+    });
+  }
+  if (s.level >= AI_AIRSTRIKE.minLevel && s.airstrikeCd <= 0) {
+    s.airstrikeCd = AI_AIRSTRIKE.cooldown;
+    cmds.push({
+      type: "support",
+      kind: "airstrike",
+      to: { x: at.x, y: at.y },
+      radius: AI_AIRSTRIKE.radius,
+      damage: AI_AIRSTRIKE.damage
+    });
+  }
 }
 
 // src/game/harvest.ts
@@ -3082,7 +3232,7 @@ function snapshotGame(g, camera) {
     }
   });
 }
-var isUnitKind = (k) => k in UNIT_STATS;
+var isUnitKind2 = (k) => k in UNIT_STATS;
 var isBuildingKind = (k) => k in BUILDING_DEFS;
 var isAIPhase = (p) => p === "gather" || p === "build" || p === "scout" || p === "muster" || p === "attack";
 function restoreBuilding(list, s, team) {
@@ -3105,7 +3255,7 @@ function restoreBuilding(list, s, team) {
 }
 function restoreUnits(list, saved, team, strength) {
   for (const s of saved) {
-    if (!isUnitKind(s.kind)) return false;
+    if (!isUnitKind2(s.kind)) return false;
     const u = makeGUnit(s.id, s.kind, 0, 0, team, team === "enemy" ? strength : 1);
     u.x = s.x;
     u.y = s.y;
