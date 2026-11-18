@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import { BALANCE, BALANCE_TABLE, DIFFICULTY, WAVE_BALANCE, validateBalance, waveSize, type Difficulty } from './balance.js';
 import { UNIT_STATS } from './units.js';
 import { BUILDING_DEFS } from './buildings.js';
+import { DAMAGE_MATRIX } from './unitRoles.js';
 
 test('validateBalance reports no drift against UNIT_STATS/BUILDING_DEFS', () => {
-  assert.deepEqual(validateBalance(), []);
+  assert.deepEqual(validateBalance(), { ok: true, errors: [] });
 });
 
 test('BALANCE mirrors the runtime stat fields it claims to tune', () => {
@@ -74,24 +75,75 @@ test('validateBalance flags negative or non-finite difficulty values', () => {
   const saved = DIFFICULTY.hard.startCredits;
   try {
     DIFFICULTY.hard.startCredits = -1;
-    assert.ok(validateBalance('hard').some((e) => e.includes('difficulty.hard.startCredits')));
+    assert.ok(validateBalance('hard').errors.some((e) => e.includes('difficulty.hard.startCredits')));
     DIFFICULTY.hard.startCredits = Number.NaN;
-    assert.ok(validateBalance('hard').some((e) => e.includes('difficulty.hard.startCredits')));
+    assert.ok(validateBalance('hard').errors.some((e) => e.includes('difficulty.hard.startCredits')));
   } finally {
     DIFFICULTY.hard.startCredits = saved;
   }
-  assert.deepEqual(validateBalance('hard'), []);
+  assert.deepEqual(validateBalance('hard'), { ok: true, errors: [] });
 });
 
 test('validateBalance flags non-monotonic difficulty ordering', () => {
   const saved = DIFFICULTY.easy.enemyStartInfantry;
   try {
     DIFFICULTY.easy.enemyStartInfantry = 99;
-    assert.ok(validateBalance().some((e) => e.includes('difficulty.enemyStartInfantry')));
+    const r = validateBalance();
+    assert.equal(r.ok, false);
+    assert.ok(r.errors.some((e) => e.includes('difficulty.enemyStartInfantry')));
   } finally {
     DIFFICULTY.easy.enemyStartInfantry = saved;
   }
-  assert.deepEqual(validateBalance(), []);
+  assert.deepEqual(validateBalance(), { ok: true, errors: [] });
+});
+
+test('validateBalance flags inverted tech-prerequisite costs', () => {
+  const saved = BALANCE.tank.cost;
+  try {
+    // tank sits at the deepest requires tier; pricing it below the
+    // shallower tier's cheapest unit breaks monotonicity.
+    BALANCE.tank.cost = 50;
+    const r = validateBalance();
+    assert.equal(r.ok, false);
+    assert.ok(r.errors.some((e) => e.includes('requires')), r.errors.join('\n'));
+  } finally {
+    BALANCE.tank.cost = saved;
+  }
+  assert.equal(validateBalance().ok, true);
+});
+
+test('validateBalance flags mutual counters in the counter matrix', () => {
+  const savedRocket = DAMAGE_MATRIX.rocket.infantry;
+  try {
+    // rocket now beats infantry armor, so rocket counters scout; make
+    // bullets also beat infantry so scout counters rocket back.
+    DAMAGE_MATRIX.rocket.infantry = 2;
+    DAMAGE_MATRIX.bullet.infantry = 2;
+    const r = validateBalance();
+    assert.equal(r.ok, false);
+    assert.ok(r.errors.some((e) => e.includes('counter')), r.errors.join('\n'));
+  } finally {
+    DAMAGE_MATRIX.rocket.infantry = savedRocket;
+    DAMAGE_MATRIX.bullet.infantry = 1.0;
+  }
+  assert.equal(validateBalance().ok, true);
+});
+
+test('validateBalance flags non-positive costs and wave tuning', () => {
+  const savedCost = BALANCE.infantry.cost;
+  const savedInterval = WAVE_BALANCE.interval;
+  try {
+    BALANCE.infantry.cost = 0;
+    WAVE_BALANCE.interval = 0;
+    const r = validateBalance();
+    assert.equal(r.ok, false);
+    assert.ok(r.errors.some((e) => e.includes('units.infantry.cost')));
+    assert.ok(r.errors.some((e) => e.includes('waves.interval')));
+  } finally {
+    BALANCE.infantry.cost = savedCost;
+    WAVE_BALANCE.interval = savedInterval;
+  }
+  assert.equal(validateBalance().ok, true);
 });
 
 test('tank costs more than infantry', () => {
