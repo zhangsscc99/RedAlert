@@ -82,6 +82,72 @@ var BUILDING_DEFS = {
 };
 var RADAR_SCAN = { radius: 12 * TILE_SIZE, period: 5 };
 
+// src/game/production.ts
+var PRODUCTION_REQUIRES = {
+  infantry: ["barracks"],
+  tank: ["barracks", "hq"],
+  harvester: ["refinery"]
+};
+
+// src/game/unitRoles.ts
+var DAMAGE_MATRIX = {
+  bullet: { infantry: 1, vehicle: 0.5, building: 0.5 },
+  rocket: { infantry: 0.5, vehicle: 2, building: 2.5 }
+};
+function damageMultiplier(weapon, armor) {
+  return DAMAGE_MATRIX[weapon]?.[armor] ?? 0;
+}
+var ROLE_STATS = {
+  rocket: {
+    hp: 80,
+    speed: 45,
+    range: 140,
+    damage: 60,
+    cost: 300,
+    buildTime: 8,
+    sight: 160,
+    armor: "infantry",
+    weapon: "rocket",
+    canAttack: true,
+    canCapture: false,
+    canRepair: false,
+    rare: false,
+    requires: ["barracks"]
+  },
+  engineer: {
+    hp: 40,
+    speed: 65,
+    range: 0,
+    damage: 0,
+    cost: 500,
+    buildTime: 10,
+    sight: 120,
+    armor: "infantry",
+    weapon: null,
+    canAttack: false,
+    canCapture: true,
+    canRepair: true,
+    rare: true,
+    requires: ["barracks"]
+  },
+  scout: {
+    hp: 30,
+    speed: 110,
+    range: 90,
+    damage: 8,
+    cost: 200,
+    buildTime: 5,
+    sight: 260,
+    armor: "infantry",
+    weapon: "bullet",
+    canAttack: true,
+    canCapture: false,
+    canRepair: false,
+    rare: true,
+    requires: ["barracks"]
+  }
+};
+
 // src/game/balance.ts
 var BALANCE = {
   infantry: { hp: 50, dmg: 8, range: 90, cooldown: 0.8, speed: 70, cost: 100, buildTime: 4 },
@@ -154,7 +220,61 @@ function validateBalance(difficulty = "normal") {
       if (a[f] !== b[f]) errors.push(`buildings.${kind}.${f}: ${a[f]} vs ${b[f]}`);
     }
   }
-  return errors;
+  for (const kind of Object.keys(BALANCE)) {
+    const b = BALANCE[kind];
+    if (!(b.cost > 0)) errors.push(`units.${kind}.cost: ${b.cost} must be > 0`);
+    if (!(b.hp > 0)) errors.push(`units.${kind}.hp: ${b.hp} must be > 0`);
+  }
+  for (const kind of Object.keys(BUILDING_BALANCE)) {
+    const b = BUILDING_BALANCE[kind];
+    if (!(b.cost > 0)) errors.push(`buildings.${kind}.cost: ${b.cost} must be > 0`);
+    if (!(b.hp > 0)) errors.push(`buildings.${kind}.hp: ${b.hp} must be > 0`);
+  }
+  if (!(WAVE_BALANCE.interval > 0)) errors.push(`waves.interval: ${WAVE_BALANCE.interval} must be > 0`);
+  if (!(WAVE_BALANCE.size > 0)) errors.push(`waves.size: ${WAVE_BALANCE.size} must be > 0`);
+  if (!(WAVE_BALANCE.growth >= 0)) errors.push(`waves.growth: ${WAVE_BALANCE.growth} must be >= 0`);
+  if (WAVE_BALANCE.max < WAVE_BALANCE.size) {
+    errors.push(`waves.max: ${WAVE_BALANCE.max} < waves.size ${WAVE_BALANCE.size}`);
+  }
+  const producibleCost = (k) => k in BALANCE ? BALANCE[k].cost : BUILDING_BALANCE[k].cost;
+  const minCostByDepth = /* @__PURE__ */ new Map();
+  for (const kind of Object.keys(PRODUCTION_REQUIRES)) {
+    const reqs = PRODUCTION_REQUIRES[kind] ?? [];
+    const depth = reqs.length;
+    const c = producibleCost(kind);
+    minCostByDepth.set(depth, Math.min(minCostByDepth.get(depth) ?? c, c));
+    let prev = 0;
+    for (const b of reqs) {
+      const bc = BUILDING_BALANCE[b].cost;
+      if (bc < prev) {
+        errors.push(`requires.${kind}: '${b}' cost ${bc} < previous prerequisite ${prev}`);
+      }
+      prev = bc;
+    }
+  }
+  const depths = [...minCostByDepth.keys()].sort((a, b) => a - b);
+  for (let i = 1; i < depths.length; i++) {
+    const shallow = minCostByDepth.get(depths[i - 1]);
+    const deep = minCostByDepth.get(depths[i]);
+    if (deep <= shallow) {
+      errors.push(`requires: depth ${depths[i]} min cost ${deep} <= depth ${depths[i - 1]} min cost ${shallow}`);
+    }
+  }
+  const attackers = Object.keys(ROLE_STATS).filter(
+    (k) => ROLE_STATS[k].canAttack && ROLE_STATS[k].weapon !== null
+  );
+  const defenders = attackers;
+  for (const a of attackers) {
+    for (const b of defenders) {
+      if (a === b) continue;
+      const ab = damageMultiplier(ROLE_STATS[a].weapon, ROLE_STATS[b].armor);
+      const ba = ROLE_STATS[b].weapon === null ? 0 : damageMultiplier(ROLE_STATS[b].weapon, ROLE_STATS[a].armor);
+      if (ab > 1 && ba > 1) {
+        errors.push(`counter: ${a} beats ${b} (x${ab}) but ${b} also beats ${a} (x${ba})`);
+      }
+    }
+  }
+  return { ok: errors.length === 0, errors };
 }
 function waveSize(n, difficulty = "normal") {
   const k = Math.max(0, Math.floor(n));
@@ -163,7 +283,7 @@ function waveSize(n, difficulty = "normal") {
 
 // src/game/balance.test.ts
 test("validateBalance reports no drift against UNIT_STATS/BUILDING_DEFS", () => {
-  assert.deepEqual(validateBalance(), []);
+  assert.deepEqual(validateBalance(), { ok: true, errors: [] });
 });
 test("BALANCE mirrors the runtime stat fields it claims to tune", () => {
   assert.equal(BALANCE.infantry.hp, UNIT_STATS.infantry.hp);
@@ -223,23 +343,67 @@ test("validateBalance flags negative or non-finite difficulty values", () => {
   const saved = DIFFICULTY.hard.startCredits;
   try {
     DIFFICULTY.hard.startCredits = -1;
-    assert.ok(validateBalance("hard").some((e) => e.includes("difficulty.hard.startCredits")));
+    assert.ok(validateBalance("hard").errors.some((e) => e.includes("difficulty.hard.startCredits")));
     DIFFICULTY.hard.startCredits = Number.NaN;
-    assert.ok(validateBalance("hard").some((e) => e.includes("difficulty.hard.startCredits")));
+    assert.ok(validateBalance("hard").errors.some((e) => e.includes("difficulty.hard.startCredits")));
   } finally {
     DIFFICULTY.hard.startCredits = saved;
   }
-  assert.deepEqual(validateBalance("hard"), []);
+  assert.deepEqual(validateBalance("hard"), { ok: true, errors: [] });
 });
 test("validateBalance flags non-monotonic difficulty ordering", () => {
   const saved = DIFFICULTY.easy.enemyStartInfantry;
   try {
     DIFFICULTY.easy.enemyStartInfantry = 99;
-    assert.ok(validateBalance().some((e) => e.includes("difficulty.enemyStartInfantry")));
+    const r = validateBalance();
+    assert.equal(r.ok, false);
+    assert.ok(r.errors.some((e) => e.includes("difficulty.enemyStartInfantry")));
   } finally {
     DIFFICULTY.easy.enemyStartInfantry = saved;
   }
-  assert.deepEqual(validateBalance(), []);
+  assert.deepEqual(validateBalance(), { ok: true, errors: [] });
+});
+test("validateBalance flags inverted tech-prerequisite costs", () => {
+  const saved = BALANCE.tank.cost;
+  try {
+    BALANCE.tank.cost = 50;
+    const r = validateBalance();
+    assert.equal(r.ok, false);
+    assert.ok(r.errors.some((e) => e.includes("requires")), r.errors.join("\n"));
+  } finally {
+    BALANCE.tank.cost = saved;
+  }
+  assert.equal(validateBalance().ok, true);
+});
+test("validateBalance flags mutual counters in the counter matrix", () => {
+  const savedRocket = DAMAGE_MATRIX.rocket.infantry;
+  try {
+    DAMAGE_MATRIX.rocket.infantry = 2;
+    DAMAGE_MATRIX.bullet.infantry = 2;
+    const r = validateBalance();
+    assert.equal(r.ok, false);
+    assert.ok(r.errors.some((e) => e.includes("counter")), r.errors.join("\n"));
+  } finally {
+    DAMAGE_MATRIX.rocket.infantry = savedRocket;
+    DAMAGE_MATRIX.bullet.infantry = 1;
+  }
+  assert.equal(validateBalance().ok, true);
+});
+test("validateBalance flags non-positive costs and wave tuning", () => {
+  const savedCost = BALANCE.infantry.cost;
+  const savedInterval = WAVE_BALANCE.interval;
+  try {
+    BALANCE.infantry.cost = 0;
+    WAVE_BALANCE.interval = 0;
+    const r = validateBalance();
+    assert.equal(r.ok, false);
+    assert.ok(r.errors.some((e) => e.includes("units.infantry.cost")));
+    assert.ok(r.errors.some((e) => e.includes("waves.interval")));
+  } finally {
+    BALANCE.infantry.cost = savedCost;
+    WAVE_BALANCE.interval = savedInterval;
+  }
+  assert.equal(validateBalance().ok, true);
 });
 test("tank costs more than infantry", () => {
   assert.ok(BALANCE.tank.cost > BALANCE.infantry.cost);

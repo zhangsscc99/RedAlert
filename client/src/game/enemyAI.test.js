@@ -100,41 +100,6 @@ var BUILDING_DEFS = {
 };
 var RADAR_SCAN = { radius: 12 * TILE_SIZE, period: 5 };
 
-// src/game/balance.ts
-var BALANCE = {
-  infantry: { hp: 50, dmg: 8, range: 90, cooldown: 0.8, speed: 70, cost: 100, buildTime: 4 },
-  tank: { hp: 400, dmg: 40, range: 120, cooldown: 1.4, speed: 55, cost: 800, buildTime: 12 },
-  harvester: { hp: 300, dmg: 0, range: 0, cooldown: 0, speed: 35, cost: 1400, buildTime: 20 }
-};
-var BUILDING_BALANCE = {
-  hq: { w: 4, h: 3, hp: 2e3, cost: 2500, buildTime: 40 },
-  barracks: { w: 3, h: 2, hp: 800, cost: 500, buildTime: 15 },
-  refinery: { w: 4, h: 3, hp: 1200, cost: 2e3, buildTime: 25 },
-  power: { w: 2, h: 2, hp: 400, cost: 300, buildTime: 8 },
-  turret: { w: 2, h: 2, hp: 700, cost: 700, buildTime: 12 },
-  wall: { w: 1, h: 1, hp: 500, cost: 100, buildTime: 4 }
-};
-var WAVE_BALANCE = {
-  interval: 30,
-  // seconds between waves
-  size: 4,
-  // enemies in the first wave
-  growth: 2,
-  // additional enemies per wave
-  max: 30
-  // hard cap on wave size
-};
-var BALANCE_TABLE = {
-  ...BALANCE,
-  buildings: BUILDING_BALANCE,
-  waves: WAVE_BALANCE
-};
-var DIFFICULTY = {
-  easy: { label: "Easy", startCredits: 7e3, waveIntervalScale: 1.35, enemyStrengthScale: 0.8, enemyStartInfantry: 2 },
-  normal: { label: "Normal", startCredits: 5e3, waveIntervalScale: 1, enemyStrengthScale: 1, enemyStartInfantry: 4 },
-  hard: { label: "Hard", startCredits: 3500, waveIntervalScale: 0.75, enemyStrengthScale: 1.25, enemyStartInfantry: 6 }
-};
-
 // src/game/unitRoles.ts
 var ARMOR_TYPES = ["infantry", "vehicle", "building"];
 var DAMAGE_MATRIX = {
@@ -193,6 +158,41 @@ var ROLE_STATS = {
     rare: true,
     requires: ["barracks"]
   }
+};
+
+// src/game/balance.ts
+var BALANCE = {
+  infantry: { hp: 50, dmg: 8, range: 90, cooldown: 0.8, speed: 70, cost: 100, buildTime: 4 },
+  tank: { hp: 400, dmg: 40, range: 120, cooldown: 1.4, speed: 55, cost: 800, buildTime: 12 },
+  harvester: { hp: 300, dmg: 0, range: 0, cooldown: 0, speed: 35, cost: 1400, buildTime: 20 }
+};
+var BUILDING_BALANCE = {
+  hq: { w: 4, h: 3, hp: 2e3, cost: 2500, buildTime: 40 },
+  barracks: { w: 3, h: 2, hp: 800, cost: 500, buildTime: 15 },
+  refinery: { w: 4, h: 3, hp: 1200, cost: 2e3, buildTime: 25 },
+  power: { w: 2, h: 2, hp: 400, cost: 300, buildTime: 8 },
+  turret: { w: 2, h: 2, hp: 700, cost: 700, buildTime: 12 },
+  wall: { w: 1, h: 1, hp: 500, cost: 100, buildTime: 4 }
+};
+var WAVE_BALANCE = {
+  interval: 30,
+  // seconds between waves
+  size: 4,
+  // enemies in the first wave
+  growth: 2,
+  // additional enemies per wave
+  max: 30
+  // hard cap on wave size
+};
+var BALANCE_TABLE = {
+  ...BALANCE,
+  buildings: BUILDING_BALANCE,
+  waves: WAVE_BALANCE
+};
+var DIFFICULTY = {
+  easy: { label: "Easy", startCredits: 7e3, waveIntervalScale: 1.35, enemyStrengthScale: 0.8, enemyStartInfantry: 2 },
+  normal: { label: "Normal", startCredits: 5e3, waveIntervalScale: 1, enemyStrengthScale: 1, enemyStartInfantry: 4 },
+  hard: { label: "Hard", startCredits: 3500, waveIntervalScale: 0.75, enemyStrengthScale: 1.25, enemyStartInfantry: 6 }
 };
 
 // src/game/enemyAI.ts

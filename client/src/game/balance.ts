@@ -3,6 +3,12 @@
 
 import { UNIT_STATS, type UnitKind } from './units.js';
 import { BUILDING_DEFS, type BuildingKind } from './buildings.js';
+import { PRODUCTION_REQUIRES, type ProducibleKind } from './production.js';
+import {
+  ROLE_STATS,
+  damageMultiplier,
+  type RoleKind,
+} from './unitRoles.js';
 
 export interface UnitBalance {
   hp: number;
@@ -83,8 +89,21 @@ const DESCENDING_FIELDS = ['startCredits', 'waveIntervalScale'] as const;
  * Also validates the DIFFICULTY table: the selected tier's numeric fields
  * must be finite and non-negative, and the easy/normal/hard ordering must
  * stay monotonic per field.
+ *
+ * Additionally enforces the structural rules that keep the tuning tables
+ * self-consistent:
+ * - tech prerequisites: a producible gated behind more buildings than
+ *   another must cost more than the cheapest producible of the shallower
+ *   tier (deeper tech => higher cost), and each `requires` list must be
+ *   non-decreasing in building cost;
+ * - counter matrix antisymmetry: if attacker A's weapon beats defender B's
+ *   armor (multiplier > 1), then B's weapon must not beat A's armor back;
+ * - every unit/building cost and hp must be positive;
+ * - wave tuning must be positive (interval > 0, growth >= 0, max >= size).
+ *
+ * Never throws; returns `{ ok, errors }` where `ok` is `errors.length === 0`.
  */
-export function validateBalance(difficulty: Difficulty = 'normal'): string[] {
+export function validateBalance(difficulty: Difficulty = 'normal'): { ok: boolean; errors: string[] } {
   const errors: string[] = [];
   const tier = DIFFICULTY[difficulty];
   for (const f of ['startCredits', 'waveIntervalScale', 'enemyStrengthScale', 'enemyStartInfantry'] as const) {
@@ -119,7 +138,76 @@ export function validateBalance(difficulty: Difficulty = 'normal'): string[] {
       if (a[f] !== b[f]) errors.push(`buildings.${kind}.${f}: ${a[f]} vs ${b[f]}`);
     }
   }
-  return errors;
+
+  // Every cost and hp in the tuning tables must be positive.
+  for (const kind of Object.keys(BALANCE) as UnitKind[]) {
+    const b = BALANCE[kind];
+    if (!(b.cost > 0)) errors.push(`units.${kind}.cost: ${b.cost} must be > 0`);
+    if (!(b.hp > 0)) errors.push(`units.${kind}.hp: ${b.hp} must be > 0`);
+  }
+  for (const kind of Object.keys(BUILDING_BALANCE) as (keyof typeof BUILDING_BALANCE)[]) {
+    const b = BUILDING_BALANCE[kind];
+    if (!(b.cost > 0)) errors.push(`buildings.${kind}.cost: ${b.cost} must be > 0`);
+    if (!(b.hp > 0)) errors.push(`buildings.${kind}.hp: ${b.hp} must be > 0`);
+  }
+
+  // Wave tuning must stay positive and self-consistent.
+  if (!(WAVE_BALANCE.interval > 0)) errors.push(`waves.interval: ${WAVE_BALANCE.interval} must be > 0`);
+  if (!(WAVE_BALANCE.size > 0)) errors.push(`waves.size: ${WAVE_BALANCE.size} must be > 0`);
+  if (!(WAVE_BALANCE.growth >= 0)) errors.push(`waves.growth: ${WAVE_BALANCE.growth} must be >= 0`);
+  if (WAVE_BALANCE.max < WAVE_BALANCE.size) {
+    errors.push(`waves.max: ${WAVE_BALANCE.max} < waves.size ${WAVE_BALANCE.size}`);
+  }
+
+  // Tech prerequisite chains: deeper tech (longer requires list) must cost
+  // more than the cheapest producible of every shallower tier, and within a
+  // single requires list building costs must be non-decreasing.
+  const producibleCost = (k: ProducibleKind): number =>
+    k in BALANCE ? BALANCE[k as UnitKind].cost : BUILDING_BALANCE[k as BuildingKind].cost;
+  const minCostByDepth = new Map<number, number>();
+  for (const kind of Object.keys(PRODUCTION_REQUIRES) as ProducibleKind[]) {
+    const reqs = PRODUCTION_REQUIRES[kind] ?? [];
+    const depth = reqs.length;
+    const c = producibleCost(kind);
+    minCostByDepth.set(depth, Math.min(minCostByDepth.get(depth) ?? c, c));
+    let prev = 0;
+    for (const b of reqs) {
+      const bc = BUILDING_BALANCE[b].cost;
+      if (bc < prev) {
+        errors.push(`requires.${kind}: '${b}' cost ${bc} < previous prerequisite ${prev}`);
+      }
+      prev = bc;
+    }
+  }
+  const depths = [...minCostByDepth.keys()].sort((a, b) => a - b);
+  for (let i = 1; i < depths.length; i++) {
+    const shallow = minCostByDepth.get(depths[i - 1])!;
+    const deep = minCostByDepth.get(depths[i])!;
+    if (deep <= shallow) {
+      errors.push(`requires: depth ${depths[i]} min cost ${deep} <= depth ${depths[i - 1]} min cost ${shallow}`);
+    }
+  }
+
+  // Counter antisymmetry over attacking roles: if A's weapon multiplies > 1
+  // against B's armor, B's weapon must not multiply > 1 against A's armor.
+  const attackers = (Object.keys(ROLE_STATS) as RoleKind[]).filter(
+    (k) => ROLE_STATS[k].canAttack && ROLE_STATS[k].weapon !== null,
+  );
+  const defenders = attackers;
+  for (const a of attackers) {
+    for (const b of defenders) {
+      if (a === b) continue;
+      const ab = damageMultiplier(ROLE_STATS[a].weapon!, ROLE_STATS[b].armor);
+      const ba = ROLE_STATS[b].weapon === null
+        ? 0
+        : damageMultiplier(ROLE_STATS[b].weapon!, ROLE_STATS[a].armor);
+      if (ab > 1 && ba > 1) {
+        errors.push(`counter: ${a} beats ${b} (x${ab}) but ${b} also beats ${a} (x${ba})`);
+      }
+    }
+  }
+
+  return { ok: errors.length === 0, errors };
 }
 
 /**
