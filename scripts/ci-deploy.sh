@@ -1,28 +1,38 @@
 #!/usr/bin/env bash
+# RedAlert 部署闸门：构建 → 备份 → 部署 → pm2 重启 → 健康检查 → 失败回滚
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p data
 
-# 1) Build the client
+echo "[1/5] build client"
 (cd client && npm run build)
 
-# 2) Back up the currently deployed dist
-[ -d server/dist ] && cp -a server/dist "server/dist.bak-$(date +%s)" || true
+echo "[2/5] backup current dist"
+if [ -d server/dist ]; then
+  cp -a server/dist "server/dist.bak-$(date +%s)"
+  ls -1dt server/dist.bak-* 2>/dev/null | tail -n +4 | xargs -r rm -rf   # 只留最近 3 份
+fi
 
-# 3) Deploy the new dist
+echo "[3/5] deploy new dist"
 rm -rf server/dist && cp -a client/dist server/dist
 
-# 4) Restart the service (pidfile-based, no pm2)
-pkill -f "node server/index.js" 2>/dev/null || true
-sleep 1
-nohup node server/index.js >> data/server.log 2>&1 &
-echo $! > data/server.pid
+echo "[4/5] restart under pm2"
+if pm2 describe redalert >/dev/null 2>&1; then
+  pm2 restart redalert --update-env >/dev/null
+else
+  pm2 start ecosystem.config.cjs >/dev/null
+fi
+pm2 save >/dev/null 2>&1 || true
 
-# 5) Health check
-for i in $(seq 1 20); do
-  if curl -sf http://127.0.0.1:3027/api/health >/dev/null; then echo "DEPLOY OK"; exit 0; fi
+echo "[5/5] health check"
+for i in $(seq 1 25); do
+  if curl -sf http://127.0.0.1:3027/api/health >/dev/null; then
+    echo "DEPLOY OK"
+    exit 0
+  fi
   sleep 1
 done
+
 echo "DEPLOY FAILED"
 bash scripts/rollback.sh
 exit 1
