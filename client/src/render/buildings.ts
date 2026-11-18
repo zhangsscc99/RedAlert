@@ -11,6 +11,7 @@ import {
   type GBuilding,
   type Unit,
 } from '../game/index.ts';
+import { computePower, isLowPower } from '../game/power.js';
 import { drawUnitBody } from './units.js';
 
 const PLAYER_BODY = '#3f5a37';
@@ -67,7 +68,10 @@ function aimAngle(b: GBuilding, dt: number): number {
       target = t;
     }
   }
-  const goal = target ? Math.atan2(target.y - b.y, target.x - b.x) : NEUTRAL_AIM;
+  // Idle sweep: when nothing is tracked, the barrel scans side to side.
+  const goal = target
+    ? Math.atan2(target.y - b.y, target.x - b.x)
+    : NEUTRAL_AIM + Math.sin(lastFrameT * 0.7 + b.id * 1.3) * 0.6;
   const cur = turretAim.get(b.id) ?? NEUTRAL_AIM;
   const step = Math.min(1, dt * TURN_RATE) * wrapAngle(goal - cur);
   const next = cur + step;
@@ -171,7 +175,10 @@ function drawDamage(
   }
 }
 
-/** Barrel drawn from the footprint center at `angle`. */
+/**
+ * Barrel drawn from the footprint center at `angle`. `recoil` (0..1) is high
+ * right after a shot: the barrel pulls back and a muzzle-smoke puff blooms.
+ */
 function drawTurret(
   ctx: CanvasRenderingContext2D,
   cx: number,
@@ -179,16 +186,209 @@ function drawTurret(
   r: number,
   angle: number,
   enemy: boolean,
+  recoil: number,
 ): void {
   ctx.fillStyle = enemy ? '#8a4a38' : '#567a49';
   ctx.beginPath();
   ctx.arc(cx, cy, r * 0.5, 0, Math.PI * 2);
   ctx.fill();
+  const len = r * (1 - 0.3 * recoil);
+  const tipX = cx + Math.cos(angle) * len;
+  const tipY = cy + Math.sin(angle) * len;
   ctx.strokeStyle = '#141410';
   ctx.lineWidth = Math.max(2, r * 0.22);
   ctx.beginPath();
   ctx.moveTo(cx, cy);
-  ctx.lineTo(cx + Math.cos(angle) * r, cy + Math.sin(angle) * r);
+  ctx.lineTo(tipX, tipY);
+  ctx.stroke();
+  if (recoil > 0.05) {
+    ctx.fillStyle = `rgba(200, 200, 200, ${recoil * 0.5})`;
+    ctx.beginPath();
+    ctx.arc(tipX + Math.cos(angle) * r * 0.15, tipY + Math.sin(angle) * r * 0.15, r * 0.28 * (1 - recoil * 0.4), 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+/** Mast + swaying boom + hanging hook above a building under construction. */
+function drawCrane(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  now: number,
+  seed: number,
+): void {
+  const mastX = x + w * 0.85;
+  const topY = y - w * 0.7;
+  const swing = Math.sin(now * 0.6 + seed * 2.1) * 0.5;
+  const boomLen = w * 0.9;
+  const tipX = mastX - Math.cos(swing) * boomLen;
+  const tipY = topY + Math.sin(swing) * boomLen * 0.25;
+  ctx.strokeStyle = SCAFFOLD;
+  ctx.lineWidth = Math.max(1, w * 0.03);
+  ctx.beginPath();
+  ctx.moveTo(mastX, y);
+  ctx.lineTo(mastX, topY);
+  ctx.lineTo(tipX, tipY);
+  ctx.stroke();
+  // hoist cable + hook block
+  ctx.beginPath();
+  ctx.moveTo(tipX, tipY);
+  ctx.lineTo(tipX, tipY + w * 0.3);
+  ctx.stroke();
+  ctx.fillStyle = SCAFFOLD;
+  ctx.fillRect(tipX - w * 0.03, tipY + w * 0.3, w * 0.06, w * 0.06);
+}
+
+/** One-time white flash + expanding ring right after construction finishes. */
+function drawCompletionBurst(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  maxR: number,
+  t: number, // 0..1 since completion
+): void {
+  ctx.strokeStyle = `rgba(255, 240, 160, ${(1 - t) * 0.9})`;
+  ctx.lineWidth = 2 + (1 - t) * 2;
+  ctx.beginPath();
+  ctx.arc(cx, cy, maxR * (0.2 + t * 0.8), 0, Math.PI * 2);
+  ctx.stroke();
+}
+
+/** Jagged crack decals, deterministic per building id. */
+function drawCracks(
+  ctx: CanvasRenderingContext2D,
+  id: number,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+): void {
+  ctx.strokeStyle = 'rgba(15, 12, 8, 0.55)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < 3; i++) {
+    const seed = id * 17 + i * 7;
+    let px = x + w * hash(seed);
+    let py = y + h * hash(seed + 1);
+    ctx.beginPath();
+    ctx.moveTo(px, py);
+    for (let s = 0; s < 3; s++) {
+      px += (hash(seed + 2 + s * 2) - 0.5) * w * 0.4;
+      py += (hash(seed + 3 + s * 2) - 0.2) * h * 0.3;
+      ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+  }
+}
+
+/** Licking flames + charred rim for buildings under 15% hp. */
+function drawFlames(
+  ctx: CanvasRenderingContext2D,
+  id: number,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  now: number,
+): void {
+  // scorched edges
+  ctx.strokeStyle = 'rgba(10, 8, 6, 0.7)';
+  ctx.lineWidth = Math.max(2, Math.min(w, h) * 0.12);
+  ctx.strokeRect(x + 1, y + 1, w - 2, h - 2);
+  for (let i = 0; i < 3; i++) {
+    const seed = id * 41 + i * 13;
+    const flick = 0.6 + hash(seed + Math.floor(now * 10 + i)) * 0.4;
+    const fx = x + w * (0.25 + hash(seed + 1) * 0.5);
+    const fy = y + h * (0.35 + hash(seed + 2) * 0.4);
+    const fh = (4 + hash(seed + 3) * 5) * flick;
+    ctx.fillStyle = `rgba(255, ${120 + Math.floor(flick * 100)}, 30, 0.85)`;
+    ctx.beginPath();
+    ctx.moveTo(fx - fh * 0.45, fy);
+    ctx.quadraticCurveTo(fx, fy - fh * 1.8, fx + fh * 0.45, fy);
+    ctx.fill();
+  }
+}
+
+/** Lit window grid; dark under low power, flickering when damaged. */
+function drawWindows(
+  ctx: CanvasRenderingContext2D,
+  id: number,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  lit: boolean,
+  flicker: boolean,
+  now: number,
+): void {
+  const cols = Math.max(2, Math.floor(w / (14 * Math.max(0.5, w / 64))));
+  const rows = Math.max(1, Math.floor(h / 24));
+  const cw = w / cols;
+  const ch = h / (rows + 1);
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const wx = x + cw * c + cw * 0.25;
+      const wy = y + ch * (r + 0.6);
+      let alpha = lit ? 0.75 : 0.12;
+      if (flicker && lit) alpha *= 0.3 + hash(id * 29 + r * 7 + c + Math.floor(now * 7)) * 0.7;
+      ctx.fillStyle = lit ? `rgba(255, 220, 120, ${alpha})` : `rgba(40, 45, 50, ${0.5 + alpha})`;
+      ctx.fillRect(wx, wy, cw * 0.5, ch * 0.45);
+    }
+  }
+}
+
+/** Blinking antenna beacon on tall buildings; blink rate slows when unpowered. */
+function drawAntenna(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  powered: boolean,
+  now: number,
+): void {
+  const ax = x + w * 0.15;
+  ctx.strokeStyle = 'rgba(30, 30, 30, 0.8)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(ax, y);
+  ctx.lineTo(ax, y - w * 0.35);
+  ctx.stroke();
+  const period = powered ? 1.2 : 4;
+  const on = (now % period) < period * 0.15;
+  ctx.fillStyle = on ? 'rgba(255, 80, 60, 0.95)' : 'rgba(120, 40, 35, 0.4)';
+  ctx.beginPath();
+  ctx.arc(ax, y - w * 0.35, Math.max(1.5, w * 0.04), 0, Math.PI * 2);
+  ctx.fill();
+}
+
+/** Rotating radar dish + decorative sweep arc on the HQ. */
+function drawRadar(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  r: number,
+  now: number,
+  id: number,
+): void {
+  const a = now * 1.4 + id;
+  // sweep arc (purely decorative)
+  ctx.strokeStyle = 'rgba(140, 220, 255, 0.35)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r * 1.6, a, a + 0.9);
+  ctx.stroke();
+  // dish pedestal
+  ctx.fillStyle = 'rgba(30, 30, 30, 0.8)';
+  ctx.fillRect(cx - r * 0.12, cy - r * 0.15, r * 0.24, r * 0.15);
+  // dish: ellipse sweeping around
+  ctx.strokeStyle = 'rgba(200, 210, 220, 0.9)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy - r * 0.35, r * 0.5, r * 0.5 * Math.abs(Math.sin(a)) * 0.6 + r * 0.05, 0, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - r * 0.15);
+  ctx.lineTo(cx + Math.cos(a) * r * 0.5, cy - r * 0.35 + Math.sin(a) * r * 0.2);
   ctx.stroke();
 }
 
@@ -227,6 +427,7 @@ export function drawBuildings(
   buildings: readonly GBuilding[],
 ): void {
   const now = performance.now() / 1000;
+  const lowPower = isLowPower(computePower(buildings));
   const dt = Math.min(0.1, lastFrameT > 0 ? now - lastFrameT : 0.016);
   lastFrameT = now;
   frameStamp++;
@@ -304,6 +505,7 @@ export function drawBuildings(
       ctx.fillRect(s.x, s.y, w, h * (1 - pct));
       drawScaffold(ctx, s.x, s.y, w, h, Math.max(3, 4 * cam.zoom));
       drawProgressRing(ctx, s.x + w / 2, s.y + h / 2, Math.min(w, h) * 0.3, pct);
+      drawCrane(ctx, s.x, s.y, w, now, b.id);
     } else if (collapsing && finishT !== undefined) {
       // One short snap: scaffold pulls in + a fading white flash.
       const t = (now - finishT) / COLLAPSE_T;
@@ -311,14 +513,32 @@ export function drawBuildings(
       ctx.fillStyle = `rgba(255, 255, 255, ${(1 - t) * 0.4})`;
       ctx.fillRect(s.x, s.y, w, h);
       drawProgressRing(ctx, s.x + w / 2, s.y + h / 2, Math.min(w, h) * 0.3 * (1 - t), 1);
+      drawCompletionBurst(ctx, s.x + w / 2, s.y + h / 2, Math.min(w, h) * 0.7, t);
+    } else if (b.done && finishT !== undefined && now - finishT < 1.2) {
+      // Expanding ring lingers briefly after the snap finishes.
+      const t = (now - finishT - COLLAPSE_T) / (1.2 - COLLAPSE_T);
+      drawCompletionBurst(ctx, s.x + w / 2, s.y + h / 2, Math.min(w, h) * 0.9, Math.max(0, t));
+    }
+
+    if (b.done && b.hp > 0) {
+      if (b.kind !== 'wall') drawWindows(ctx, b.id, s.x, s.y, w, h, !lowPower, ratio < 0.9, now);
+      if (b.kind === 'hq' || b.kind === 'power') {
+        drawAntenna(ctx, s.x, s.y, w, !lowPower, now);
+      }
+      if (b.kind === 'hq') {
+        drawRadar(ctx, s.x + w * 0.8, s.y + h * 0.3, Math.min(w, h) * 0.18, now, b.id);
+      }
     }
 
     if (b.kind === 'turret' && b.done) {
-      drawTurret(ctx, s.x + w / 2, s.y + h / 2, Math.min(w, h) * 0.42, aimAngle(b, dt), b.team === 'enemy');
+      const recoil = b.cooldownMax > 0 ? Math.max(0, Math.min(1, b.cooldown / b.cooldownMax)) : 0;
+      drawTurret(ctx, s.x + w / 2, s.y + h / 2, Math.min(w, h) * 0.42, aimAngle(b, dt), b.team === 'enemy', recoil);
     }
 
-    if (b.done && b.hp > 0 && ratio < 0.9) {
-      drawDamage(ctx, b, s.x, s.y, w, h, ratio, now);
+    if (b.done && b.hp > 0) {
+      if (ratio < 0.7) drawCracks(ctx, b.id, s.x, s.y, w, h);
+      if (ratio < 0.4) drawDamage(ctx, b, s.x, s.y, w, h, ratio, now);
+      if (ratio < 0.15) drawFlames(ctx, b.id, s.x, s.y, w, h, now);
     }
 
     if (b.hp < b.maxHp) {
