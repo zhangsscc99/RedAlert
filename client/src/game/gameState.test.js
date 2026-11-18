@@ -639,11 +639,6 @@ function credit(e, amount, grade = ORE_GRADE_POOR) {
   refreshFlags(e);
   return accepted;
 }
-function enqueue(q, e, item) {
-  if (!spend(e, item.cost)) return false;
-  q.push({ ...item });
-  return true;
-}
 
 // src/game/upgrades.ts
 var BASE_LEVEL = 1;
@@ -779,6 +774,10 @@ function missingRequirements(state, kind, requires) {
   return missing;
 }
 function enqueueUnitChecked(q, e, kind, opts = {}) {
+  if (opts.requestId !== void 0) {
+    const dup = q.find((o) => o.type === "unit" && o.requestId === opts.requestId);
+    if (dup) return { ok: true, order: dup };
+  }
   if (opts.buildings !== void 0) {
     const missing = missingRequirements({ buildings: opts.buildings }, kind, opts.requires);
     if (missing.length > 0) return { ok: false, reason: "requires", missing };
@@ -792,18 +791,21 @@ function enqueueUnitChecked(q, e, kind, opts = {}) {
     buildTime: s.buildTime,
     elapsed: 0
   };
+  if (opts.priority !== void 0) order.priority = opts.priority;
+  if (opts.requestId !== void 0) order.requestId = opts.requestId;
   if (opts.barracksId !== void 0) {
     order.barracksId = opts.barracksId;
     const p = opts.rally?.get(opts.barracksId);
     if (p) order.rally = { x: p.x, y: p.y };
   }
-  if (!enqueue(q, e, order)) return { ok: false, reason: "funds" };
-  return { ok: true };
+  if (!spend(e, order.cost)) return { ok: false, reason: "funds" };
+  q.splice(laneInsertIndex(q, order), 0, order);
+  return { ok: true, order };
 }
 function createRallyPoints() {
   return /* @__PURE__ */ new Map();
 }
-function enqueueUpgrade(q, e, b, level, powered) {
+function enqueueUpgrade(q, e, b, level, powered, opts = {}) {
   if (q.some((o) => o.type === "upgrade" && o.buildingId === b.id)) {
     return { ok: false, reason: "busy" };
   }
@@ -824,11 +826,23 @@ function enqueueUpgrade(q, e, b, level, powered) {
     effect: tier.effect,
     multiplier: tier.multiplier
   };
-  if (!enqueue(q, e, order)) return { ok: false, reason: "funds" };
+  if (opts.priority !== void 0) order.priority = opts.priority;
+  if (!spend(e, order.cost)) return { ok: false, reason: "funds" };
+  q.splice(laneInsertIndex(q, order), 0, order);
   return { ok: true, order };
 }
 function laneKey(o) {
   return o.type === "upgrade" ? o.buildingId : o.barracksId;
+}
+function laneInsertIndex(q, order) {
+  const key = laneKey(order);
+  const pri = order.priority ?? 0;
+  for (let i = 0; i < q.length; i++) {
+    const o = q[i];
+    if (laneKey(o) !== key || o.elapsed > 0) continue;
+    if ((o.priority ?? 0) < pri) return i;
+  }
+  return q.length;
 }
 function tickLanes(list, dt, lanes, done) {
   let remaining = dt;
@@ -2231,7 +2245,7 @@ function repairCost(maxHp, hp, unitValue) {
 function createRepairQueue() {
   return { jobs: [], engineers: /* @__PURE__ */ new Map() };
 }
-function enqueue2(queue, target) {
+function enqueue(queue, target) {
   if (!(target.maxHp > 0) || !(target.value >= 0)) return { ok: false, reason: "invalid" };
   if (target.hp <= 0) return { ok: false, reason: "dead" };
   if (target.hp >= target.maxHp) return { ok: false, reason: "full" };
@@ -2595,7 +2609,7 @@ function startRepair(g, buildingId) {
   if (repairCost(b.maxHp, b.hp, def.cost) > 0 && g.economy.credits <= 0) {
     return { ok: false, reason: "funds" };
   }
-  const r = enqueue2(g.repairs, { id: b.id, hp: b.hp, maxHp: b.maxHp, value: def.cost });
+  const r = enqueue(g.repairs, { id: b.id, hp: b.hp, maxHp: b.maxHp, value: def.cost });
   if (!r.ok) return r;
   assignEngineer(g.repairs, b.id, b.id);
   b.repairing = true;

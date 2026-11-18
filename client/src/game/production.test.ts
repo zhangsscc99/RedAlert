@@ -26,6 +26,18 @@ import {
   missingRequirements,
   canProduce,
   enqueueUnitChecked,
+  refundAmount,
+  TECH_TREE,
+  missingTech,
+  canReachTech,
+  requirementsForTier,
+  PRODUCTION_TIER,
+  missingTechFor,
+  settleOrders,
+  producerFor,
+  spawnTileNear,
+  assignSpawnTiles,
+  suggestProduction,
   type Construction,
   type UnitOrder,
   type UpgradeOrder,
@@ -622,7 +634,9 @@ test('enqueueUnitChecked reports missing prerequisites instead of failing silent
   });
 
   const ok = enqueueUnitChecked(q, e, 'tank', { buildings });
-  assert.deepEqual(ok, { ok: true });
+  if (!ok.ok) assert.fail('tank should enqueue');
+  assert.equal(ok.order.kind, 'tank');
+  assert.equal(ok.order.cost, UNIT_STATS.tank.cost);
   assert.equal(q.length, 1);
 });
 
@@ -720,4 +734,381 @@ test('promoteOrder on the lane head is a no-op; cancelled head refunds by progre
   // The demoted infantry was untouched by the tank's promotion.
   assert.equal(q[0]!.kind, 'infantry');
   assert.equal(q[0]!.elapsed, 0);
+});
+
+// -------------------------------------------------------------- tech chain --
+
+test('TECH_TREE walks 兵营 → 雷达 → 重工 → 高科 with label keys', () => {
+  assert.deepEqual(
+    TECH_TREE.map((s) => s.tier),
+    ['barracks', 'radar', 'factory', 'tech'],
+  );
+  for (const s of TECH_TREE) assert.ok(s.labelKey.startsWith('tech.'));
+  assert.equal(TECH_TREE[0]!.labelKey, 'tech.barracks');
+  assert.equal(TECH_TREE[1]!.labelKey, 'tech.radar');
+  assert.equal(TECH_TREE[2]!.labelKey, 'tech.factory');
+  assert.equal(TECH_TREE[3]!.labelKey, 'tech.tech');
+});
+
+test('missingTech reports every unmet stage up to the target, in chain order', () => {
+  const empty = { buildings: [] as Building[] };
+
+  // Nothing built: reaching 高科 lists all four gaps; each names its stage.
+  const gaps = missingTech(empty, 'tech');
+  assert.deepEqual(
+    gaps.map((g) => g.tier),
+    ['barracks', 'radar', 'factory', 'tech'],
+  );
+  assert.deepEqual(gaps[0]!.missing, ['barracks']);
+  assert.deepEqual(gaps[1]!.missing, ['hq']);
+  assert.deepEqual(gaps[2]!.missing, ['refinery']);
+  assert.deepEqual(gaps[3]!.missing, ['power']);
+  assert.equal(canReachTech(empty, 'tech'), false);
+
+  // A finished barracks satisfies the first stage only.
+  const rax = { buildings: [finishedBuilding('barracks', 1)] };
+  const g2 = missingTech(rax, 'tech');
+  assert.deepEqual(
+    g2.map((g) => g.tier),
+    ['radar', 'factory', 'tech'],
+  );
+  assert.equal(canReachTech(rax, 'barracks'), true);
+  assert.equal(canReachTech(rax, 'radar'), false);
+
+  // Stages above the target are not inspected.
+  assert.deepEqual(missingTech(rax, 'barracks'), []);
+
+  // Unfinished sites never satisfy a stage.
+  const half = { buildings: [place([], 'hq', 0, 0, 9), finishedBuilding('barracks', 1)] };
+  assert.deepEqual(missingTech(half, 'radar')[0]!.missing, ['hq']);
+
+  // Full chain reachable once every stage stands finished.
+  const full = {
+    buildings: [
+      finishedBuilding('barracks', 1),
+      finishedBuilding('hq', 2),
+      finishedBuilding('refinery', 3),
+      finishedBuilding('power', 4),
+    ],
+  };
+  assert.deepEqual(missingTech(full, 'tech'), []);
+  assert.equal(canReachTech(full, 'tech'), true);
+});
+
+test('requirementsForTier flattens the cumulative chain for `requires` args', () => {
+  assert.deepEqual(requirementsForTier('barracks'), ['barracks']);
+  assert.deepEqual(requirementsForTier('radar'), ['barracks', 'hq']);
+  assert.deepEqual(requirementsForTier('factory'), ['barracks', 'hq', 'refinery']);
+  assert.deepEqual(requirementsForTier('tech'), ['barracks', 'hq', 'refinery', 'power']);
+});
+
+test('missingTechFor gates producibles by their declared tier', () => {
+  assert.equal(PRODUCTION_TIER.infantry, 'barracks');
+  assert.equal(PRODUCTION_TIER.tank, 'radar');
+  assert.equal(PRODUCTION_TIER.harvester, 'factory');
+
+  const empty = { buildings: [] as Building[] };
+  // Infantry needs only the first stage; the harvester is gated by the
+  // whole barracks → radar → 重工 chain even though its flat requires is
+  // just the refinery.
+  assert.deepEqual(missingTechFor(empty, 'infantry').map((g) => g.tier), ['barracks']);
+  assert.deepEqual(missingTechFor(empty, 'tank').map((g) => g.tier), ['barracks', 'radar']);
+  assert.deepEqual(missingTechFor(empty, 'harvester').map((g) => g.tier), [
+    'barracks',
+    'radar',
+    'factory',
+  ]);
+  // Turret has no declared tier — no chain gate at all.
+  assert.deepEqual(missingTechFor(empty, 'turret'), []);
+
+  const rax = { buildings: [finishedBuilding('barracks', 1)] };
+  assert.deepEqual(missingTechFor(rax, 'infantry'), []);
+  assert.deepEqual(missingTechFor(rax, 'tank').map((g) => g.tier), ['radar']);
+});
+
+// ---------------------------------------------------- shared-fund settle ---
+
+test('settleOrders charges each spec once across several producers', () => {
+  const e = createEconomy(10000);
+  const q = createUnitQueue();
+  const specs = [
+    { kind: 'infantry' as const, requestId: 'a', barracksId: 7 },
+    { kind: 'tank' as const, requestId: 'b', barracksId: 9 },
+  ];
+
+  const r = settleOrders(q, e, specs);
+  assert.equal(r.queued.length, 2);
+  assert.equal(r.deduped.length, 0);
+  assert.equal(r.rejected.length, 0);
+  assert.equal(e.credits, 10000 - UNIT_STATS.infantry.cost - UNIT_STATS.tank.cost);
+  assert.equal((r.queued[0]!).barracksId, 7);
+  assert.equal((r.queued[1]!).barracksId, 9);
+
+  // Retrying the same batch is idempotent: everything dedups, no credits move.
+  const again = settleOrders(q, e, specs);
+  assert.equal(again.queued.length, 0);
+  assert.equal(again.deduped.length, 2);
+  assert.equal(again.deduped[0], r.queued[0]);
+  assert.equal(e.credits, 10000 - UNIT_STATS.infantry.cost - UNIT_STATS.tank.cost);
+  assert.equal(q.length, 2);
+});
+
+test('settleOrders dedups inside the batch and keeps rejected specs non-fatal', () => {
+  const e = createEconomy(UNIT_STATS.infantry.cost + 1);
+  const q = createUnitQueue();
+  const r = settleOrders(q, e, [
+    { kind: 'infantry', requestId: 'a' },
+    { kind: 'infantry', requestId: 'a' }, // same token — never double-charged
+    { kind: 'tank', requestId: 'c' }, // unaffordable → rejected, batch continues
+  ]);
+  assert.equal(r.queued.length, 1);
+  assert.equal(r.deduped.length, 1);
+  assert.equal(r.deduped[0], r.queued[0]);
+  assert.equal(r.rejected.length, 1);
+  assert.equal(r.rejected[0]!.reason, 'funds');
+  assert.equal(e.credits, 1); // one infantry charged, nothing else
+  assert.equal(q.length, 1);
+});
+
+test('enqueueUnitChecked requestId dedup prevents double-spend on retry', () => {
+  const e = createEconomy(1000);
+  const q = createUnitQueue();
+  const first = enqueueUnitChecked(q, e, 'tank', { requestId: 'r1' });
+  if (!first.ok) assert.fail('first enqueue should succeed');
+  const paid = e.credits;
+
+  const retry = enqueueUnitChecked(q, e, 'tank', { requestId: 'r1' });
+  if (!retry.ok) assert.fail('retry should return the queued order');
+  assert.equal(retry.order, first.order);
+  assert.equal(e.credits, paid); // charged once
+  assert.equal(q.length, 1);
+
+  // A different token is a fresh order.
+  assert.equal(enqueueUnitChecked(q, e, 'infantry', { requestId: 'r2' }).ok, true);
+  assert.equal(q.length, 2);
+});
+
+// ------------------------------------------------------------ queue priority
+
+test('priority orders jump waiting lane siblings but never preempt progress', () => {
+  const e = createEconomy(10000);
+  const q = createUnitQueue();
+  enqueueUnitTo(q, e, 'infantry', 7); // pri 0, not yet started
+  enqueueUnitTo(q, e, 'infantry', 7); // waiting, pri 0
+  const vip = enqueueUnitChecked(q, e, 'tank', { barracksId: 7, priority: 5 });
+  if (!vip.ok) assert.fail('vip should enqueue');
+  assert.equal(vip.order.priority, 5);
+
+  // Nothing has started, so the tank jumps the whole waiting lane.
+  assert.equal(q[0]!.kind, 'tank');
+  tickProduction(q, 1); // tank now in progress: elapsed 1
+
+  // A later VIP never preempts the in-progress tank — it lands behind it
+  // but ahead of the still-waiting infantries.
+  const late = enqueueUnitChecked(q, e, 'infantry', { barracksId: 7, priority: 9 });
+  if (!late.ok) assert.fail('late vip should enqueue');
+  const lane = q.filter((o) => (o as UnitOrder).barracksId === 7);
+  assert.deepEqual(
+    lane.map((o) => o.kind),
+    ['tank', 'infantry', 'infantry', 'infantry'],
+  );
+  assert.equal(lane[0]!.kind, 'tank');
+  assert.equal(lane[0]!.elapsed, 1);
+  assert.equal(lane[1]!.priority, 9);
+
+  // FIFO among equals: a second pri-9 lands behind the first pri-9.
+  enqueueUnitChecked(q, e, 'infantry', { barracksId: 7, priority: 9 });
+  const lane2 = q.filter((o) => (o as UnitOrder).barracksId === 7);
+  assert.equal(lane2[2]!.priority, 9);
+  assert.equal(lane2[3]!.priority, undefined);
+
+  // The in-progress tank still finishes first — priority can cancel-wait,
+  // never preempt.
+  const done = tickProduction(q, UNIT_STATS.tank.buildTime - 1);
+  assert.equal(done.length, 1);
+  assert.equal(done[0]!.kind, 'tank');
+  assert.equal((q[0]! as UnitOrder).priority, 9); // vip is the new lane head
+});
+
+test('priority on a different lane does not reorder the default lane', () => {
+  const e = createEconomy(10000);
+  const q = createUnitQueue();
+  enqueueUnit(q, e, 'infantry'); // default lane
+  enqueueUnitChecked(q, e, 'tank', { barracksId: 9, priority: 99 });
+  const done = tickProduction(q, UNIT_STATS.infantry.buildTime);
+  // rax 9's VIP is on its own lane; the default lane ran normally in parallel.
+  assert.equal(done.length, 1);
+  assert.equal(done[0]!.kind, 'infantry');
+  assert.equal(q[0]!.kind, 'tank');
+  assert.equal(q[0]!.elapsed, UNIT_STATS.infantry.buildTime);
+});
+
+// -------------------------------------------------------------- refunds ---
+
+test('refundAmount floors the payout, honors rate, and never exceeds cost', () => {
+  // 100-cost order at 40% progress: unbuilt share 60 → floor keeps it exact.
+  assert.equal(refundAmount(100, 4, 10), 60);
+  // Fractional results round down.
+  assert.equal(refundAmount(7, 1, 2), 3); // floor(7 * 0.5)
+  // rate scales the unbuilt share (rate 0.5 → half of what's unbuilt).
+  assert.equal(refundAmount(100, 0, 10, { rate: 0.5 }), 50);
+  assert.equal(refundAmount(100, 5, 10, { rate: 0.5 }), 25);
+  // rate is clamped to [0,1]; payout is clamped to [0,cost].
+  assert.equal(refundAmount(100, 0, 10, { rate: 2 }), 100);
+  assert.equal(refundAmount(100, 0, 10, { rate: -1 }), 0);
+  assert.equal(refundAmount(100, 10, 10), 0); // 100% built refunds nothing
+  assert.ok(refundAmount(100, 0, 10) <= 100);
+  // Degenerate buildTime is treated as 0% progress.
+  assert.equal(refundAmount(50, 3, 0), 50);
+});
+
+test('cancelUnit honors a configurable refund policy', () => {
+  const e = createEconomy(10000);
+  const q = createUnitQueue();
+  enqueueUnit(q, e, 'tank'); // 800 / 12s
+  tickProduction(q, 6); // 50% done → unbuilt share 400
+
+  // Half-rate policy: only half of the unbuilt share comes back.
+  const before = e.credits;
+  assert.equal(cancelUnit(q, e, 0, { rate: 0.5 }), true);
+  assert.equal(e.credits - before, 200);
+});
+
+test('cancelConstruction honors a configurable refund policy', () => {
+  const e = createEconomy(10000);
+  const map = openMap();
+  const r = startConstruction('barracks', 0, 0, e, [], map);
+  if (!r.ok) assert.fail('site should start');
+  const list = [r.item];
+  tickConstruction(list, r.item.buildTime / 2, [], nextIdGen());
+
+  const before = e.credits;
+  assert.equal(cancelConstruction(list, e, 0, { rate: 0.25 }), true);
+  assert.equal(e.credits - before, Math.floor(r.item.cost * 0.5 * 0.25));
+});
+
+// --------------------------------------------------------- spawn avoidance --
+
+test('assignSpawnTiles gives same-tick spawns from two producers distinct tiles', () => {
+  const map = openMap();
+  const buildings: Building[] = [];
+  const raxA = place(buildings, 'barracks', 4, 4, 7);
+  raxA.done = true;
+  const raxB = place(buildings, 'barracks', 12, 4, 9);
+  raxB.done = true;
+
+  const orders: UnitOrder[] = [
+    { type: 'unit', key: 'infantry', kind: 'infantry', cost: 0, buildTime: 4, elapsed: 4, barracksId: 7 },
+    { type: 'unit', key: 'infantry', kind: 'infantry', cost: 0, buildTime: 4, elapsed: 4, barracksId: 9 },
+    // A second order from rax A must not collide with the first's tile.
+    { type: 'unit', key: 'infantry', kind: 'infantry', cost: 0, buildTime: 4, elapsed: 4, barracksId: 7 },
+  ];
+  const tiles = assignSpawnTiles(map, buildings, orders);
+  assert.equal(tiles.length, 3);
+  for (const t of tiles) assert.ok(t !== undefined);
+  const keys = new Set(tiles.map((t) => `${t!.x},${t!.y}`));
+  assert.equal(keys.size, 3); // no two spawns share a tile
+  // Every tile sits below its producer's exit row, passable and footprint-free.
+  for (const t of tiles) assert.equal(map.tiles[t!.y * map.w + t!.x], GRASS);
+});
+
+test('assignSpawnTiles respects occupied tiles and producer fallbacks', () => {
+  const map = openMap();
+  const buildings: Building[] = [];
+  const rax = place(buildings, 'barracks', 4, 4, 7);
+  rax.done = true;
+
+  const o: UnitOrder = {
+    type: 'unit', key: 'infantry', kind: 'infantry', cost: 0, buildTime: 4, elapsed: 4,
+    barracksId: 7,
+  };
+  // Preferred exit tile is (4 + 1, 4 + 2) = (5,6); occupying it pushes the
+  // spawn to the next free tile in scan order.
+  const first = assignSpawnTiles(map, buildings, [o]);
+  const blocked = assignSpawnTiles(map, buildings, [o], [first[0]!]);
+  assert.notDeepEqual(blocked[0], first[0]);
+  assert.ok(blocked[0] !== undefined);
+
+  // Orphan order (no barracksId, no finished barracks) falls back to any
+  // finished building, then map center when nothing stands.
+  const orphan: UnitOrder = {
+    type: 'unit', key: 'tank', kind: 'tank', cost: 0, buildTime: 12, elapsed: 12,
+  };
+  const b = producerFor(orphan, buildings);
+  assert.equal(b, rax); // finished barracks fallback
+  assert.equal(producerFor(o, []), undefined);
+  const center = assignSpawnTiles(map, [], [orphan]);
+  assert.ok(center[0] !== undefined);
+
+  // Orphan with a stamped-but-dead barracks still uses the fallback chain.
+  const dead = { ...o, barracksId: 99 };
+  assert.equal(producerFor(dead, buildings), rax);
+});
+
+test('spawnTileNear returns the nearest free tile and skips taken/impassable', () => {
+  const map = openMap(8, 8);
+  const taken = new Set<number>();
+  const t = spawnTileNear(map, [], taken, 4, 4);
+  assert.deepEqual(t, { x: 4, y: 4 });
+
+  // Water is never a spawn tile; taken tiles are skipped.
+  map.tiles[4 * map.w + 4] = WATER;
+  const t2 = spawnTileNear(map, [], taken, 4, 4);
+  assert.ok(t2 !== undefined && !(t2.x === 4 && t2.y === 4));
+  // A fully walled-off tiny map with maxR 0 yields nothing.
+  map.tiles.fill(WATER);
+  assert.equal(spawnTileNear(map, [], taken, 4, 4, 0), undefined);
+});
+
+// --------------------------------------------------------- AI suggestions --
+
+test('suggestProduction is pure and respects funds, tech chain, and owned units', () => {
+  const empty: Building[] = [];
+
+  // Broke + no tech: nothing to suggest.
+  assert.deepEqual(suggestProduction({ credits: 0, buildings: empty }), []);
+  // Rich but no tech: still nothing — even infantry needs a barracks.
+  assert.deepEqual(suggestProduction({ credits: 99999, buildings: empty }), []);
+
+  const raxOnly = [finishedBuilding('barracks', 1)];
+  const s1 = suggestProduction({ credits: 10000, buildings: raxOnly });
+  // Only infantry is reachable (tank needs the radar tier, harvester the
+  // whole factory chain).
+  assert.deepEqual(
+    s1.map((s) => s.kind),
+    ['infantry'],
+  );
+  assert.equal(s1[0]!.reasonKey, 'ai.suggest.filler');
+  assert.equal(s1[0]!.cost, UNIT_STATS.infantry.cost);
+
+  const full = [
+    finishedBuilding('barracks', 1),
+    finishedBuilding('hq', 2),
+    finishedBuilding('refinery', 3),
+    finishedBuilding('power', 4),
+  ];
+  const s2 = suggestProduction({ credits: 10000, buildings: full });
+  // Full chain: harvester first (economy), then tank (force), then filler.
+  assert.deepEqual(
+    s2.map((s) => [s.kind, s.reasonKey]),
+    [
+      ['harvester', 'ai.suggest.economy'],
+      ['tank', 'ai.suggest.force'],
+      ['infantry', 'ai.suggest.filler'],
+    ],
+  );
+
+  // Already fielding a harvester: the economy slot drops out.
+  const s3 = suggestProduction({ credits: 10000, buildings: full, owned: ['harvester'] });
+  assert.deepEqual(
+    s3.map((s) => s.kind),
+    ['tank', 'infantry'],
+  );
+
+  // Tight funds drop the pricey kinds but keep the affordable filler.
+  const s4 = suggestProduction({ credits: UNIT_STATS.infantry.cost, buildings: full });
+  assert.deepEqual(
+    s4.map((s) => s.kind),
+    ['infantry'],
+  );
 });
