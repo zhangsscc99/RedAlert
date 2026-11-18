@@ -1,7 +1,36 @@
 // A* pathfinding on the tile grid. 8 directions, diagonal cost sqrt(2),
 // and no diagonal "corner cutting" through blocked orthogonal neighbors.
 
-import { GRASS, idx, inBounds, isPassable, type GameMap, type Tile } from './grid.js';
+import { GRASS, ORE, idx, inBounds, isPassable, type GameMap, type Tile } from './grid.js';
+
+/**
+ * Tile value a map may use for paved road. generateMap never emits it, but
+ * callers can stamp it into GameMap.tiles; under {@link SmoothPathOptions
+ * .terrainCost} road is the cheap tier (units prefer it), grass is the
+ * baseline, ore is costly-but-crossable, and water stays impassable.
+ */
+export const ROAD = 3;
+
+const COST_ROAD = 0.6;
+const COST_GRASS = 1;
+const COST_ORE = 3;
+const MIN_TERRAIN_COST = COST_ROAD;
+/** Default soft cost per unit standing within `crowdRadius` of a tile. */
+const CROWD_COST = 1;
+
+/** Enter-cost multiplier for one tile value; Infinity = impassable. */
+function tileCost(t: number): number {
+  switch (t) {
+    case ROAD:
+      return COST_ROAD;
+    case GRASS:
+      return COST_GRASS;
+    case ORE:
+      return COST_ORE;
+    default:
+      return Infinity;
+  }
+}
 
 const SQRT2 = Math.SQRT2;
 const DIRS: readonly (readonly [number, number, number])[] = [
@@ -94,9 +123,12 @@ export function findPath(
  * Shared A* core. Callers supply the occupancy predicate and, optionally, a
  * per-step clearance check evaluated on the segment between the current and
  * candidate tile centers (used by radius avoidance). `enterCost` adds a soft
- * penalty for stepping onto a tile (used by group pathing to spread units);
- * `budget`, when given, is decremented per expanded node and aborts the
- * search with null once it hits zero.
+ * penalty for stepping onto a tile — it receives the base step length (1 or
+ * sqrt(2)) so terrain costs scale with distance while crowd penalties stay
+ * flat (used by group pathing to spread units); `budget`, when given, is
+ * decremented per expanded node and aborts the search with null once it hits
+ * zero. `hScale` shrinks the octile heuristic when tiles can cost less than
+ * the base step length (road terrain), keeping the heuristic admissible.
  */
 function astar(
   map: GameMap,
@@ -106,8 +138,9 @@ function astar(
   gy: number,
   passable: Passable,
   stepClear?: (cx: number, cy: number, nx: number, ny: number) => boolean,
-  enterCost?: (nx: number, ny: number) => number,
+  enterCost?: (nx: number, ny: number, base: number) => number,
   budget?: { left: number },
+  hScale = 1,
 ): Tile[] | null {
   const n = map.w * map.h;
   const g = new Float64Array(n).fill(Infinity);
@@ -118,7 +151,7 @@ function astar(
   const start = idx(map, sx, sy);
   const goal = idx(map, gx, gy);
   g[start] = 0;
-  f[start] = octile(sx, sy, gx, gy);
+  f[start] = octile(sx, sy, gx, gy) * hScale;
   const open = new Heap(f);
   open.push(start);
 
@@ -143,10 +176,10 @@ function astar(
       }
       if (stepClear && !stepClear(cx, cy, nx, ny)) continue;
       const ni = idx(map, nx, ny);
-      const ng = g[cur]! + cost + (enterCost ? enterCost(nx, ny) : 0);
+      const ng = g[cur]! + cost + (enterCost ? enterCost(nx, ny, cost) : 0);
       if (ng < g[ni]!) {
         g[ni] = ng;
-        f[ni] = ng + octile(nx, ny, gx, gy);
+        f[ni] = ng + octile(nx, ny, gx, gy) * hScale;
         came[ni] = cur;
         open.push(ni);
       }
@@ -254,6 +287,23 @@ export interface SmoothPathOptions {
    * avoidance and keeps findPath's hug-the-wall behavior.
    */
   radius?: number;
+  /**
+   * Enable tiered terrain costs: ROAD tiles are cheap to enter, GRASS is the
+   * baseline, ORE is costly but crossable, WATER and unknown tiles stay
+   * impassable. Default false keeps the flat-cost grass-only rules.
+   */
+  terrainCost?: boolean;
+  /**
+   * Tiles where other units currently stand. Entering a tile costs an extra
+   * `crowdCost` per unit within `crowdRadius` (Chebyshev) of it, so a unit
+   * paths around congestion instead of piling onto the same lane. Default
+   * off — no penalty when omitted.
+   */
+  crowd?: readonly Tile[];
+  /** Chebyshev radius around each `crowd` tile that adds cost. Default 1. */
+  crowdRadius?: number;
+  /** Soft cost per crowded unit. Default {@link CROWD_COST}. */
+  crowdCost?: number;
 }
 
 /**
@@ -275,13 +325,87 @@ export function findPathSmooth(
   if (!inBounds(map, sx, sy) || !inBounds(map, gx, gy)) return null;
   if (sx === gx && sy === gy) return [];
 
-  const blocked = blockedMask(map, opts.blockers ?? []);
+  const costMode = opts.terrainCost === true;
+  const blocked = blockedMask(map, opts.blockers ?? [], costMode);
   const nav = navFns(map, blocked, opts.radius ?? 0);
   if (!nav.clear(gx, gy)) return null;
 
-  const raw = astar(map, sx, sy, gx, gy, nav.clear, nav.step);
+  const counts = crowdCounts(map, opts.crowd, opts.crowdRadius ?? 1);
+  const enterCost = makeEnterCost(map, costMode, counts, opts.crowdCost ?? CROWD_COST);
+  const raw = astar(
+    map,
+    sx,
+    sy,
+    gx,
+    gy,
+    nav.clear,
+    nav.step,
+    enterCost,
+    undefined,
+    costMode ? MIN_TERRAIN_COST : 1,
+  );
   if (!raw) return null;
-  return pullString({ x: sx, y: sy }, raw, nav.los);
+  const los = costAwareLos(map, nav.los, costMode, counts);
+  return pullString({ x: sx, y: sy }, raw, los);
+}
+
+/**
+ * Build the per-step soft cost for a search: tiered terrain (scaled by the
+ * step length so diagonals across ore stay proportionally dear) plus a flat
+ * penalty per crowd unit near the entered tile. Returns undefined when both
+ * are off so the A* hot loop skips the callback entirely.
+ */
+function makeEnterCost(
+  map: GameMap,
+  costMode: boolean,
+  counts: Uint16Array | null,
+  per: number,
+): ((nx: number, ny: number, base: number) => number) | undefined {
+  if (!costMode && !counts) return undefined;
+  return (nx, ny, base) =>
+    (costMode ? (tileCost(map.tiles[idx(map, nx, ny)]!) - COST_GRASS) * base : 0) +
+    (counts ? counts[idx(map, nx, ny)]! * per : 0);
+}
+
+/**
+ * String pulling is cost-blind: it only knows blocked tiles. When soft costs
+ * are in play, wrapping `los` so a pulled segment may only sweep tiles that
+ * stay cheap (grass-tier or better) and un-crowded keeps smoothing from
+ * re-straightening the path right back through the ore or the mob it paid to
+ * avoid. Returns `los` unchanged when nothing soft is enabled.
+ */
+function costAwareLos(
+  map: GameMap,
+  los: (a: Tile, b: Tile) => boolean,
+  costMode: boolean,
+  counts: Uint16Array | null,
+): (a: Tile, b: Tile) => boolean {
+  if (!costMode && !counts) return los;
+  const ok = (x: number, y: number) =>
+    (!costMode || tileCost(map.tiles[idx(map, x, y)]!) <= COST_GRASS) &&
+    (!counts || counts[idx(map, x, y)]! === 0);
+  return (a, b) => los(a, b) && supercoverWalk(map, a.x, a.y, b.x, b.y, ok);
+}
+
+/** Count, for every tile, how many `units` stand within Chebyshev `r`. Null
+ * when no crowd was supplied so hot paths can skip the lookup entirely. */
+function crowdCounts(
+  map: GameMap,
+  units: readonly Tile[] | undefined,
+  r: number,
+): Uint16Array | null {
+  if (!units || units.length === 0) return null;
+  const counts = new Uint16Array(map.w * map.h);
+  for (const u of units) {
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        const x = u.x + dx;
+        const y = u.y + dy;
+        if (inBounds(map, x, y)) counts[idx(map, x, y)]!++;
+      }
+    }
+  }
+  return counts;
 }
 
 /** The three walkability checks every search/smoothing pair shares. */
@@ -330,11 +454,20 @@ function pullString(start: Tile, raw: readonly Tile[], los: (a: Tile, b: Tile) =
   return out;
 }
 
-/** Occupancy grid: 1 = blocked (impassable terrain or inside a blocker). */
-function blockedMask(map: GameMap, blockers: readonly Blocker[]): Uint8Array {
+/**
+ * Occupancy grid: 1 = blocked (impassable terrain or inside a blocker). When
+ * `costMode` is on, terrain is blocked only when its enter cost is infinite —
+ * water and unknown tiles — while ore and road stay walkable but pricey.
+ */
+function blockedMask(
+  map: GameMap,
+  blockers: readonly Blocker[],
+  costMode = false,
+): Uint8Array {
   const blocked = new Uint8Array(map.w * map.h);
   for (let i = 0; i < blocked.length; i++) {
-    if (map.tiles[i] !== GRASS) blocked[i] = 1;
+    const t = map.tiles[i]!;
+    if (costMode ? tileCost(t) === Infinity : t !== GRASS) blocked[i] = 1;
   }
   for (const b of blockers) {
     for (let y = b.gy; y < b.gy + b.h; y++) {
@@ -362,9 +495,21 @@ function supercoverClear(
   bx: number,
   by: number,
 ): boolean {
+  return supercoverWalk(map, ax, ay, bx, by, (x, y) => !blocked[idx(map, x, y)]);
+}
+
+/** supercoverClear generalized to any per-tile predicate. */
+function supercoverWalk(
+  map: GameMap,
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+  ok: (x: number, y: number) => boolean,
+): boolean {
   let x = ax;
   let y = ay;
-  if (blocked[idx(map, x, y)]) return false;
+  if (!ok(x, y)) return false;
   const sx = Math.sign(bx - ax);
   const sy = Math.sign(by - ay);
   const adx = Math.abs(bx - ax);
@@ -377,18 +522,18 @@ function supercoverClear(
     if (tx < ty) {
       x += sx;
       nx += 2;
-      if (blocked[idx(map, x, y)]) return false;
+      if (!ok(x, y)) return false;
     } else if (ty < tx) {
       y += sy;
       ny += 2;
-      if (blocked[idx(map, x, y)]) return false;
+      if (!ok(x, y)) return false;
     } else {
-      if (blocked[idx(map, x + sx, y)] || blocked[idx(map, x, y + sy)]) return false;
+      if (!ok(x + sx, y) || !ok(x, y + sy)) return false;
       x += sx;
       y += sy;
       nx += 2;
       ny += 2;
-      if (blocked[idx(map, x, y)]) return false;
+      if (!ok(x, y)) return false;
     }
   }
   return true;
@@ -572,18 +717,27 @@ const GROUP_AVOID_COST = 1.5;
  * altogether, in which case the nearest found slots are reused so the result
  * still lines up with the requested count. `radius` keeps slots the same
  * clearance from blocked terrain as findPathSmooth's radius option.
+ *
+ * `shape` picks the slot layout: 'ring' (default) packs the nearest cells in
+ * every direction, 'wide' fills along the x-axis first (a horizontal line —
+ * units shoulder to shoulder), 'narrow' fills along the y-axis first (a
+ * column for threading corridors).
  */
 export function formationSlots(
   target: Tile,
   count: number,
   map: GameMap,
   radius = 0,
+  shape: FormationShape = 'ring',
 ): Tile[] {
   if (count <= 0) return [];
   const blocked = blockedMask(map, []);
   const nav = navFns(map, blocked, radius);
-  return ringSlots(map, target, count, nav.clear);
+  return ringSlots(map, target, count, nav.clear, shape);
 }
+
+/** Slot layout for {@link formationSlots} and {@link findPathGroup}. */
+export type FormationShape = 'ring' | 'wide' | 'narrow';
 
 /**
  * Ring-by-ring scan for `count` unique cells near `target` satisfying
@@ -591,10 +745,41 @@ export function formationSlots(
  * found cells repeat (nearest first) so the output length is `count` whenever
  * at least one walkable cell exists; returns [] when none do.
  */
-function ringSlots(map: GameMap, target: Tile, count: number, passable: Passable): Tile[] {
+function ringSlots(
+  map: GameMap,
+  target: Tile,
+  count: number,
+  passable: Passable,
+  shape: FormationShape = 'ring',
+): Tile[] {
   const out: Tile[] = [];
   const maxR = Math.max(map.w, map.h);
-  for (let r = 0; out.length < count && r <= maxR; r++) {
+  if (shape !== 'ring') {
+    // Line formations rank by off-axis distance first, so a far on-axis cell
+    // beats a near off-axis one — the ring loop can't express that, gather
+    // every candidate and sort once.
+    const all: Tile[] = [];
+    for (let y = 0; y < map.h; y++) {
+      for (let x = 0; x < map.w; x++) {
+        if (passable(x, y)) all.push({ x, y });
+      }
+    }
+    const off = (t: Tile) => (shape === 'wide' ? Math.abs(t.y - target.y) : Math.abs(t.x - target.x));
+    all.sort(
+      (a, b) =>
+        off(a) - off(b) ||
+        (a.x - target.x) ** 2 +
+          (a.y - target.y) ** 2 -
+          ((b.x - target.x) ** 2 + (b.y - target.y) ** 2) ||
+        a.y - b.y ||
+        a.x - b.x,
+    );
+    for (const t of all) {
+      if (out.length >= count) break;
+      out.push(t);
+    }
+  }
+  for (let r = 0; shape === 'ring' && out.length < count && r <= maxR; r++) {
     const ring: Tile[] = [];
     for (let dy = -r; dy <= r; dy++) {
       for (let dx = -r; dx <= r; dx++) {
@@ -638,6 +823,11 @@ export interface GroupPathOptions extends SmoothPathOptions {
    * result is flagged `degraded`. Default {@link GROUP_NODE_BUDGET}.
    */
   nodeBudget?: number;
+  /**
+   * Slot layout passed to formationSlots: 'ring' (default), 'wide' for a
+   * horizontal line, 'narrow' for a column.
+   */
+  formation?: FormationShape;
 }
 
 /** Result of {@link findPathGroup}. */
@@ -679,9 +869,10 @@ export function findPathGroup(
   });
   if (!inBounds(map, target.x, target.y)) return none([]);
 
-  const blocked = blockedMask(map, opts.blockers ?? []);
+  const costMode = opts.terrainCost === true;
+  const blocked = blockedMask(map, opts.blockers ?? [], costMode);
   const nav = navFns(map, blocked, opts.radius ?? 0);
-  const slots = ringSlots(map, target, n, nav.clear);
+  const slots = ringSlots(map, target, n, nav.clear, opts.formation ?? 'ring');
   if (slots.length === 0) return none([]);
 
   // Assign each unit its nearest free slot.
@@ -702,7 +893,12 @@ export function findPathGroup(
   const avoid = opts.avoidCost ?? GROUP_AVOID_COST;
   const budget = { left: opts.nodeBudget ?? GROUP_NODE_BUDGET };
   const occupied = new Uint16Array(map.w * map.h);
-  const enterCost = (x: number, y: number) => occupied[idx(map, x, y)]! * avoid;
+  const counts = crowdCounts(map, opts.crowd, opts.crowdRadius ?? 1);
+  const soft = makeEnterCost(map, costMode, counts, opts.crowdCost ?? CROWD_COST);
+  const hScale = costMode ? MIN_TERRAIN_COST : 1;
+  const los = costAwareLos(map, nav.los, costMode, counts);
+  const enterCost = (x: number, y: number, base: number) =>
+    occupied[idx(map, x, y)]! * avoid + (soft ? soft(x, y, base) : 0);
   const paths: (Tile[] | null)[] = new Array(n).fill(null);
   let degraded = false;
 
@@ -714,13 +910,13 @@ export function findPathGroup(
     if (s.x === g.x && s.y === g.y) {
       raw = [];
     } else {
-      raw = astar(map, s.x, s.y, g.x, g.y, nav.clear, nav.step, enterCost, budget);
+      raw = astar(map, s.x, s.y, g.x, g.y, nav.clear, nav.step, enterCost, budget, hScale);
       if (!raw && budget.left > 0) {
         // Slot sits in a pocket the unit can't reach: retry the walkable
         // tile nearest the original target.
         const alt = nearestPassable(map, target.x, target.y, nav.clear);
         if (alt && (alt.x !== g.x || alt.y !== g.y)) {
-          raw = astar(map, s.x, s.y, alt.x, alt.y, nav.clear, nav.step, enterCost, budget);
+          raw = astar(map, s.x, s.y, alt.x, alt.y, nav.clear, nav.step, enterCost, budget, hScale);
           if (raw) {
             g = alt;
             assigned[i] = alt;
@@ -735,7 +931,7 @@ export function findPathGroup(
       }
       continue;
     }
-    const path = pullString(s, raw, nav.los);
+    const path = pullString(s, raw, los);
     paths[i] = path;
     markPathTiles(map, occupied, s, path);
   }
