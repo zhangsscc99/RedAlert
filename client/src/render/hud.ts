@@ -11,6 +11,13 @@ import {
   type Unit,
   type UnitKind,
 } from '../game/index.ts';
+import {
+  RANKS,
+  parseRank,
+  rankName,
+  rankProgress,
+  type Rank,
+} from '../game/veterancy.ts';
 
 export const MINIMAP_SIZE = 144;
 export const MINIMAP_MARGIN = 12;
@@ -308,6 +315,25 @@ const KIND_LABEL: Record<UnitKind, string> = {
   harvester: '采矿车',
 };
 
+/** Rank label colour, mirroring render/units.ts' badge palette. */
+const RANK_FG: Record<Rank, string> = {
+  rookie: '#c9c9b8',
+  veteran: '#9ec4ff',
+  elite: '#ffb0f0',
+};
+const XP_BAR = '#ffd94d';
+
+/** Highest veterancy rank across a selection (multi-select shows the best). */
+function topRank(units: readonly Unit[]): Rank {
+  let top: Rank = 'rookie';
+  for (const u of units) {
+    const rk = parseRank(u.rank);
+    if (RANKS.indexOf(rk) > RANKS.indexOf(top)) top = rk;
+    if (top === 'elite') break;
+  }
+  return top;
+}
+
 function panel(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number): void {
   ctx.fillStyle = PANEL_BG;
   ctx.fillRect(x, y, w, h);
@@ -536,15 +562,25 @@ export function drawSelectionCard(
       const u = sel[0]!;
       const frac = u.maxHp > 0 ? u.hp / u.maxHp : 0;
       const c = frac > 0.5 ? ACCENT : frac > 0.25 ? WARN : BAD;
+      const rk = parseRank(u.rank);
       ctx.font = `bold ${layout.font}px ui-monospace, Menlo, Consolas, monospace`;
       ctx.fillStyle = ACCENT;
       ctx.fillText(`${KIND_LABEL[u.kind] ?? u.kind}#${u.id}`, r.x + padX, cy);
+      ctx.fillStyle = RANK_FG[rk];
+      ctx.fillText(
+        rankName(rk),
+        r.x + padX + ctx.measureText(`${KIND_LABEL[u.kind] ?? u.kind}#${u.id}`).width + 6,
+        cy,
+      );
       const hpText = `${u.hp}/${u.maxHp}`;
       ctx.font = `${layout.font}px ui-monospace, Menlo, Consolas, monospace`;
       ctx.fillStyle = TEXT_MAIN;
       const tx = r.x + padX + 132;
       ctx.fillText(hpText, tx, cy);
-      bar(ctx, tx + 58, r.y + r.h / 2 - 4, r.w - (tx - r.x) - 58 - padX, 8, frac, c);
+      const bw = r.w - (tx - r.x) - 58 - padX;
+      bar(ctx, tx + 58, r.y + r.h / 2 - 6, bw, 6, frac, c);
+      // Kill progress toward the next rank: thin gold strip under the hp bar.
+      bar(ctx, tx + 58, r.y + r.h / 2 + 2, bw, 4, rankProgress(u.kills ?? 0).ratio, XP_BAR);
     } else {
       const groups = new Map<UnitKind, number>();
       for (const u of sel) groups.set(u.kind, (groups.get(u.kind) ?? 0) + 1);
@@ -556,7 +592,7 @@ export function drawSelectionCard(
       ctx.fillText(`${sel.length} 个单位`, r.x + padX, cy);
       ctx.font = `${layout.font}px ui-monospace, Menlo, Consolas, monospace`;
       ctx.fillStyle = TEXT_MAIN;
-      ctx.fillText(text, r.x + padX + 92, cy);
+      ctx.fillText(`${text} ·最高 ${rankName(topRank(sel))}`, r.x + padX + 92, cy);
     }
     return;
   }
@@ -566,24 +602,37 @@ export function drawSelectionCard(
 
   if (sel.length === 1) {
     const u = sel[0]!;
+    const rk = parseRank(u.rank);
+    const prog = rankProgress(u.kills ?? 0);
     const h = 86;
     const y = r.y + r.h - h; // bottom-aligned inside the layout rect
     panel(ctx, r.x, y, w, h);
 
     ctx.font = 'bold 14px ui-monospace, Menlo, Consolas, monospace';
     ctx.fillStyle = ACCENT;
-    ctx.fillText(`${KIND_LABEL[u.kind] ?? u.kind} #${u.id}`, r.x + padX, y + 20);
+    const title = `${KIND_LABEL[u.kind] ?? u.kind} #${u.id}`;
+    ctx.fillText(title, r.x + padX, y + 18);
+    ctx.fillStyle = RANK_FG[rk];
+    ctx.fillText(`· ${rankName(rk)}`, r.x + padX + ctx.measureText(title).width + 6, y + 18);
 
     ctx.font = '10px ui-monospace, Menlo, Consolas, monospace';
     ctx.fillStyle = TEXT_DIM;
-    ctx.fillText(`HP ${u.hp}/${u.maxHp}`, r.x + padX, y + 38);
+    ctx.fillText(`HP ${u.hp}/${u.maxHp}`, r.x + padX, y + 33);
     const frac = u.maxHp > 0 ? u.hp / u.maxHp : 0;
     const c = frac > 0.5 ? ACCENT : frac > 0.25 ? WARN : BAD;
-    bar(ctx, r.x + padX, y + 44, w - padX * 2, 8, frac, c);
+    bar(ctx, r.x + padX, y + 38, w - padX * 2, 6, frac, c);
+
+    // Kill progress toward the next rank (elite reads 满级 with a full bar).
+    ctx.fillText(
+      prog.next === null ? `击杀 ${prog.kills} · 满级` : `击杀 ${prog.kills}/${prog.next}`,
+      r.x + padX,
+      y + 56,
+    );
+    bar(ctx, r.x + padX, y + 61, w - padX * 2, 5, prog.ratio, XP_BAR);
 
     ctx.font = HUD_FONT;
     ctx.fillStyle = TEXT_MAIN;
-    ctx.fillText(`状态: ${unitStatus(u)}`, r.x + padX, y + 72);
+    ctx.fillText(`状态: ${unitStatus(u)}`, r.x + padX, y + 80);
     return;
   }
 
@@ -596,7 +645,8 @@ export function drawSelectionCard(
   const rows = [...groups.entries()].map(
     ([k, n]) => `${KIND_LABEL[k] ?? k}  x${n}`,
   );
-  const h = 26 + (rows.length + 1) * 18 + 6;
+  const top = topRank(sel);
+  const h = 26 + (rows.length + 2) * 18 + 6;
   const y = r.y + r.h - h;
   panel(ctx, r.x, y, w, h);
 
@@ -607,8 +657,10 @@ export function drawSelectionCard(
   ctx.font = HUD_FONT;
   ctx.fillStyle = TEXT_MAIN;
   rows.forEach((row, i) => ctx.fillText(row, r.x + padX, y + 22 + (i + 1) * 18));
+  ctx.fillStyle = RANK_FG[top];
+  ctx.fillText(`最高军衔: ${rankName(top)}`, r.x + padX, y + 22 + (rows.length + 1) * 18);
   ctx.fillStyle = TEXT_DIM;
-  ctx.fillText(`移动中: ${moving}`, r.x + padX, y + 22 + (rows.length + 1) * 18);
+  ctx.fillText(`移动中: ${moving}`, r.x + padX, y + 22 + (rows.length + 2) * 18);
 }
 
 // ------------------------------------------------------ production panel --

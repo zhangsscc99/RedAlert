@@ -102,6 +102,8 @@ export interface Sfx {
   ): void;
   /** Retune the distance attenuation used by play's at/view shorthand. */
   setSpatial?(params: Partial<SpatialParams>): void;
+  /** Veteran promotion chime — shorthand for play('promote'). */
+  promote(): void;
   /** Selection acknowledgment bark for a unit kind. */
   unitAck(kind: UnitVoice): void;
   /** Order confirmation bark for a unit kind. */
@@ -595,7 +597,7 @@ export function createSfx(): Sfx {
     if (c) table[kind](c, buses.voice ?? master!);
   }
 
-  return {
+  const api: Sfx = {
     get enabled(): boolean {
       return enabled;
     },
@@ -646,6 +648,9 @@ export function createSfx(): Sfx {
     setSpatial(params: Partial<SpatialParams>): void {
       Object.assign(spatial, params);
     },
+    promote(): void {
+      api.play('promote');
+    },
     unitAck(kind: UnitVoice): void {
       playVoice(kind, 'ack', acks);
     },
@@ -674,4 +679,5 @@ export function createSfx(): Sfx {
       lastPlay.clear();
     },
   };
+  return api;
 }
