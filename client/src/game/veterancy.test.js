@@ -47,13 +47,15 @@ var promotionQueue = [];
 function drainPromotions() {
   return promotionQueue.splice(0, promotionQueue.length);
 }
-function addKill(rank, kills) {
+function addKill(rank, kills, unitId) {
   const before = kills !== void 0 ? Math.max(0, Math.floor(kills)) : Math.max(0, (RANK_THRESHOLDS[nextRank(rank) ?? rank] ?? 0) - 1);
   const after = before + 1;
   const newRank = rankFromKills(after);
   const promoted = newRank !== rank;
   if (promoted) {
-    promotionQueue.push({ from: rank, to: newRank });
+    promotionQueue.push(
+      unitId === void 0 ? { from: rank, to: newRank } : { from: rank, to: newRank, unitId }
+    );
   }
   return { kills: after, rank: newRank, promoted };
 }
@@ -141,6 +143,27 @@ test("addKill without explicit kills promotes to the next rank", () => {
   assert.equal(addKill("rookie").rank, "veteran");
   assert.equal(addKill("veteran").rank, "elite");
   assert.equal(addKill("elite").rank, "elite");
+});
+test("addKill stamps the unit id on the queued promotion when given", () => {
+  drainPromotions();
+  addKill("rookie", 2, 42);
+  addKill("rookie", 0, 43);
+  addKill("veteran", 7, 44);
+  assert.deepEqual(drainPromotions(), [
+    { from: "rookie", to: "veteran", unitId: 42 },
+    { from: "veteran", to: "elite", unitId: 44 }
+  ]);
+});
+test("multiplier tables match the documented tuning", () => {
+  assert.equal(damageMultiplier("rookie"), 1);
+  assert.equal(damageMultiplier("veteran"), 1.15);
+  assert.equal(damageMultiplier("elite"), 1.3);
+  assert.equal(armorMultiplier("rookie"), 1);
+  assert.equal(armorMultiplier("veteran"), 0.9);
+  assert.equal(armorMultiplier("elite"), 0.8);
+  assert.equal(speedMultiplier("rookie"), 1);
+  assert.equal(speedMultiplier("veteran"), 1.05);
+  assert.equal(speedMultiplier("elite"), 1.1);
 });
 test("serializeRank/parseRank round-trip and parseRank falls back to rookie", () => {
   assert.equal(parseRank(serializeRank("elite")), "elite");

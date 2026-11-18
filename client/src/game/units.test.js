@@ -323,6 +323,12 @@ function segBoxDist(px, py, qx, qy, bx, by) {
   );
 }
 
+// src/game/veterancy.ts
+var RANK_SPEED = { rookie: 1, veteran: 1.05, elite: 1.1 };
+function speedMultiplier(rank) {
+  return RANK_SPEED[rank];
+}
+
 // src/game/units.ts
 var UNIT_STATS = {
   infantry: { hp: 50, speed: 70, cost: 100, buildTime: 4, radius: 9, canHarvest: false },
@@ -343,7 +349,9 @@ function makeUnit(id, kind, tx, ty) {
     angle: -Math.PI / 2,
     speed: stats.speed,
     path: [],
-    selected: false
+    selected: false,
+    kills: 0,
+    rank: "rookie"
   };
 }
 function spawnSpots(map, limit) {
@@ -392,7 +400,7 @@ function commandMove(units, map, gx, gy) {
 }
 function updateUnits(units, dt) {
   for (const u of units) {
-    let remaining = u.speed * dt;
+    let remaining = u.speed * speedMultiplier(u.rank ?? "rookie") * dt;
     while (remaining > 0) {
       const target = u.path[0];
       if (!target) break;

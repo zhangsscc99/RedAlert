@@ -10,6 +10,7 @@ import {
   type Combatant,
 } from './combat.js';
 import type { Building } from './buildings.js';
+import { drainPromotions } from './veterancy.js';
 
 function combatant(partial: Partial<Combatant> = {}): Combatant {
   return {
@@ -194,6 +195,70 @@ test('focus fire keeps the lock, then re-picks the nearest threat on death', () 
   assert.deepEqual(stepCombat([c, unreachable, inRange], 0.1, { focusFire: true }), []);
   assert.equal(c.targetId, 30);
   assert.equal(inRange.hp, 100);
+});
+
+test('veterancy: elite out-damages rookie and shrugs off more hits', () => {
+  const target = () => combatant({ id: 2, x: 30, team: 'enemy', hp: 400, maxHp: 400, cooldown: 100 });
+  const rookie = combatant({ id: 1, damage: 10, rank: 'rookie', kills: 0 });
+  const elite = combatant({ id: 3, damage: 10, rank: 'elite', kills: 8 });
+
+  // Same weapon, same target: only the attacker's rank differs (×1 vs ×1.3).
+  assert.ok(Math.abs(effectiveDamage(rookie, target()) - 10) <= 1);
+  assert.ok(Math.abs(effectiveDamage(elite, target()) - 13) <= 1);
+
+  const t1 = target();
+  const ev = stepCombat([rookie, t1], 0.1);
+  assert.deepEqual(ev, [{ type: 'hit', from: 1, to: 2, damage: 10 }]);
+  assert.equal(t1.hp, 390);
+
+  // Defender side: an elite takes 80% of a rookie hit, a rookie takes it all.
+  const rookieTarget = combatant({ id: 4, x: 30, team: 'enemy', hp: 400, maxHp: 400, cooldown: 100, rank: 'rookie' });
+  const eliteTarget = combatant({ id: 5, x: 30, team: 'enemy', hp: 400, maxHp: 400, cooldown: 100, rank: 'elite' });
+  assert.ok(Math.abs(effectiveDamage(rookie, rookieTarget) - 10) <= 1);
+  assert.ok(Math.abs(effectiveDamage(rookie, eliteTarget) - 8) <= 1);
+});
+
+test('veterancy: rankless combatants hit exactly as before and earn kills', () => {
+  drainPromotions();
+  const a = combatant({ id: 1, damage: 50 });
+  const t = combatant({ id: 2, x: 10, team: 'enemy', hp: 20 });
+  assert.equal(effectiveDamage(a, t), 50);
+  const events = stepCombat([a, t], 0.1);
+  assert.deepEqual(events, [
+    { type: 'hit', from: 1, to: 2, damage: 50 },
+    { type: 'death', id: 2 },
+  ]);
+  // The kill is recorded but one kill doesn't promote a rookie.
+  assert.equal(a.kills, 1);
+  assert.equal(a.rank, 'rookie');
+  assert.deepEqual(drainPromotions(), []);
+});
+
+test('veterancy: crossing a threshold promotes and queues the event', () => {
+  drainPromotions();
+  const a = combatant({ id: 7, damage: 50, kills: 2, rank: 'rookie' });
+  const t = combatant({ id: 2, x: 10, team: 'enemy', hp: 20 });
+  stepCombat([a, t], 0.1);
+  assert.equal(a.kills, 3);
+  assert.equal(a.rank, 'veteran');
+  assert.deepEqual(drainPromotions(), [{ from: 'rookie', to: 'veteran', unitId: 7 }]);
+  assert.deepEqual(drainPromotions(), []); // queue drained
+
+  // The next hit lands with the veteran multiplier (10 * 1.15 = 11.5).
+  const t2 = combatant({ id: 3, x: 10, team: 'enemy', hp: 400, maxHp: 400, cooldown: 100 });
+  const vet = combatant({ id: 8, damage: 10, kills: 3, rank: 'veteran' });
+  assert.ok(Math.abs(effectiveDamage(vet, t2) - 11.5) <= 1);
+});
+
+test('veterancy: splash kills credit the shooter too', () => {
+  drainPromotions();
+  const a = combatant({ id: 1, x: 0, y: 0, range: 400, damage: 40, splashRadius: 100, kills: 2, rank: 'rookie' });
+  const primary = combatant({ id: 2, x: 300, y: 0, team: 'enemy', hp: 10, cooldown: 100 });
+  const bystander = combatant({ id: 3, x: 320, y: 0, team: 'enemy', hp: 10, cooldown: 100 });
+  stepCombat([a, primary, bystander], 0.1, { splash: true });
+  assert.equal(a.kills, 4);
+  assert.equal(a.rank, 'veteran');
+  assert.deepEqual(drainPromotions(), [{ from: 'rookie', to: 'veteran', unitId: 1 }]);
 });
 
 test('a building on the fire line blocks the shot', () => {
