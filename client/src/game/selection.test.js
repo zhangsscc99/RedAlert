@@ -53,15 +53,6 @@ function toggleSelect(u) {
   u.selected = !u.selected;
 }
 
-// src/game/units.ts
-var UNIT_STATS = {
-  infantry: { hp: 50, speed: 70, cost: 100, buildTime: 4, radius: 9, canHarvest: false },
-  tank: { hp: 400, speed: 55, cost: 800, buildTime: 12, radius: 11, canHarvest: false },
-  harvester: { hp: 300, speed: 35, cost: 1400, buildTime: 20, radius: 12, canHarvest: true }
-};
-var UNIT_RADIUS = UNIT_STATS.infantry.radius;
-var INFANTRY_SPEED = UNIT_STATS.infantry.speed;
-
 // src/game/selection.test.ts
 function mkUnit(id, x, y) {
   return { id, kind: "infantry", hp: 50, maxHp: 50, x, y, angle: 0, speed: 70, path: [], selected: false };
@@ -97,37 +88,47 @@ test("selectUnits replaces selection unless additive", () => {
   selectUnits(units, null, false);
   assert.deepEqual(units.map((u) => u.selected), [false, false, false]);
 });
-function mkKindUnit(id, kind) {
-  const s = UNIT_STATS[kind];
-  return { id, kind, hp: s.hp, maxHp: s.hp, x: 0, y: 0, angle: 0, speed: s.speed, path: [], selected: false };
+function mkKindUnit(id, speed) {
+  return {
+    id,
+    kind: speed === 70 ? "infantry" : "tank",
+    hp: 50,
+    maxHp: 50,
+    x: 0,
+    y: 0,
+    angle: 0,
+    speed,
+    path: [],
+    selected: false
+  };
 }
 test("selectSameKind selects all units of the same kind", () => {
-  const units = [mkKindUnit(1, "infantry"), mkKindUnit(2, "tank"), mkKindUnit(3, "infantry")];
+  const units = [mkKindUnit(1, 70), mkKindUnit(2, 120), mkKindUnit(3, 70)];
   const n = selectSameKind(units, units[0]);
   assert.equal(n, 2);
   assert.deepEqual(units.map((u) => u.selected), [true, false, true]);
 });
 test("selectSameKind clears previously selected units of other kinds", () => {
-  const units = [mkKindUnit(1, "infantry"), mkKindUnit(2, "tank"), mkKindUnit(3, "infantry")];
+  const units = [mkKindUnit(1, 70), mkKindUnit(2, 120), mkKindUnit(3, 70)];
   units[1].selected = true;
   const n = selectSameKind(units, units[0]);
   assert.equal(n, 2);
   assert.equal(units[1].selected, false);
 });
 test("selectSameKind with a different kind sample selects only that kind", () => {
-  const units = [mkKindUnit(1, "infantry"), mkKindUnit(2, "tank"), mkKindUnit(3, "infantry")];
+  const units = [mkKindUnit(1, 70), mkKindUnit(2, 120), mkKindUnit(3, 70)];
   const n = selectSameKind(units, units[1]);
   assert.equal(n, 1);
   assert.deepEqual(units.map((u) => u.selected), [false, true, false]);
 });
 test("selectAll selects every unit and returns the count", () => {
-  const units = [mkKindUnit(1, "infantry"), mkKindUnit(2, "tank"), mkKindUnit(3, "infantry")];
+  const units = [mkKindUnit(1, 70), mkKindUnit(2, 120), mkKindUnit(3, 70)];
   assert.equal(selectAll(units), 3);
   assert.ok(units.every((u) => u.selected));
   assert.equal(selectAll([]), 0);
 });
 test("toggleSelect flips selected state both ways", () => {
-  const u = mkKindUnit(1, "infantry");
+  const u = mkKindUnit(1, 70);
   toggleSelect(u);
   assert.equal(u.selected, true);
   toggleSelect(u);
