@@ -17,6 +17,7 @@ var BUILDING_DEFS = {
   turret: { w: 2, h: 2, cost: 700, buildTime: 12, hp: 700, label: "Turret", range: 150, damage: 30, powerUse: 30, buildable: true },
   wall: { w: 1, h: 1, cost: 100, buildTime: 4, hp: 500, label: "Wall", blocksPath: true, buildable: true }
 };
+var RADAR_SCAN = { radius: 12 * TILE_SIZE, period: 5 };
 
 // src/game/fog.ts
 var SIGHT_RADIUS = {

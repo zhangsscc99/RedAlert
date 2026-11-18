@@ -27,6 +27,7 @@ function enqueue(q, e, item) {
 }
 
 // src/game/grid.ts
+var TILE_SIZE = 32;
 var GRASS = 0;
 var WATER = 1;
 function idx(map, x, y) {
@@ -80,6 +81,7 @@ function place(buildings, kind, gx, gy, nextId) {
   buildings.push(b);
   return b;
 }
+var RADAR_SCAN = { radius: 12 * TILE_SIZE, period: 5 };
 
 // src/game/units.ts
 var UNIT_STATS = {
@@ -157,12 +159,14 @@ function overlapsPending(c, kind, gx, gy) {
   const b = BUILDING_DEFS[kind];
   return gx < c.gx + a.w && gx + b.w > c.gx && gy < c.gy + a.h && gy + b.h > c.gy;
 }
-function startConstruction(kind, gx, gy, e, buildings, map, pending = []) {
+function startConstruction(kind, gx, gy, e, buildings, map, pending = [], requires) {
   const chk = canPlace(map, buildings, kind, gx, gy);
   if (!chk.ok) return { ok: false, reason: chk.reason ?? "oob" };
   for (const c of pending) {
     if (overlapsPending(c, kind, gx, gy)) return { ok: false, reason: "overlap" };
   }
+  const missing = missingRequirements({ buildings }, kind, requires);
+  if (missing.length > 0) return { ok: false, reason: "requires", missing };
   const def = BUILDING_DEFS[kind];
   if (!spend(e, def.cost)) return { ok: false, reason: "funds" };
   return {
@@ -195,7 +199,30 @@ function cancelConstruction(list, e, index) {
 function createUnitQueue() {
   return [];
 }
-function enqueueUnit(q, e, kind) {
+var PRODUCTION_REQUIRES = {
+  infantry: ["barracks"],
+  tank: ["barracks", "hq"],
+  harvester: ["refinery"]
+};
+function requirementsFor(kind, requires) {
+  return requires ?? PRODUCTION_REQUIRES[kind] ?? [];
+}
+function missingRequirements(state, kind, requires) {
+  const missing = [];
+  for (const k of requirementsFor(kind, requires)) {
+    if (missing.includes(k)) continue;
+    if (!state.buildings.some((b) => b.kind === k && b.done)) missing.push(k);
+  }
+  return missing;
+}
+function canProduce(state, kind, requires) {
+  return missingRequirements(state, kind, requires).length === 0;
+}
+function enqueueUnitChecked(q, e, kind, opts = {}) {
+  if (opts.buildings !== void 0) {
+    const missing = missingRequirements({ buildings: opts.buildings }, kind, opts.requires);
+    if (missing.length > 0) return { ok: false, reason: "requires", missing };
+  }
   const s = UNIT_STATS[kind];
   const order = {
     type: "unit",
@@ -205,22 +232,19 @@ function enqueueUnit(q, e, kind) {
     buildTime: s.buildTime,
     elapsed: 0
   };
-  return enqueue(q, e, order);
+  if (opts.barracksId !== void 0) {
+    order.barracksId = opts.barracksId;
+    const p = opts.rally?.get(opts.barracksId);
+    if (p) order.rally = { x: p.x, y: p.y };
+  }
+  if (!enqueue(q, e, order)) return { ok: false, reason: "funds" };
+  return { ok: true };
 }
-function enqueueUnitTo(q, e, kind, barracksId, rally) {
-  const s = UNIT_STATS[kind];
-  const order = {
-    type: "unit",
-    key: kind,
-    kind,
-    cost: s.cost,
-    buildTime: s.buildTime,
-    elapsed: 0,
-    barracksId
-  };
-  const p = rally?.get(barracksId);
-  if (p) order.rally = { x: p.x, y: p.y };
-  return enqueue(q, e, order);
+function enqueueUnit(q, e, kind, buildings, requires) {
+  return enqueueUnitChecked(q, e, kind, { buildings, requires }).ok;
+}
+function enqueueUnitTo(q, e, kind, barracksId, rally, buildings, requires) {
+  return enqueueUnitChecked(q, e, kind, { buildings, requires, barracksId, rally }).ok;
 }
 function createRallyPoints() {
   return /* @__PURE__ */ new Map();
@@ -306,6 +330,15 @@ function tickProduction(q, dt, parallel = PARALLEL_PER_BARRACKS) {
   q.length = 0;
   q.push(...rest);
   return done;
+}
+function promoteOrder(q, index) {
+  if (index < 0 || index >= q.length) return false;
+  const [o] = q.splice(index, 1);
+  const key = laneKey(o);
+  let i = 0;
+  while (i < q.length && laneKey(q[i]) !== key) i++;
+  q.splice(i, 0, o);
+  return true;
 }
 function cancelUnit(q, e, index) {
   if (index < 0 || index >= q.length) return false;
@@ -724,4 +757,126 @@ test("cancelling a queued upgrade refunds its remaining progress", () => {
   const before = e.credits;
   assert.equal(cancelUnit(q, e, 0), true);
   assert.equal(e.credits, before + Math.round(tier.cost * 0.5));
+});
+function finishedBuilding(kind, id) {
+  const b = place([], kind, 0, 0, id);
+  b.done = true;
+  return b;
+}
+test("PRODUCTION_REQUIRES declares the spec tech tree", () => {
+  assert.deepEqual(requirementsFor("infantry"), ["barracks"]);
+  assert.deepEqual(requirementsFor("tank"), ["barracks", "hq"]);
+  assert.deepEqual(requirementsFor("harvester"), ["refinery"]);
+  assert.deepEqual(requirementsFor("turret"), []);
+  assert.deepEqual(requirementsFor("infantry", ["power"]), ["power"]);
+  assert.deepEqual(PRODUCTION_REQUIRES.tank, ["barracks", "hq"]);
+});
+test("missingRequirements names each unmet kind once; canProduce mirrors it", () => {
+  const empty = { buildings: [] };
+  assert.deepEqual(missingRequirements(empty, "tank"), ["barracks", "hq"]);
+  assert.deepEqual(missingRequirements(empty, "infantry"), ["barracks"]);
+  assert.deepEqual(missingRequirements(empty, "harvester"), ["refinery"]);
+  assert.deepEqual(missingRequirements(empty, "turret"), []);
+  assert.equal(canProduce(empty, "tank"), false);
+  assert.equal(canProduce(empty, "barracks"), true);
+  const half = { buildings: [place([], "barracks", 0, 0, 1)] };
+  assert.deepEqual(missingRequirements(half, "infantry"), ["barracks"]);
+  const rax = { buildings: [finishedBuilding("barracks", 1)] };
+  assert.deepEqual(missingRequirements(rax, "infantry"), []);
+  assert.deepEqual(missingRequirements(rax, "tank"), ["hq"]);
+  assert.equal(canProduce(rax, "tank"), false);
+  const full = { buildings: [finishedBuilding("barracks", 1), finishedBuilding("hq", 2)] };
+  assert.deepEqual(missingRequirements(full, "tank"), []);
+  assert.equal(canProduce(full, "tank"), true);
+});
+test("enqueueUnitChecked reports missing prerequisites instead of failing silently", () => {
+  const e = createEconomy(1e4);
+  const q = createUnitQueue();
+  const r = enqueueUnitChecked(q, e, "tank", { buildings: [] });
+  assert.deepEqual(r, { ok: false, reason: "requires", missing: ["barracks", "hq"] });
+  assert.equal(q.length, 0);
+  assert.equal(e.credits, 1e4);
+  assert.equal(enqueueUnit(q, e, "tank", []), false);
+  assert.equal(q.length, 0);
+  const buildings = [finishedBuilding("barracks", 1)];
+  const r2 = enqueueUnitChecked(q, e, "tank", { buildings });
+  assert.deepEqual(r2, { ok: false, reason: "requires", missing: ["hq"] });
+  buildings.push(finishedBuilding("hq", 2));
+  const broke = createEconomy(UNIT_STATS.tank.cost - 1);
+  assert.deepEqual(enqueueUnitChecked(q, broke, "tank", { buildings }), {
+    ok: false,
+    reason: "funds"
+  });
+  const ok = enqueueUnitChecked(q, e, "tank", { buildings });
+  assert.deepEqual(ok, { ok: true });
+  assert.equal(q.length, 1);
+});
+test("enqueueUnit/enqueueUnitTo enforce requires only when buildings are passed", () => {
+  const e = createEconomy(1e4);
+  const q = createUnitQueue();
+  assert.equal(enqueueUnit(q, e, "tank"), true);
+  q.length = 0;
+  assert.equal(enqueueUnit(q, e, "harvester", []), false);
+  assert.equal(enqueueUnitTo(q, e, "harvester", 7, void 0, []), false);
+  assert.equal(q.length, 0);
+  const buildings = [finishedBuilding("refinery", 3)];
+  assert.equal(enqueueUnit(q, e, "harvester", buildings), true);
+  assert.equal(enqueueUnitTo(q, e, "harvester", 7, void 0, buildings), true);
+  assert.equal(q.length, 2);
+  assert.equal(enqueueUnit(q, e, "infantry", [], ["power"]), false);
+});
+test("startConstruction refuses sites whose declared requires are unmet", () => {
+  const e = createEconomy(1e4);
+  const map = openMap();
+  const buildings = [];
+  const r = startConstruction("turret", 0, 0, e, buildings, map, [], ["barracks"]);
+  assert.deepEqual(r, { ok: false, reason: "requires", missing: ["barracks"] });
+  assert.equal(e.credits, 1e4);
+  buildings.push(place([], "barracks", 10, 10, 1));
+  assert.deepEqual(startConstruction("turret", 0, 0, e, buildings, map, [], ["barracks"]), {
+    ok: false,
+    reason: "requires",
+    missing: ["barracks"]
+  });
+  buildings[0].done = true;
+  assert.equal(startConstruction("turret", 0, 0, e, buildings, map, [], ["barracks"]).ok, true);
+  assert.equal(startConstruction("wall", 0, 4, e, buildings, map).ok, true);
+  assert.equal(startConstruction("turret", 0, 8, e, [], openMap(), [], []).ok, true);
+});
+test("promoteOrder jumps an order to the front of its own lane", () => {
+  const e = createEconomy(1e4);
+  const q = createUnitQueue();
+  enqueueUnitTo(q, e, "infantry", 7);
+  enqueueUnitTo(q, e, "tank", 7);
+  enqueueUnitTo(q, e, "infantry", 9);
+  assert.equal(promoteOrder(q, 1), true);
+  assert.deepEqual(
+    q.map((o) => o.kind),
+    ["tank", "infantry", "infantry"]
+  );
+  const done = tickProduction(q, 4);
+  assert.equal(done.length, 1);
+  assert.equal(done[0].barracksId, 9);
+  const tank = q.find((o) => o.kind === "tank");
+  const waiting = q.find((o) => o.type === "unit" && o.kind === "infantry");
+  assert.equal(tank.elapsed, 4);
+  assert.equal(waiting.elapsed, 0);
+  assert.equal(promoteOrder(q, -1), false);
+  assert.equal(promoteOrder(q, 99), false);
+});
+test("promoteOrder on the lane head is a no-op; cancelled head refunds by progress", () => {
+  const e = createEconomy(1e4);
+  const q = createUnitQueue();
+  enqueueUnit(q, e, "infantry");
+  enqueueUnit(q, e, "tank");
+  assert.equal(promoteOrder(q, 0), true);
+  assert.equal(q[0].kind, "infantry");
+  assert.equal(promoteOrder(q, 1), true);
+  assert.equal(q[0].kind, "tank");
+  tickProduction(q, UNIT_STATS.tank.buildTime / 2);
+  const before = e.credits;
+  assert.equal(cancelUnit(q, e, 0), true);
+  assert.equal(e.credits, before + Math.round(UNIT_STATS.tank.cost * 0.5));
+  assert.equal(q[0].kind, "infantry");
+  assert.equal(q[0].elapsed, 0);
 });

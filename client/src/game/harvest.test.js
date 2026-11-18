@@ -192,16 +192,6 @@ var UNIT_STATS = {
 var UNIT_RADIUS = UNIT_STATS.infantry.radius;
 var INFANTRY_SPEED = UNIT_STATS.infantry.speed;
 
-// src/game/buildings.ts
-var BUILDING_DEFS = {
-  hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2e3, label: "HQ", buildable: false },
-  barracks: { w: 3, h: 2, cost: 500, buildTime: 15, hp: 800, label: "Barracks", powerUse: 40, buildable: true },
-  refinery: { w: 4, h: 3, cost: 2e3, buildTime: 25, hp: 1200, label: "Refinery", powerUse: 50, buildable: true },
-  power: { w: 2, h: 2, cost: 300, buildTime: 8, hp: 400, label: "Power Plant", buildable: true },
-  turret: { w: 2, h: 2, cost: 700, buildTime: 12, hp: 700, label: "Turret", range: 150, damage: 30, powerUse: 30, buildable: true },
-  wall: { w: 1, h: 1, cost: 100, buildTime: 4, hp: 500, label: "Wall", blocksPath: true, buildable: true }
-};
-
 // src/game/economy.ts
 function createEconomy(start = 5e3) {
   return { credits: start, earned: 0, spent: 0 };
@@ -211,6 +201,17 @@ function credit(e, amount) {
   e.credits += amount;
   e.earned += amount;
 }
+
+// src/game/buildings.ts
+var BUILDING_DEFS = {
+  hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2e3, label: "HQ", buildable: false },
+  barracks: { w: 3, h: 2, cost: 500, buildTime: 15, hp: 800, label: "Barracks", powerUse: 40, buildable: true },
+  refinery: { w: 4, h: 3, cost: 2e3, buildTime: 25, hp: 1200, label: "Refinery", powerUse: 50, buildable: true },
+  power: { w: 2, h: 2, cost: 300, buildTime: 8, hp: 400, label: "Power Plant", buildable: true },
+  turret: { w: 2, h: 2, cost: 700, buildTime: 12, hp: 700, label: "Turret", range: 150, damage: 30, powerUse: 30, buildable: true },
+  wall: { w: 1, h: 1, cost: 100, buildTime: 4, hp: 500, label: "Wall", blocksPath: true, buildable: true }
+};
+var RADAR_SCAN = { radius: 12 * TILE_SIZE, period: 5 };
 
 // src/game/harvest.ts
 var HARVEST_RATE = 140;
