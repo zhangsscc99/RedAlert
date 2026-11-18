@@ -57,13 +57,62 @@ function spend(e, amount) {
   return true;
 }
 
+// src/game/upgrades.ts
+var BASE_LEVEL = 1;
+var MAX_LEVEL = 3;
+var stock = (effect) => ({
+  level: 1,
+  label: "\u57FA\u7840",
+  cost: 0,
+  time: 0,
+  effect,
+  multiplier: 1,
+  needsPower: false
+});
+var UPGRADE_TABLE = {
+  hq: {
+    1: stock("armor"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 800, time: 15, effect: "armor", multiplier: 1.25, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 1500, time: 25, effect: "armor", multiplier: 1.5, needsPower: true }
+  },
+  barracks: {
+    1: stock("production"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 300, time: 12, effect: "production", multiplier: 1.25, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 600, time: 20, effect: "production", multiplier: 1.5, needsPower: true }
+  },
+  refinery: {
+    1: stock("production"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 1e3, time: 18, effect: "production", multiplier: 1.5, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 2e3, time: 30, effect: "production", multiplier: 2, needsPower: true }
+  },
+  power: {
+    1: stock("production"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 200, time: 8, effect: "production", multiplier: 1.5, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 400, time: 15, effect: "production", multiplier: 2, needsPower: true }
+  },
+  turret: {
+    1: stock("range"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 400, time: 12, effect: "range", multiplier: 1.25, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 800, time: 20, effect: "range", multiplier: 1.5, needsPower: true }
+  },
+  wall: {
+    1: stock("armor"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 50, time: 4, effect: "armor", multiplier: 1.5, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 100, time: 8, effect: "armor", multiplier: 2, needsPower: true }
+  }
+};
+function effectAt(kind, level) {
+  const t = UPGRADE_TABLE[kind][level];
+  return { effect: t.effect, multiplier: t.multiplier };
+}
+
 // src/game/buildings.ts
 var BUILDING_DEFS = {
-  hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2e3, label: "HQ", buildable: false },
+  hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2e3, label: "HQ", radar: true, buildable: false },
   barracks: { w: 3, h: 2, cost: 500, buildTime: 15, hp: 800, label: "Barracks", powerUse: 40, buildable: true },
   refinery: { w: 4, h: 3, cost: 2e3, buildTime: 25, hp: 1200, label: "Refinery", powerUse: 50, buildable: true },
   power: { w: 2, h: 2, cost: 300, buildTime: 8, hp: 400, label: "Power Plant", buildable: true },
-  turret: { w: 2, h: 2, cost: 700, buildTime: 12, hp: 700, label: "Turret", range: 150, damage: 30, powerUse: 30, buildable: true },
+  turret: { w: 2, h: 2, cost: 700, buildTime: 12, hp: 700, label: "Turret", range: 150, damage: 30, powerUse: 30, antiAir: true, buildable: true },
   wall: { w: 1, h: 1, cost: 100, buildTime: 4, hp: 500, label: "Wall", blocksPath: true, buildable: true }
 };
 function isDefensive(kind) {
@@ -202,6 +251,56 @@ function claimCompletionYield(b, claimed, supply) {
   if (!b.done || claimed.has(b.id)) return null;
   claimed.add(b.id);
   return { ...supply };
+}
+function defOf(kindOrDef) {
+  return typeof kindOrDef === "string" ? BUILDING_DEFS[kindOrDef] : kindOrDef;
+}
+function clampLevel(level) {
+  const l = Math.round(level);
+  return l <= BASE_LEVEL ? BASE_LEVEL : l >= MAX_LEVEL ? MAX_LEVEL : l;
+}
+function buildingStatsAt(kind, level = BASE_LEVEL) {
+  const def = BUILDING_DEFS[kind];
+  const { effect, multiplier } = effectAt(kind, clampLevel(level));
+  const s = { hp: def.hp, range: def.range ?? 0, damage: def.damage ?? 0, output: 1 };
+  if (effect === "armor") s.hp = Math.round(def.hp * multiplier);
+  else if (effect === "range") s.range = Math.round((def.range ?? 0) * multiplier);
+  else s.output = multiplier;
+  return s;
+}
+function maxHpAtLevel(kind, level = BASE_LEVEL) {
+  return buildingStatsAt(kind, level).hp;
+}
+function rangeAtLevel(kind, level = BASE_LEVEL) {
+  return buildingStatsAt(kind, level).range;
+}
+function outputAtLevel(kind, level = BASE_LEVEL) {
+  return buildingStatsAt(kind, level).output;
+}
+function applyLevel(b, level) {
+  const maxHp = maxHpAtLevel(b.kind, level);
+  return { ...b, maxHp, hp: Math.min(b.hp, maxHp) };
+}
+function isAntiAir(kindOrDef) {
+  return defOf(kindOrDef).antiAir === true;
+}
+function canEngage(kindOrDef, domain) {
+  const def = defOf(kindOrDef);
+  if (!((def.range ?? 0) > 0) || !((def.damage ?? 0) > 0)) return false;
+  return domain === "ground" || def.antiAir === true;
+}
+function engageableTargets(kindOrDef, targets) {
+  return targets.filter((t) => canEngage(kindOrDef, t.domain ?? "ground"));
+}
+function isRadarHost(kindOrDef) {
+  return defOf(kindOrDef).radar === true;
+}
+var RADAR_VISION_BONUS = { 1: 4, 2: 6, 3: 8 };
+function radarVisionBonus(b, level = BASE_LEVEL) {
+  return b.done && isRadarHost(b.kind) ? RADAR_VISION_BONUS[clampLevel(level)] : 0;
+}
+function inDepotRange(depot, v) {
+  return isAdjacentTo(depot, worldToTile(v.x), worldToTile(v.y));
 }
 
 // src/game/buildings.test.ts
@@ -471,4 +570,115 @@ test("claimCompletionYield pays out exactly once per finished building", () => {
   const other = place([], "barracks", 4, 4, 2);
   other.done = true;
   assert.deepEqual(claimCompletionYield(other, claimed, supply), supply);
+});
+test("clampLevel rounds and clamps into the 1-3 band", () => {
+  assert.equal(clampLevel(1), 1);
+  assert.equal(clampLevel(2), 2);
+  assert.equal(clampLevel(3), 3);
+  assert.equal(clampLevel(0), 1);
+  assert.equal(clampLevel(-9), 1);
+  assert.equal(clampLevel(4), 3);
+  assert.equal(clampLevel(99), 3);
+  assert.equal(clampLevel(2.4), 2);
+  assert.equal(clampLevel(2.6), 3);
+});
+test("armor kinds grow maxHp per level (hq 2000 \u2192 2500 \u2192 3000)", () => {
+  assert.equal(maxHpAtLevel("hq"), 2e3);
+  assert.equal(maxHpAtLevel("hq", 1), 2e3);
+  assert.equal(maxHpAtLevel("hq", 2), 2500);
+  assert.equal(maxHpAtLevel("hq", 3), 3e3);
+  assert.equal(maxHpAtLevel("wall", 3), 1e3);
+});
+test("range kinds grow attack reach per level (turret 150 \u2192 188 \u2192 225)", () => {
+  assert.equal(rangeAtLevel("turret"), 150);
+  assert.equal(rangeAtLevel("turret", 2), Math.round(150 * 1.25));
+  assert.equal(rangeAtLevel("turret", 3), 225);
+  assert.equal(rangeAtLevel("refinery", 3), 0);
+  assert.equal(rangeAtLevel("hq", 3), 0);
+});
+test("production kinds scale output per level; other effects leave it at 1", () => {
+  assert.equal(outputAtLevel("refinery"), 1);
+  assert.equal(outputAtLevel("refinery", 2), 1.5);
+  assert.equal(outputAtLevel("refinery", 3), 2);
+  assert.equal(outputAtLevel("barracks", 3), 1.5);
+  assert.equal(outputAtLevel("power", 2), 1.5);
+  assert.equal(outputAtLevel("hq", 3), 1);
+  assert.equal(outputAtLevel("turret", 3), 1);
+});
+test("buildingStatsAt reports the whole sheet with only the boosted stat moved", () => {
+  assert.deepEqual(buildingStatsAt("turret"), { hp: 700, range: 150, damage: 30, output: 1 });
+  assert.deepEqual(buildingStatsAt("turret", 3), { hp: 700, range: 225, damage: 30, output: 1 });
+  assert.deepEqual(buildingStatsAt("hq", 2), { hp: 2500, range: 0, damage: 0, output: 1 });
+  assert.deepEqual(buildingStatsAt("refinery", 2), { hp: 1200, range: 0, damage: 0, output: 1.5 });
+});
+test("applyLevel grows maxHp without a free heal; downgrade clamps surplus hp", () => {
+  const hq = doneHq(1);
+  const up = applyLevel(hq, 2);
+  assert.equal(up.maxHp, 2500);
+  assert.equal(up.hp, 2e3);
+  assert.equal(hq.maxHp, 2e3);
+  const hurt = applyLevel({ ...hq, hp: 1500 }, 3);
+  assert.equal(hurt.maxHp, 3e3);
+  assert.equal(hurt.hp, 1500);
+  const down = applyLevel({ ...hq, hp: 2800, maxHp: 3e3 }, 1);
+  assert.equal(down.maxHp, 2e3);
+  assert.equal(down.hp, 2e3);
+});
+test("isAntiAir: only the turret reaches air targets", () => {
+  assert.equal(isAntiAir("turret"), true);
+  assert.equal(isAntiAir(BUILDING_DEFS.turret), true);
+  for (const k of ["hq", "barracks", "refinery", "power", "wall"]) {
+    assert.equal(isAntiAir(k), false);
+  }
+});
+test("canEngage: air refuses every weapon but antiAir; unarmed kinds shoot nothing", () => {
+  assert.equal(canEngage("turret", "ground"), true);
+  assert.equal(canEngage("turret", "air"), true);
+  for (const k of ["hq", "barracks", "refinery", "power", "wall"]) {
+    assert.equal(canEngage(k, "ground"), false);
+    assert.equal(canEngage(k, "air"), false);
+  }
+  const gun = { w: 1, h: 1, cost: 0, buildTime: 0, hp: 1, label: "Gun", range: 100, damage: 10 };
+  assert.equal(canEngage(gun, "ground"), true);
+  assert.equal(canEngage(gun, "air"), false);
+  assert.equal(canEngage({ ...gun, damage: 0 }, "ground"), false);
+  assert.equal(canEngage({ ...gun, range: 0 }, "ground"), false);
+});
+test("engageableTargets filters a mixed-domain list to legal shots", () => {
+  const targets = [
+    { id: 1, domain: "ground" },
+    { id: 2, domain: "air" },
+    { id: 3 }
+    // no domain counts as ground
+  ];
+  assert.deepEqual(engageableTargets("turret", targets).map((t) => t.id), [1, 2, 3]);
+  const gun = { w: 1, h: 1, cost: 0, buildTime: 0, hp: 1, label: "Gun", range: 100, damage: 10 };
+  assert.deepEqual(engageableTargets(gun, targets).map((t) => t.id), [1, 3]);
+  assert.deepEqual(engageableTargets("barracks", targets), []);
+});
+test("isRadarHost flags only dish hosts (the HQ)", () => {
+  assert.equal(isRadarHost("hq"), true);
+  assert.equal(isRadarHost(BUILDING_DEFS.hq), true);
+  for (const k of ["barracks", "refinery", "power", "turret", "wall"]) {
+    assert.equal(isRadarHost(k), false);
+  }
+});
+test("radarVisionBonus scales with level and needs a finished dish", () => {
+  const hq = doneHq(1);
+  assert.equal(RADAR_VISION_BONUS[1], 4);
+  assert.equal(radarVisionBonus(hq), 4);
+  assert.equal(radarVisionBonus(hq, 2), 6);
+  assert.equal(radarVisionBonus(hq, 3), 8);
+  hq.done = false;
+  assert.equal(radarVisionBonus(hq, 3), 0);
+  const rax = place([], "barracks", 0, 0, 9);
+  rax.done = true;
+  assert.equal(radarVisionBonus(rax, 3), 0);
+});
+test("inDepotRange matches the footprint ring on the vehicle tile", () => {
+  const depot = doneHq(1, 10, 10);
+  assert.equal(inDepotRange(depot, vehicle(5, 9, 10, 50)), true);
+  assert.equal(inDepotRange(depot, vehicle(6, 14, 13, 50)), true);
+  assert.equal(inDepotRange(depot, vehicle(7, 15, 10, 50)), false);
+  assert.equal(inDepotRange(depot, vehicle(8, 20, 20, 50)), false);
 });
