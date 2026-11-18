@@ -21,12 +21,9 @@
 - [x] F011 生产路径 /redalert/ 返回 200 且含游戏 canvas｜verify: bash -c "curl -sf http://127.0.0.1:3027/redalert/ | grep -q 'canvas id=\"game\"'"｜risk: low
 - [x] F012 部署失败时可回退上一版 dist｜verify: bash -n scripts/rollback.sh && bash -n scripts/ci-deploy.sh｜risk: low
 
-## M2（待办示例，下一轮展开）
+## M2（旧占位已并入 F201–F206）
 
-- [ ] F101 矿石地形生成与渲染｜verify: node --test client/src/game/grid.test.js｜risk: low
-- [ ] F102 矿车采集-回程循环｜verify: node --test client/src/game/economy.test.js｜risk: med
-- [ ] F103 建筑放置（格子吸附/占地判定）｜verify: node --test client/src/game/buildings.test.js｜risk: med
-- [ ] F104 兵营生产队列与资金扣款｜verify: node --test client/src/game/economy.test.js｜risk: med
+> F101 矿石地形→F201；F102 采集→F202+F302；F103 建筑放置→F203；F104 生产队列→F204+F303。旧复选框删除，避免重复计数。
 
 ## M2 并行车道批（2026-11-18 13:15 UTC）
 
@@ -40,3 +37,20 @@
 - [x] F208 选择增强：双击选同类、Ctrl+A 全选、框选顺序稳定（selection.ts）｜verify: bash scripts/build-tests.sh && node --test client/src/game/selection.test.js && (cd client && npx tsc --noEmit)｜risk: low
 - [x] F209 相机体验：屏幕边缘滚动 + 平移平滑插值 + 限位不越界（camera.ts）｜verify: bash scripts/build-tests.sh && node --test client/src/game/camera.test.js && (cd client && npx tsc --noEmit)｜risk: low
 - [x] F210 存档序列化：save.ts（版本化快照 serialize/parse + 校验，纯逻辑）｜verify: bash scripts/build-tests.sh && node --test client/src/game/save.test.js && (cd client && npx tsc --noEmit)｜risk: low
+
+## M3 并行车道批（2026-11-18 14:20 UTC）
+
+> 现状判断：M2 的内核（矿脉/单位表/建筑/经济/战斗/敌方 AI/存档/HUD/相机）都只是**纯模块**，
+> `main.ts` 仍只跑「8 个步兵走来走去」——没有资金、没有建筑、没有敌人、没有胜负，产品层是断的。
+> 本批先把缺失的内核补齐（各自独占文件），F301 负责唯一一次 `main.ts`/`index.ts` 接线。
+
+- [ ] F301 游戏主循环集成：新增 gameState.ts（tick 聚合 economy/buildings/combat/enemyAI/胜负判定，纯逻辑）+ main.ts/index.ts 唯一接线（资金条、放置 HQ/兵营/矿厂、敌方单位与战斗、胜负结算与重开）｜verify: bash scripts/build-tests.sh && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: med
+- [ ] F302 矿车采集循环：harvest.ts（矿车 idle→去矿脉→采满→回矿厂→卸货入账 状态机，纯逻辑、可确定性测试）｜verify: bash scripts/build-tests.sh && node --test client/src/game/harvest.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F303 生产与建造队列：production.ts（建筑建造进度、兵营出兵队列、取消退款、并发上限；复用 economy/buildings 不重写）｜verify: bash scripts/build-tests.sh && node --test client/src/game/production.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F304 战争迷雾：fog.ts（单位视野半径、已探明/当前可见两层、逐 tick 更新、格子级 bitmask，纯逻辑）｜verify: bash scripts/build-tests.sh && node --test client/src/game/fog.test.js && (cd client && npx tsc --noEmit)｜risk: low
+- [ ] F305 战斗特效：game/effects.ts（特效粒子状态机：爆炸/曳光/伤害数字，纯更新逻辑）+ render/effects.ts（Canvas 绘制）｜verify: bash scripts/build-tests.sh && node --test client/src/game/effects.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F306 指令系统：commands.ts（攻击指令/攻击移动/停止/保持阵型/编队 1–9 分配与选中，纯逻辑，衔接 combat）｜verify: bash scripts/build-tests.sh && node --test client/src/game/commands.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F307 电力系统：power.ts（电厂供电、建筑耗电、低电时生产降速）+ buildings.ts 增加 power 建筑定义（只增不改旧签名）｜verify: bash scripts/build-tests.sh && node --test client/src/game/power.test.js && node --test client/src/game/buildings.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F308 地形渲染升级：render/terrain.ts（矿脉晶簇、水岸过渡、草地纹理噪点，预渲染离屏，不引第三方库）｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F309 HUD 深化：render/hud.ts（多选信息卡、生产面板骨架、快捷键提示、消息队列样式；保持 drawHud 旧签名兼容）｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F310 数值平衡表：balance.ts（单位/建筑成本、伤害、波次难度曲线，集中可调 + 一致性校验测试）｜verify: bash scripts/build-tests.sh && node --test client/src/game/balance.test.js && (cd client && npx tsc --noEmit)｜risk: low
