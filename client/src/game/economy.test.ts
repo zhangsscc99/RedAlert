@@ -11,6 +11,10 @@ import {
   enqueue,
   cancel,
   tickQueue,
+  pollAlerts,
+  ORE_GRADE_RICH,
+  LOW_FUNDS_AT,
+  ALERT_COOLDOWN,
 } from './economy.js';
 import type { QueueItem } from './economy.js';
 
@@ -248,4 +252,86 @@ test('afford mirrors canAfford', () => {
   assert.equal(afford(e, 100), true);
   assert.equal(afford(e, 101), false);
   assert.equal(afford(e, -1), false);
+});
+
+test('rich ore credits at the grade multiplier; poor grade stays baseline', () => {
+  const e = createEconomy(0);
+  assert.equal(credit(e, 350, ORE_GRADE_RICH), 700);
+  assert.equal(e.credits, 700);
+  assert.equal(e.earned, 700);
+  // 缺省品位 = 贫矿，不放大
+  assert.equal(credit(e, 350), 350);
+  assert.equal(e.credits, 1050);
+  // 非正品位等同非法金额
+  assert.equal(credit(e, 100, 0), 0);
+  assert.equal(credit(e, 100, -2), 0);
+  assert.equal(e.credits, 1050);
+});
+
+test('rich-grade income still respects the cap', () => {
+  const e = createEconomy(900, { cap: 1000 });
+  const accepted = credit(e, 350, ORE_GRADE_RICH); // 放大到 700，只剩 100 空间
+  assert.equal(accepted, 100);
+  assert.equal(e.credits, 1000);
+  assert.equal(e.storageFull, true);
+  assert.equal(e.lostToCap, 600); // 丢弃的是放大后的部分
+});
+
+test('nearCap flags once credits reach the warn fraction of the cap', () => {
+  const e = createEconomy(950, { cap: 1000 });
+  assert.equal(e.nearCap, true); // ≥ 90%
+
+  spend(e, 100);
+  assert.equal(e.nearCap, false);
+  credit(e, 60); // 960 → 再次越过阈值
+  assert.equal(e.nearCap, true);
+
+  // 无 cap 的经济永不 nearCap
+  const u = createEconomy(99999);
+  assert.equal(u.nearCap, false);
+});
+
+test('nearCapFraction option customizes the warn level', () => {
+  const e = createEconomy(500, { cap: 1000, nearCapFraction: 0.5 });
+  assert.equal(e.nearCap, true);
+});
+
+test('pollAlerts throttles low-funds to one alert per cooldown', () => {
+  const e = createEconomy(100); // 低于 LOW_FUNDS_AT
+  assert.deepEqual(pollAlerts(e, 0), ['low-funds']);
+  assert.deepEqual(pollAlerts(e, 1), []); // 冷却内不再刷屏
+  assert.deepEqual(pollAlerts(e, ALERT_COOLDOWN), ['low-funds']); // 间隔到期重发
+});
+
+test('pollAlerts stops reporting once the balance recovers', () => {
+  const e = createEconomy(10, { maintenanceRate: 10 });
+  incomeTick(e, 1, 3); // -20 → broke，也算 low-funds
+  assert.deepEqual(pollAlerts(e, 0), ['low-funds']);
+  credit(e, 1000);
+  assert.deepEqual(pollAlerts(e, ALERT_COOLDOWN), []); // 条件解除后不再发
+});
+
+test('lowFundsAt option overrides the default alert threshold', () => {
+  const e = createEconomy(600, { lowFundsAt: 1000 });
+  assert.ok(e.credits >= LOW_FUNDS_AT);
+  assert.deepEqual(pollAlerts(e, 0), ['low-funds']);
+});
+
+test('pollAlerts reports near-cap and storage-full on independent cadences', () => {
+  const e = createEconomy(900, { cap: 1000 });
+  credit(e, 50); // 950 → nearCap
+  assert.deepEqual(pollAlerts(e, 0), ['near-cap']);
+
+  credit(e, 100); // +50 → 满，溢出置 storageFull
+  assert.equal(e.storageFull, true);
+  // near-cap 仍在冷却内被抑制，storage-full 首次发出
+  assert.deepEqual(pollAlerts(e, 1), ['storage-full']);
+  // 冷却到期后两者各自重发
+  assert.deepEqual(pollAlerts(e, ALERT_COOLDOWN + 1), ['near-cap', 'storage-full']);
+});
+
+test('pollAlerts is quiet on a healthy economy', () => {
+  const e = createEconomy(5000);
+  assert.deepEqual(pollAlerts(e, 0), []);
+  assert.deepEqual(pollAlerts(e, ALERT_COOLDOWN * 2), []);
 });

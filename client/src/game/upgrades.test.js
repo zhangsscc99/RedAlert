@@ -3,6 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 // src/game/economy.ts
+var NEAR_CAP_FRACTION = 0.9;
 function createEconomy(start = 5e3, opts) {
   const cap = opts?.cap;
   const e = {
@@ -14,8 +15,13 @@ function createEconomy(start = 5e3, opts) {
     passiveRate: opts?.passiveRate,
     storageFull: false,
     broke: false,
-    lostToCap: 0
+    nearCap: false,
+    nearCapFraction: opts?.nearCapFraction,
+    lowFundsAt: opts?.lowFundsAt,
+    lostToCap: 0,
+    alertLog: {}
   };
+  refreshFlags(e);
   return e;
 }
 function canAfford(e, amount) {
@@ -24,6 +30,7 @@ function canAfford(e, amount) {
 function refreshFlags(e) {
   e.broke = e.credits < 0;
   if (e.cap === void 0 || e.credits < e.cap) e.storageFull = false;
+  e.nearCap = e.cap !== void 0 && e.credits >= e.cap * (e.nearCapFraction ?? NEAR_CAP_FRACTION);
 }
 function spend(e, amount) {
   if (!canAfford(e, amount)) return false;

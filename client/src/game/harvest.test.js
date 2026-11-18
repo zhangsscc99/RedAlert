@@ -193,6 +193,9 @@ var UNIT_RADIUS = UNIT_STATS.infantry.radius;
 var INFANTRY_SPEED = UNIT_STATS.infantry.speed;
 
 // src/game/economy.ts
+var ORE_GRADE_POOR = 1;
+var ORE_GRADE_RICH = 2;
+var NEAR_CAP_FRACTION = 0.9;
 function createEconomy(start = 5e3, opts) {
   const cap = opts?.cap;
   const e = {
@@ -204,22 +207,34 @@ function createEconomy(start = 5e3, opts) {
     passiveRate: opts?.passiveRate,
     storageFull: false,
     broke: false,
-    lostToCap: 0
+    nearCap: false,
+    nearCapFraction: opts?.nearCapFraction,
+    lowFundsAt: opts?.lowFundsAt,
+    lostToCap: 0,
+    alertLog: {}
   };
+  refreshFlags(e);
   return e;
 }
-function credit(e, amount) {
-  if (!(amount > 0)) return 0;
-  const room = e.cap !== void 0 ? Math.max(0, e.cap - e.credits) : amount;
-  const accepted = Math.min(amount, room);
+function refreshFlags(e) {
+  e.broke = e.credits < 0;
+  if (e.cap === void 0 || e.credits < e.cap) e.storageFull = false;
+  e.nearCap = e.cap !== void 0 && e.credits >= e.cap * (e.nearCapFraction ?? NEAR_CAP_FRACTION);
+}
+function credit(e, amount, grade = ORE_GRADE_POOR) {
+  const scaled = amount * (grade > 0 ? grade : 0);
+  if (!(scaled > 0)) return 0;
+  const room = e.cap !== void 0 ? Math.max(0, e.cap - e.credits) : scaled;
+  const accepted = Math.min(scaled, room);
   if (accepted > 0) {
     e.credits += accepted;
     e.earned += accepted;
   }
-  if (accepted < amount) {
+  if (accepted < scaled) {
     e.storageFull = true;
-    e.lostToCap = (e.lostToCap ?? 0) + (amount - accepted);
+    e.lostToCap = (e.lostToCap ?? 0) + (scaled - accepted);
   }
+  refreshFlags(e);
   return accepted;
 }
 
@@ -270,6 +285,19 @@ function harvesterStatus(h) {
   }
 }
 var reservesByMap = /* @__PURE__ */ new WeakMap();
+var gradesByMap = /* @__PURE__ */ new WeakMap();
+function setOreGrade(map, x, y, grade) {
+  let g = gradesByMap.get(map);
+  if (!g) {
+    g = new Float64Array(map.w * map.h).fill(ORE_GRADE_POOR);
+    gradesByMap.set(map, g);
+  }
+  g[idx(map, x, y)] = grade;
+}
+function oreGrade(map, i) {
+  const g = gradesByMap.get(map)?.[i];
+  return g !== void 0 && g > 0 ? g : ORE_GRADE_POOR;
+}
 function reserveTable(map) {
   let r = reservesByMap.get(map);
   if (!r) {
@@ -305,6 +333,14 @@ function buildingBlockers(buildings) {
     const def = BUILDING_DEFS[b.kind];
     return { gx: b.gx, gy: b.gy, w: def.w, h: def.h };
   });
+}
+function unitBlockers(hs, self) {
+  const out = [];
+  for (const o of hs) {
+    if (o === self || o.unit.kind !== "harvester") continue;
+    out.push({ gx: worldToTile(o.unit.x), gy: worldToTile(o.unit.y), w: 1, h: 1 });
+  }
+  return out;
 }
 function blockedTiles(map, blockers) {
   const out = new Uint8Array(map.w * map.h);
@@ -469,17 +505,20 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles) {
       h.lastY = h.unit.y;
       if (stuckT >= STUCK_SECONDS) {
         h.unit.path = [];
+        const avoid = [...blockers, ...unitBlockers(hs, h)];
+        const avoidBlocked = blockedTiles(map, avoid);
         let ok;
         if (h.state === "toOre") {
           h.replans = (h.replans ?? 0) + 1;
           const cur = h.target !== null ? idx(map, h.target.x, h.target.y) : -1;
           ok = false;
           if (h.replans > REPLAN_BEFORE_SWITCH && cur >= 0) {
-            ok = sendToOre(h, map, reserves, claims, blockers, blocked, /* @__PURE__ */ new Set([cur]));
+            ok = sendToOre(h, map, reserves, claims, avoid, avoidBlocked, /* @__PURE__ */ new Set([cur]));
           }
+          if (!ok) ok = sendToOre(h, map, reserves, claims, avoid, avoidBlocked);
           if (!ok) ok = sendToOre(h, map, reserves, claims, blockers, blocked);
         } else {
-          ok = sendToRefinery(h, map, buildings, blockers);
+          ok = sendToRefinery(h, map, buildings, avoid) || sendToRefinery(h, map, buildings, blockers);
         }
         if (!ok) toIdle(h);
         continue;
@@ -518,8 +557,13 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles) {
           break;
         }
         const i = idx(map, h.target.x, h.target.y);
-        const take = Math.min(HARVEST_RATE * dt, HARVEST_CAPACITY - h.cargo, reserves[i]);
-        h.cargo += take;
+        const grade = oreGrade(map, i);
+        const take = Math.min(
+          HARVEST_RATE * dt,
+          (HARVEST_CAPACITY - h.cargo) / grade,
+          reserves[i]
+        );
+        h.cargo += take * grade;
         reserves[i] = reserves[i] - take;
         if (reserves[i] <= 0) {
           reserves[i] = 0;
@@ -886,4 +930,115 @@ test("a harvester waiting behind a claimed vein stays standby, not depleted", ()
   assert.equal(h1.state, "mining");
   assert.equal(h2.state, "idle");
   assert.equal(harvesterStatus(h2), "standby");
+});
+test("a rich vein pays grade\xD7 credits per round trip", () => {
+  const map = openMap();
+  const refinery = building("refinery", 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  setOreGrade(map, 10, 8, ORE_GRADE_RICH);
+  const h = createHarvester(unitAt("harvester", 8, 8));
+  const econ = createEconomy(0);
+  const depleted = drive([h], map, [refinery], econ, 400);
+  assert.deepEqual(depleted, [{ x: 10, y: 8 }]);
+  assert.equal(econ.credits, ORE_RESERVE * ORE_GRADE_RICH);
+  assert.equal(h.cargo, 0);
+  assert.equal(h.state, "idle");
+});
+test("a stuck harvester lane-changes around a tile held by another harvester", () => {
+  const map = openMap();
+  const refinery = building("refinery", 2, 2);
+  for (let x = 4; x <= 16; x++) {
+    setTerrain(map, x, 9, WATER);
+    setTerrain(map, x, 13, WATER);
+  }
+  setTerrain(map, 9, 12, ORE);
+  setTerrain(map, 14, 11, ORE);
+  const h1 = createHarvester(unitAt("harvester", 9, 11));
+  const h2 = createHarvester(unitAt("harvester", 5, 11));
+  h2.unit.id = 2;
+  const econ = createEconomy(0);
+  const speed = UNIT_STATS.harvester.speed;
+  UNIT_STATS.harvester.speed = 0;
+  try {
+    updateHarvesters([h1, h2], map, [refinery], econ, 0.2);
+    assert.equal(h1.state, "mining");
+    assert.equal(h2.state, "toOre");
+    assert.deepEqual(h2.target, { x: 14, y: 11 });
+    assert.ok(
+      h2.unit.path.some((p) => worldToTile(p.x) === 9 && worldToTile(p.y) === 11),
+      "initial path should cross the jammed tile"
+    );
+    const ticks = Math.ceil(STUCK_SECONDS / 0.2) + 2;
+    for (let i = 0; i < ticks; i++) updateHarvesters([h1, h2], map, [refinery], econ, 0.2);
+    assert.equal(h2.state, "toOre");
+    assert.deepEqual(h2.target, { x: 14, y: 11 });
+    assert.ok(h2.unit.path.length > 0);
+    assert.ok(
+      h2.unit.path.every((p) => !(worldToTile(p.x) === 9 && worldToTile(p.y) === 11)),
+      "re-planned path must detour around the jammed tile"
+    );
+  } finally {
+    UNIT_STATS.harvester.speed = speed;
+  }
+});
+test("a vein that dries mid-travel retargets the nearest live ore", () => {
+  const map = openMap();
+  const refinery = building("refinery", 2, 2);
+  setTerrain(map, 12, 8, ORE);
+  setTerrain(map, 20, 8, ORE);
+  const h = createHarvester(unitAt("harvester", 8, 8));
+  const econ = createEconomy(0);
+  updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, "toOre");
+  assert.deepEqual(h.target, { x: 12, y: 8 });
+  setTerrain(map, 12, 8, GRASS);
+  for (let i = 0; i < 3; i++) updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.ok(h.state === "toOre" || h.state === "mining");
+  assert.deepEqual(h.target, { x: 20, y: 8 });
+});
+test("a full hold heads home even while veins still hold ore", () => {
+  const map = openMap();
+  const refinery = building("refinery", 2, 2);
+  setTerrain(map, 9, 8, ORE);
+  setTerrain(map, 10, 8, ORE);
+  setTerrain(map, 11, 8, ORE);
+  const h = createHarvester(unitAt("harvester", 8, 8));
+  const econ = createEconomy(0);
+  let sawHauling = false;
+  for (let i = 0; i < 400 && !sawHauling; i++) {
+    for (const t of updateHarvesters([h], map, [refinery], econ, 0.2)) {
+      setTerrain(map, t.x, t.y, GRASS);
+    }
+    if (h.cargo >= HARVEST_CAPACITY && h.state === "toRefinery") sawHauling = true;
+  }
+  assert.ok(sawHauling, "full hold switched to the return leg while ore remained");
+});
+test("a full hold goes home instead of chasing new ore when its vein dies en route", () => {
+  const map = openMap();
+  const refinery = building("refinery", 2, 2);
+  setTerrain(map, 12, 8, ORE);
+  setTerrain(map, 20, 8, ORE);
+  const h = createHarvester(unitAt("harvester", 8, 8));
+  const econ = createEconomy(0);
+  updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, "toOre");
+  assert.deepEqual(h.target, { x: 12, y: 8 });
+  h.cargo = HARVEST_CAPACITY;
+  setTerrain(map, 12, 8, GRASS);
+  for (let i = 0; i < 3; i++) updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, "toRefinery");
+  assert.notDeepEqual(h.target, { x: 20, y: 8 });
+});
+test("each harvester claims the vein nearest to it", () => {
+  const map = openMap();
+  const refinery = building("refinery", 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  setTerrain(map, 16, 8, ORE);
+  const h1 = createHarvester(unitAt("harvester", 8, 7));
+  const h2 = createHarvester(unitAt("harvester", 14, 9));
+  h2.unit.id = 2;
+  const econ = createEconomy(0);
+  drive([h1, h2], map, [refinery], econ, 3);
+  assert.deepEqual(h1.target, { x: 10, y: 8 });
+  assert.deepEqual(h2.target, { x: 16, y: 8 });
 });

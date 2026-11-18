@@ -3,6 +3,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 // src/game/economy.ts
+var ORE_GRADE_POOR = 1;
+var ORE_GRADE_RICH = 2;
+var NEAR_CAP_FRACTION = 0.9;
+var LOW_FUNDS_AT = 500;
+var ALERT_COOLDOWN = 30;
 function createEconomy(start = 5e3, opts) {
   const cap = opts?.cap;
   const e = {
@@ -14,8 +19,13 @@ function createEconomy(start = 5e3, opts) {
     passiveRate: opts?.passiveRate,
     storageFull: false,
     broke: false,
-    lostToCap: 0
+    nearCap: false,
+    nearCapFraction: opts?.nearCapFraction,
+    lowFundsAt: opts?.lowFundsAt,
+    lostToCap: 0,
+    alertLog: {}
   };
+  refreshFlags(e);
   return e;
 }
 function canAfford(e, amount) {
@@ -27,6 +37,7 @@ function afford(e, cost) {
 function refreshFlags(e) {
   e.broke = e.credits < 0;
   if (e.cap === void 0 || e.credits < e.cap) e.storageFull = false;
+  e.nearCap = e.cap !== void 0 && e.credits >= e.cap * (e.nearCapFraction ?? NEAR_CAP_FRACTION);
 }
 function spend(e, amount) {
   if (!canAfford(e, amount)) return false;
@@ -35,18 +46,20 @@ function spend(e, amount) {
   refreshFlags(e);
   return true;
 }
-function credit(e, amount) {
-  if (!(amount > 0)) return 0;
-  const room = e.cap !== void 0 ? Math.max(0, e.cap - e.credits) : amount;
-  const accepted = Math.min(amount, room);
+function credit(e, amount, grade = ORE_GRADE_POOR) {
+  const scaled = amount * (grade > 0 ? grade : 0);
+  if (!(scaled > 0)) return 0;
+  const room = e.cap !== void 0 ? Math.max(0, e.cap - e.credits) : scaled;
+  const accepted = Math.min(scaled, room);
   if (accepted > 0) {
     e.credits += accepted;
     e.earned += accepted;
   }
-  if (accepted < amount) {
+  if (accepted < scaled) {
     e.storageFull = true;
-    e.lostToCap = (e.lostToCap ?? 0) + (amount - accepted);
+    e.lostToCap = (e.lostToCap ?? 0) + (scaled - accepted);
   }
+  refreshFlags(e);
   return accepted;
 }
 function incomeTick(e, dt, buildingCount = 0) {
@@ -55,6 +68,22 @@ function incomeTick(e, dt, buildingCount = 0) {
   const upkeep = (e.maintenanceRate ?? 0) * Math.max(0, buildingCount) * dt;
   if (upkeep > 0) e.credits -= upkeep;
   refreshFlags(e);
+}
+function pollAlerts(e, now) {
+  const log = e.alertLog ??= {};
+  const out = [];
+  const fire = (kind, cond) => {
+    if (!cond) return;
+    const last = log[kind];
+    if (last === void 0 || now - last >= ALERT_COOLDOWN) {
+      log[kind] = now;
+      out.push(kind);
+    }
+  };
+  fire("low-funds", e.broke === true || e.credits < (e.lowFundsAt ?? LOW_FUNDS_AT));
+  fire("near-cap", e.nearCap === true);
+  fire("storage-full", e.storageFull === true);
+  return out;
 }
 function createQueue() {
   return [];
@@ -288,4 +317,69 @@ test("afford mirrors canAfford", () => {
   assert.equal(afford(e, 100), true);
   assert.equal(afford(e, 101), false);
   assert.equal(afford(e, -1), false);
+});
+test("rich ore credits at the grade multiplier; poor grade stays baseline", () => {
+  const e = createEconomy(0);
+  assert.equal(credit(e, 350, ORE_GRADE_RICH), 700);
+  assert.equal(e.credits, 700);
+  assert.equal(e.earned, 700);
+  assert.equal(credit(e, 350), 350);
+  assert.equal(e.credits, 1050);
+  assert.equal(credit(e, 100, 0), 0);
+  assert.equal(credit(e, 100, -2), 0);
+  assert.equal(e.credits, 1050);
+});
+test("rich-grade income still respects the cap", () => {
+  const e = createEconomy(900, { cap: 1e3 });
+  const accepted = credit(e, 350, ORE_GRADE_RICH);
+  assert.equal(accepted, 100);
+  assert.equal(e.credits, 1e3);
+  assert.equal(e.storageFull, true);
+  assert.equal(e.lostToCap, 600);
+});
+test("nearCap flags once credits reach the warn fraction of the cap", () => {
+  const e = createEconomy(950, { cap: 1e3 });
+  assert.equal(e.nearCap, true);
+  spend(e, 100);
+  assert.equal(e.nearCap, false);
+  credit(e, 60);
+  assert.equal(e.nearCap, true);
+  const u = createEconomy(99999);
+  assert.equal(u.nearCap, false);
+});
+test("nearCapFraction option customizes the warn level", () => {
+  const e = createEconomy(500, { cap: 1e3, nearCapFraction: 0.5 });
+  assert.equal(e.nearCap, true);
+});
+test("pollAlerts throttles low-funds to one alert per cooldown", () => {
+  const e = createEconomy(100);
+  assert.deepEqual(pollAlerts(e, 0), ["low-funds"]);
+  assert.deepEqual(pollAlerts(e, 1), []);
+  assert.deepEqual(pollAlerts(e, ALERT_COOLDOWN), ["low-funds"]);
+});
+test("pollAlerts stops reporting once the balance recovers", () => {
+  const e = createEconomy(10, { maintenanceRate: 10 });
+  incomeTick(e, 1, 3);
+  assert.deepEqual(pollAlerts(e, 0), ["low-funds"]);
+  credit(e, 1e3);
+  assert.deepEqual(pollAlerts(e, ALERT_COOLDOWN), []);
+});
+test("lowFundsAt option overrides the default alert threshold", () => {
+  const e = createEconomy(600, { lowFundsAt: 1e3 });
+  assert.ok(e.credits >= LOW_FUNDS_AT);
+  assert.deepEqual(pollAlerts(e, 0), ["low-funds"]);
+});
+test("pollAlerts reports near-cap and storage-full on independent cadences", () => {
+  const e = createEconomy(900, { cap: 1e3 });
+  credit(e, 50);
+  assert.deepEqual(pollAlerts(e, 0), ["near-cap"]);
+  credit(e, 100);
+  assert.equal(e.storageFull, true);
+  assert.deepEqual(pollAlerts(e, 1), ["storage-full"]);
+  assert.deepEqual(pollAlerts(e, ALERT_COOLDOWN + 1), ["near-cap", "storage-full"]);
+});
+test("pollAlerts is quiet on a healthy economy", () => {
+  const e = createEconomy(5e3);
+  assert.deepEqual(pollAlerts(e, 0), []);
+  assert.deepEqual(pollAlerts(e, ALERT_COOLDOWN * 2), []);
 });
