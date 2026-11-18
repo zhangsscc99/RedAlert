@@ -7,6 +7,7 @@ import {
   hintText,
   normalizeKey,
   resolve,
+  validateHotkeys,
   type Binding,
   type CommandState,
 } from './hotkeys.js';
@@ -57,6 +58,45 @@ test('detectConflicts reports same-key same-ctx duplicates', () => {
   assert.equal(conflicts[0]!.ctx, 'game');
   assert.deepEqual(conflicts[0]!.ids.sort(), ['a.one', 'a.two']);
   assert.equal(detectConflicts(DEFAULT_BINDINGS).length, 0);
+});
+
+test('validateHotkeys returns empty on the real table (no panel dup keys)', () => {
+  assert.deepEqual(validateHotkeys(), []);
+  // 生产面板项都在表里：电厂有自己的键，不与矿车共用 E
+  const panelIds = [
+    'train.infantry',
+    'train.tank',
+    'train.harvester',
+    'build.barracks',
+    'build.refinery',
+    'build.power',
+  ];
+  const keys = panelIds.map(
+    (id) => DEFAULT_BINDINGS.find((b) => b.id === id)!.keys[0],
+  );
+  assert.equal(new Set(keys).size, keys.length);
+});
+
+test('validateHotkeys reports an injected same-key duplicate', () => {
+  const dup: Binding[] = [
+    ...DEFAULT_BINDINGS,
+    { id: 'build.power2', label: '电厂二号', keys: ['e'], ctx: 'game', hint: 'E' },
+  ];
+  const c = validateHotkeys(dup);
+  const e = c.find((x) => x.key === 'e');
+  assert.ok(e);
+  assert.deepEqual(e.ids.sort(), ['build.power2', 'train.harvester']);
+});
+
+test('validateHotkeys flags a panel key shadowing a reserved always-key', () => {
+  const clash: Binding[] = [
+    ...DEFAULT_BINDINGS,
+    { id: 'build.extra', label: '额外建筑', keys: ['f'], ctx: 'game', hint: 'F' },
+  ];
+  const c = validateHotkeys(clash);
+  const f = c.find((x) => x.key === 'f');
+  assert.ok(f);
+  assert.deepEqual(f.ids.sort(), ['build.extra', 'ui.fullscreen']);
 });
 
 test('commandCard disables build entries without power / credits', () => {

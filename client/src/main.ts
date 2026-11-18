@@ -1233,21 +1233,28 @@ function drawBoardPanel(x: number, topY: number, w: number, lines: readonly stri
 interface BarDef {
   id: string;
   label: string;
-  hotkey?: string;
+  /** Binding id in DEFAULT_BINDINGS — the panel's displayed key and the
+   *  actual keyboard shortcut share this single source. */
+  action: string;
   kind: UnitKind | BuildingKind;
   cost: number;
 }
 
 const BAR_DEFS: BarDef[] = [
-  { id: 'infantry', label: '步兵', hotkey: 'Q', kind: 'infantry', cost: UNIT_STATS.infantry.cost },
-  { id: 'tank', label: '坦克', hotkey: 'W', kind: 'tank', cost: UNIT_STATS.tank.cost },
-  { id: 'harvester', label: '矿车', hotkey: 'E', kind: 'harvester', cost: UNIT_STATS.harvester.cost },
-  { id: 'barracks', label: '兵营', hotkey: 'B', kind: 'barracks', cost: BUILDING_DEFS.barracks.cost },
-  { id: 'refinery', label: '矿厂', hotkey: 'R', kind: 'refinery', cost: BUILDING_DEFS.refinery.cost },
-  { id: 'power', label: '电厂', kind: 'power', cost: BUILDING_DEFS.power.cost },
+  { id: 'infantry', label: '步兵', action: 'train.infantry', kind: 'infantry', cost: UNIT_STATS.infantry.cost },
+  { id: 'tank', label: '坦克', action: 'train.tank', kind: 'tank', cost: UNIT_STATS.tank.cost },
+  { id: 'harvester', label: '矿车', action: 'train.harvester', kind: 'harvester', cost: UNIT_STATS.harvester.cost },
+  { id: 'barracks', label: '兵营', action: 'build.barracks', kind: 'barracks', cost: BUILDING_DEFS.barracks.cost },
+  { id: 'refinery', label: '矿厂', action: 'build.refinery', kind: 'refinery', cost: BUILDING_DEFS.refinery.cost },
+  { id: 'power', label: '电厂', action: 'build.power', kind: 'power', cost: BUILDING_DEFS.power.cost },
 ];
 
 const UNIT_KINDS: readonly string[] = ['infantry', 'tank', 'harvester'];
+
+/** Displayed key for a bar item, straight from the binding table. */
+function barHotkey(actionId: string): string | undefined {
+  return DEFAULT_BINDINGS.find((b) => b.id === actionId)?.hint;
+}
 
 function barItems(): BuildBarItem[] {
   const credits = game.economy.credits;
@@ -1265,7 +1272,7 @@ function barItems(): BuildBarItem[] {
     return {
       id: d.id,
       label: d.label,
-      hotkey: d.hotkey,
+      hotkey: barHotkey(d.action),
       cost: d.cost,
       enabled: reason === undefined,
       reason,

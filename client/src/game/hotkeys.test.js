@@ -21,6 +21,7 @@ var DEFAULT_BINDINGS = [
   { id: "train.infantry", label: "\u8BAD\u7EC3\u6B65\u5175", keys: ["q"], ctx: "game", hint: "Q" },
   { id: "train.tank", label: "\u751F\u4EA7\u5766\u514B", keys: ["w"], ctx: "game", hint: "W" },
   { id: "train.harvester", label: "\u751F\u4EA7\u91C7\u77FF\u8F66", keys: ["e"], ctx: "game", hint: "E" },
+  { id: "build.power", label: "\u5EFA\u9020\u7535\u5382", keys: ["p"], ctx: "game", hint: "P" },
   // 指令
   { id: "cmd.attackMove", label: "\u653B\u51FB\u79FB\u52A8", keys: ["a"], ctx: "game", hint: "A + \u5DE6\u952E" },
   { id: "cmd.stop", label: "\u505C\u6B62", keys: ["s"], ctx: "game", hint: "S" },
@@ -74,6 +75,38 @@ function detectConflicts(bindings) {
   }
   return out;
 }
+function validateHotkeys(bindings = DEFAULT_BINDINGS) {
+  const slots = /* @__PURE__ */ new Map();
+  const add = (ctx, key, id) => {
+    const mk = `${ctx}:${key}`;
+    const slot = slots.get(mk) ?? { ctx, ids: [] };
+    if (!slot.ids.includes(id)) slot.ids.push(id);
+    slots.set(mk, slot);
+  };
+  for (const b of bindings) {
+    for (const k of b.keys) {
+      if (b.ctx === "always") {
+        add("always", k, b.id);
+        add("game", k, b.id);
+        add("menu", k, b.id);
+      } else {
+        add(b.ctx, k, b.id);
+      }
+    }
+  }
+  const out = [];
+  for (const [mk, slot] of slots) {
+    if (slot.ids.length <= 1) continue;
+    const key = mk.slice(slot.ctx.length + 1);
+    if (slot.ctx !== "always") {
+      const a = slots.get(`always:${key}`);
+      if (a && a.ids.length === slot.ids.length && slot.ids.every((i) => a.ids.includes(i)))
+        continue;
+    }
+    out.push({ key, ctx: slot.ctx, ids: slot.ids });
+  }
+  return out;
+}
 function hintText(b) {
   return `${b.hint} \u2014 ${b.label}`;
 }
@@ -81,6 +114,7 @@ var REQUIREMENTS = {
   "build.barracks": { cost: 500, needsPower: true },
   "build.refinery": { cost: 2e3, needsPower: true },
   "build.turret": { cost: 700, needsPower: true },
+  "build.power": { cost: 300 },
   "train.infantry": { cost: 100, needsBarracks: true },
   "train.tank": { cost: 800, needsBarracks: true },
   "train.harvester": { cost: 1400, needsBarracks: true },
@@ -152,6 +186,41 @@ test("detectConflicts reports same-key same-ctx duplicates", () => {
   assert.equal(conflicts[0].ctx, "game");
   assert.deepEqual(conflicts[0].ids.sort(), ["a.one", "a.two"]);
   assert.equal(detectConflicts(DEFAULT_BINDINGS).length, 0);
+});
+test("validateHotkeys returns empty on the real table (no panel dup keys)", () => {
+  assert.deepEqual(validateHotkeys(), []);
+  const panelIds = [
+    "train.infantry",
+    "train.tank",
+    "train.harvester",
+    "build.barracks",
+    "build.refinery",
+    "build.power"
+  ];
+  const keys = panelIds.map(
+    (id) => DEFAULT_BINDINGS.find((b) => b.id === id).keys[0]
+  );
+  assert.equal(new Set(keys).size, keys.length);
+});
+test("validateHotkeys reports an injected same-key duplicate", () => {
+  const dup = [
+    ...DEFAULT_BINDINGS,
+    { id: "build.power2", label: "\u7535\u5382\u4E8C\u53F7", keys: ["e"], ctx: "game", hint: "E" }
+  ];
+  const c = validateHotkeys(dup);
+  const e = c.find((x) => x.key === "e");
+  assert.ok(e);
+  assert.deepEqual(e.ids.sort(), ["build.power2", "train.harvester"]);
+});
+test("validateHotkeys flags a panel key shadowing a reserved always-key", () => {
+  const clash = [
+    ...DEFAULT_BINDINGS,
+    { id: "build.extra", label: "\u989D\u5916\u5EFA\u7B51", keys: ["f"], ctx: "game", hint: "F" }
+  ];
+  const c = validateHotkeys(clash);
+  const f = c.find((x) => x.key === "f");
+  assert.ok(f);
+  assert.deepEqual(f.ids.sort(), ["build.extra", "ui.fullscreen"]);
 });
 test("commandCard disables build entries without power / credits", () => {
   const rich = commandCard("game", state());
