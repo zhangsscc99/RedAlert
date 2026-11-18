@@ -6,7 +6,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../client"
 
-for f in src/game/*.test.ts; do
+for f in src/game/*.test.ts src/input/*.test.ts; do
   npx esbuild "$f" --bundle --platform=node --format=esm --outfile="${f%.ts}.js"
 done
-echo "built test bundles: src/game/*.test.js"
+echo "built test bundles: src/{game,input}/*.test.js"

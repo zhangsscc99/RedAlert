@@ -15,13 +15,226 @@ import {
 export const MINIMAP_SIZE = 144;
 export const MINIMAP_MARGIN = 12;
 
-export function minimapRect(viewW: number, viewH: number): Rect {
-  return {
-    x: viewW - MINIMAP_SIZE - MINIMAP_MARGIN,
-    y: viewH - MINIMAP_SIZE - MINIMAP_MARGIN,
-    w: MINIMAP_SIZE,
-    h: MINIMAP_SIZE,
+// --------------------------------------------------------------- layout ----
+// Single source of truth for every HUD rect. Draw + hit-test functions both
+// consume HudLayout so they can never disagree.
+
+export type HudMode = 'desktop' | 'mobile-landscape' | 'mobile-portrait';
+
+export type ActionId = 'build' | 'map' | 'stop' | 'fullscreen';
+
+export interface ActionButton {
+  id: ActionId;
+  rect: Rect;
+  label: string;
+}
+
+export interface HudLayoutOpts {
+  isTouch?: boolean;
+  minimapCollapsed?: boolean;
+  /** Mobile build bar is collapsed until the 建造 button opens it. */
+  buildBarOpen?: boolean;
+  /** Show the fullscreen action button (requestFullscreen exists). */
+  fullscreen?: boolean;
+  /** Selection card is up → messages stack above it. */
+  hasSelection?: boolean;
+  /** Number of queued production items (for panel width). */
+  prodCount?: number;
+}
+
+export interface HudLayout {
+  mode: HudMode;
+  viewW: number;
+  viewH: number;
+  /** Base HUD font size (CSS px); ≥14 on touch devices. */
+  font: number;
+  /** Bottom safe-area approximation (canvas can't read env()). */
+  safePad: number;
+  minimap: Rect | null;
+  actionBar: Rect | null;
+  actionButtons: ActionButton[];
+  /** Band the build bar is centered in (mobile: above the action bar). */
+  buildDock: Rect;
+  buildBarOpen: boolean;
+  selCard: Rect;
+  /** Box messages stack upward from (desktop) / downward into (mobile). */
+  msgBox: Rect;
+  resource: Rect;
+  /** Production-queue strip (w=0 when empty). */
+  prodPanel: Rect;
+}
+
+const MOBILE_MINIMAP_LAND = 104;
+const MOBILE_MINIMAP_PORT = 96;
+const SAFE_PAD_TOUCH = 16;
+const ACTION_BTN_H = 48; // ≥44 CSS px
+const ACTION_GAP = 10;
+const ACTION_PAD = 10;
+
+export function computeHudLayout(
+  viewW: number,
+  viewH: number,
+  o: HudLayoutOpts = {},
+): HudLayout {
+  const isTouch = !!o.isTouch;
+  const mode: HudMode = !isTouch
+    ? 'desktop'
+    : viewW < viewH
+      ? 'mobile-portrait'
+      : 'mobile-landscape';
+  const font = mode === 'desktop' ? 13 : 14;
+
+  if (mode === 'desktop') {
+    const minimap: Rect = {
+      x: viewW - MINIMAP_SIZE - MINIMAP_MARGIN,
+      y: viewH - MINIMAP_SIZE - MINIMAP_MARGIN,
+      w: MINIMAP_SIZE,
+      h: MINIMAP_SIZE,
+    };
+    const selH = 86;
+    const selCard: Rect = { x: 12, y: viewH - selH - 12, w: 188, h: selH };
+    const msgBottom = o.hasSelection ? selCard.y - 8 : viewH - 12;
+    const prodN = Math.min(o.prodCount ?? 0, 6);
+    const prodW = prodN > 0 ? 20 + prodN * 52 - 8 : 0;
+    const prodPanel: Rect = {
+      x: minimap.x - prodW - 12,
+      y: minimap.y + minimap.h - 80,
+      w: prodW,
+      h: prodN > 0 ? 80 : 0,
+    };
+    return {
+      mode,
+      viewW,
+      viewH,
+      font,
+      safePad: 0,
+      minimap,
+      actionBar: null,
+      actionButtons: [],
+      buildDock: { x: 0, y: viewH - 90, w: viewW, h: 90 },
+      buildBarOpen: true,
+      selCard,
+      msgBox: { x: 12, y: 0, w: 0, h: msgBottom },
+      resource: { x: 10, y: 10, w: 148, h: 12 + 5 * 30 },
+      prodPanel,
+    };
+  }
+
+  // ---- mobile ----
+  const safePad = SAFE_PAD_TOUCH;
+  const rows = mode === 'mobile-portrait' ? 2 : 1;
+  const innerH = rows * ACTION_BTN_H + (rows - 1) * ACTION_GAP + ACTION_PAD * 2;
+  const barH = innerH + safePad;
+  const actionBar: Rect = { x: 0, y: viewH - barH, w: viewW, h: barH };
+
+  const ids: ActionId[] = o.fullscreen
+    ? ['build', 'map', 'stop', 'fullscreen']
+    : ['build', 'map', 'stop'];
+  const labels: Record<ActionId, string> = {
+    build: '建造',
+    map: '地图',
+    stop: '停止',
+    fullscreen: '全屏',
   };
+  const actionButtons: ActionButton[] = [];
+  const usableW = viewW - ACTION_PAD * 2;
+  if (rows === 1) {
+    const bw = (usableW - ACTION_GAP * (ids.length - 1)) / ids.length;
+    ids.forEach((id, i) => {
+      actionButtons.push({
+        id,
+        label: labels[id],
+        rect: {
+          x: ACTION_PAD + i * (bw + ACTION_GAP),
+          y: actionBar.y + ACTION_PAD,
+          w: bw,
+          h: ACTION_BTN_H,
+        },
+      });
+    });
+  } else {
+    // portrait: 2×2 grid — [建造 地图] / [停止 全屏] (last row spans if odd).
+    const bw = (usableW - ACTION_GAP) / 2;
+    ids.forEach((id, i) => {
+      const row = Math.floor(i / 2);
+      const last = i === ids.length - 1 && ids.length % 2 === 1;
+      actionButtons.push({
+        id,
+        label: labels[id],
+        rect: {
+          x: last ? ACTION_PAD : ACTION_PAD + (i % 2) * (bw + ACTION_GAP),
+          y: actionBar.y + ACTION_PAD + row * (ACTION_BTN_H + ACTION_GAP),
+          w: last ? usableW : bw,
+          h: ACTION_BTN_H,
+        },
+      });
+    });
+  }
+
+  const mmSize = mode === 'mobile-portrait' ? MOBILE_MINIMAP_PORT : MOBILE_MINIMAP_LAND;
+  const minimap: Rect | null = o.minimapCollapsed
+    ? null
+    : {
+        x: viewW - mmSize - 10,
+        y: actionBar.y - 8 - mmSize,
+        w: mmSize,
+        h: mmSize,
+      };
+
+  const dockH = 56 + 16; // mobile build buttons are 56px tall
+  const buildDock: Rect = { x: 0, y: actionBar.y - 8 - dockH, w: viewW, h: dockH };
+  const buildBarOpen = o.buildBarOpen ?? false;
+
+  // Production strip sits above the bar/dock, right-aligned; the selection
+  // card keeps clear of it and of the minimap.
+  const prodN = Math.min(o.prodCount ?? 0, 6);
+  const prodW = prodN > 0 ? 20 + prodN * 52 - 8 : 0;
+  const prodBase = buildBarOpen ? buildDock.y : actionBar.y;
+  const prodPanel: Rect = {
+    x: viewW - prodW - 10,
+    y: prodBase - 8 - 80,
+    w: prodW,
+    h: prodN > 0 ? 80 : 0,
+  };
+  let cardRight = minimap ? minimap.x - 8 : viewW - 10;
+  if (prodN > 0) cardRight = Math.min(cardRight, prodPanel.x - 8);
+  const selCard: Rect = {
+    x: 10,
+    y: prodBase - 8 - 34,
+    w: Math.max(140, Math.min(cardRight - 10, 340)),
+    h: 34,
+  };
+  const resH = 12 + 5 * 36;
+  return {
+    mode,
+    viewW,
+    viewH,
+    font,
+    safePad,
+    minimap,
+    actionBar,
+    actionButtons,
+    buildDock,
+    buildBarOpen,
+    selCard,
+    msgBox: { x: 10, y: 10 + resH + 10, w: Math.min(viewW - 20, 420), h: 120 },
+    resource: { x: 10, y: 10, w: 170, h: resH },
+    prodPanel,
+  };
+}
+
+/** Which action-bar button (if any) is under the point. */
+export function actionButtonAt(layout: HudLayout, px: number, py: number): ActionId | null {
+  for (const b of layout.actionButtons) {
+    const r = b.rect;
+    if (px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h) return b.id;
+  }
+  return null;
+}
+
+/** Minimap rect for this layout, or null when collapsed/mobile-hidden. */
+export function minimapRect(layout: HudLayout): Rect | null {
+  return layout.minimap;
 }
 
 /** 资源栏数据。power/population 为「已用/上限」对；旧字段 units/buildings 仍兼容。 */
@@ -52,7 +265,6 @@ export interface ProductionItem {
 }
 
 export interface HudExtras {
-  viewH?: number;
   messages?: readonly HudMessage[];
   production?: readonly ProductionItem[];
 }
@@ -155,34 +367,90 @@ function drawResourcePanel(ctx: CanvasRenderingContext2D, info: HudInfo): void {
   });
 }
 
+/** 移动端资源条：14/16px 文字、更宽行高，位置由 layout.resource 给出。 */
+function drawResourcePanelMobile(
+  ctx: CanvasRenderingContext2D,
+  info: HudInfo,
+  layout: HudLayout,
+): void {
+  const rows: { label: string; value: string; color: string; frac?: number }[] = [
+    { label: '资金', value: `${info.credits ?? 0}`, color: WARN },
+  ];
+  if (info.power !== undefined || info.powerMax !== undefined) {
+    const used = info.power ?? 0;
+    const max = info.powerMax ?? 0;
+    const deficit = used > max;
+    rows.push({
+      label: '电力',
+      value: `${used}/${max}`,
+      color: deficit ? BAD : '#7ec8ff',
+      frac: max > 0 ? used / max : deficit ? 1 : 0,
+    });
+  }
+  if (info.population !== undefined || info.popMax !== undefined) {
+    const used = info.population ?? 0;
+    const max = info.popMax ?? 0;
+    rows.push({
+      label: '人口',
+      value: `${used}/${max}`,
+      color: used >= max ? BAD : ACCENT,
+      frac: max > 0 ? used / max : 0,
+    });
+  }
+  if (info.units !== undefined) rows.push({ label: '单位', value: `${info.units}`, color: TEXT_MAIN });
+  if (info.buildings !== undefined)
+    rows.push({ label: '建筑', value: `${info.buildings}`, color: TEXT_MAIN });
+
+  const padX = 12;
+  const rowH = 36;
+  const { x, y, w } = layout.resource;
+  const h = 12 + rows.length * rowH;
+  panel(ctx, x, y, w, h);
+
+  rows.forEach((r, i) => {
+    const cy = y + 8 + i * rowH;
+    ctx.font = '14px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillStyle = TEXT_DIM;
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(r.label, x + padX, cy + 11);
+    ctx.font = 'bold 16px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillStyle = r.color;
+    ctx.textAlign = 'right';
+    ctx.fillText(r.value, x + w - padX, cy + 12);
+    ctx.textAlign = 'left';
+    if (r.frac !== undefined) bar(ctx, x + padX, cy + 19, w - padX * 2, 5, r.frac, r.color);
+  });
+}
+
 export function drawHud(
   ctx: CanvasRenderingContext2D,
   cam: Camera,
   units: readonly Unit[],
   mouseTile: { x: number; y: number } | null,
-  info?: HudInfo,
-  viewW = 0,
+  info: HudInfo | undefined,
+  layout: HudLayout,
   extras?: HudExtras,
 ): void {
-  const selected = units.reduce((n, u) => n + (u.selected ? 1 : 0), 0);
-  const lines = [
-    `Units: ${selected}/${units.length}`,
-    `Tile: ${mouseTile ? `${mouseTile.x},${mouseTile.y}` : '—'}`,
-    `Zoom: ${cam.zoom.toFixed(2)}x`,
-  ];
+  // The tiny debug panel is desktop-only — mobile gets the scaled resource bar.
+  if (layout.mode === 'desktop') {
+    const selected = units.reduce((n, u) => n + (u.selected ? 1 : 0), 0);
+    const lines = [
+      `Units: ${selected}/${units.length}`,
+      `Tile: ${mouseTile ? `${mouseTile.x},${mouseTile.y}` : '—'}`,
+      `Zoom: ${cam.zoom.toFixed(2)}x`,
+    ];
+    ctx.font = HUD_FONT;
+    const w = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 20;
+    panel(ctx, 10, 10, w, 20 + lines.length * 18);
+    ctx.fillStyle = TEXT_MAIN;
+    lines.forEach((l, i) => ctx.fillText(l, 20, 30 + i * 18));
+    if (info) drawResourcePanel(ctx, info);
+  } else if (info) {
+    drawResourcePanelMobile(ctx, info, layout);
+  }
 
-  ctx.font = HUD_FONT;
-  const w = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 20;
-  panel(ctx, 10, 10, w, 20 + lines.length * 18);
-  ctx.fillStyle = TEXT_MAIN;
-  lines.forEach((l, i) => ctx.fillText(l, 20, 30 + i * 18));
-
-  if (info) drawResourcePanel(ctx, info);
-
-  const viewH = extras?.viewH ?? 0;
-  if (extras?.messages && viewH > 0) drawMessages(ctx, extras.messages, viewW, viewH);
-  if (extras?.production && viewH > 0)
-    drawProductionPanel(ctx, viewW, viewH, extras.production);
+  if (extras?.messages) drawMessages(ctx, extras.messages, layout);
+  if (extras?.production) drawProductionPanel(ctx, layout, extras.production);
 }
 
 /** 追加一条消息，最多保留 MAX_MESSAGES 条（丢弃最旧的）。 */
@@ -191,24 +459,23 @@ export function pushMessage(list: HudMessage[], text: string, ttl = 2.5): void {
   while (list.length > MAX_MESSAGES) list.shift();
 }
 
-/** 左下角消息提示；调用方需先按 dt 递减 ttl 并剔除 ttl<=0 的条目。 */
+/** 消息提示；桌面左下角（选中卡上方），移动端贴资源条下方。调用方按 dt 递减 ttl。 */
 export function drawMessages(
   ctx: CanvasRenderingContext2D,
   list: readonly HudMessage[],
-  viewW: number,
-  viewH: number,
+  layout: HudLayout,
 ): void {
   if (list.length === 0) return;
   const shown = list.length > MAX_MESSAGES ? list.slice(list.length - MAX_MESSAGES) : list;
-  void viewW;
 
   ctx.font = HUD_FONT;
-  const lineH = 18;
+  const lineH = layout.mode === 'desktop' ? 18 : 20;
   const pad = 10;
   const w = Math.max(...shown.map((m) => ctx.measureText(m.text).width)) + pad * 2;
   const h = pad * 2 + shown.length * lineH;
-  const x = 12;
-  const y = viewH - h - 12;
+  const x = layout.msgBox.x;
+  const y =
+    layout.mode === 'desktop' ? layout.msgBox.y + layout.msgBox.h - h : layout.msgBox.y;
 
   panel(ctx, x, y, w, h);
   shown.forEach((m, i) => {
@@ -228,41 +495,74 @@ function unitStatus(u: Unit): string {
   return '待机';
 }
 
-/** 底部左侧选中单位卡片：单选看血量/类型/状态，多选看数量与类型分组。 */
+/** 选中单位卡片：桌面多行卡（单选血量/状态，多选分组）；移动端紧凑单行。 */
 export function drawSelectionCard(
   ctx: CanvasRenderingContext2D,
   units: readonly Unit[],
-  viewW: number,
-  viewH: number,
+  layout: HudLayout,
 ): void {
   const sel = units.filter((u) => u.selected);
   if (sel.length === 0) return;
-  void viewW;
+  const r = layout.selCard;
 
-  const x = 12;
+  if (layout.mode !== 'desktop') {
+    // Compact single line: "坦克#3 45/60 ▓▓▓░" or "3单位 步兵x2 坦克x1".
+    panel(ctx, r.x, r.y, r.w, r.h);
+    const padX = 12;
+    const cy = r.y + r.h / 2 + 5;
+    ctx.textBaseline = 'alphabetic';
+    if (sel.length === 1) {
+      const u = sel[0]!;
+      const frac = u.maxHp > 0 ? u.hp / u.maxHp : 0;
+      const c = frac > 0.5 ? ACCENT : frac > 0.25 ? WARN : BAD;
+      ctx.font = `bold ${layout.font}px ui-monospace, Menlo, Consolas, monospace`;
+      ctx.fillStyle = ACCENT;
+      ctx.fillText(`${KIND_LABEL[u.kind] ?? u.kind}#${u.id}`, r.x + padX, cy);
+      const hpText = `${u.hp}/${u.maxHp}`;
+      ctx.font = `${layout.font}px ui-monospace, Menlo, Consolas, monospace`;
+      ctx.fillStyle = TEXT_MAIN;
+      const tx = r.x + padX + 132;
+      ctx.fillText(hpText, tx, cy);
+      bar(ctx, tx + 58, r.y + r.h / 2 - 4, r.w - (tx - r.x) - 58 - padX, 8, frac, c);
+    } else {
+      const groups = new Map<UnitKind, number>();
+      for (const u of sel) groups.set(u.kind, (groups.get(u.kind) ?? 0) + 1);
+      const text = [...groups.entries()]
+        .map(([k, n]) => `${KIND_LABEL[k] ?? k}x${n}`)
+        .join(' ');
+      ctx.font = `bold ${layout.font}px ui-monospace, Menlo, Consolas, monospace`;
+      ctx.fillStyle = ACCENT;
+      ctx.fillText(`${sel.length} 个单位`, r.x + padX, cy);
+      ctx.font = `${layout.font}px ui-monospace, Menlo, Consolas, monospace`;
+      ctx.fillStyle = TEXT_MAIN;
+      ctx.fillText(text, r.x + padX + 92, cy);
+    }
+    return;
+  }
+
   const padX = 14;
-  const w = 188;
+  const w = r.w;
 
   if (sel.length === 1) {
     const u = sel[0]!;
     const h = 86;
-    const y = viewH - h - 12;
-    panel(ctx, x, y, w, h);
+    const y = r.y + r.h - h; // bottom-aligned inside the layout rect
+    panel(ctx, r.x, y, w, h);
 
     ctx.font = 'bold 14px ui-monospace, Menlo, Consolas, monospace';
     ctx.fillStyle = ACCENT;
-    ctx.fillText(`${KIND_LABEL[u.kind] ?? u.kind} #${u.id}`, x + padX, y + 20);
+    ctx.fillText(`${KIND_LABEL[u.kind] ?? u.kind} #${u.id}`, r.x + padX, y + 20);
 
     ctx.font = '10px ui-monospace, Menlo, Consolas, monospace';
     ctx.fillStyle = TEXT_DIM;
-    ctx.fillText(`HP ${u.hp}/${u.maxHp}`, x + padX, y + 38);
+    ctx.fillText(`HP ${u.hp}/${u.maxHp}`, r.x + padX, y + 38);
     const frac = u.maxHp > 0 ? u.hp / u.maxHp : 0;
     const c = frac > 0.5 ? ACCENT : frac > 0.25 ? WARN : BAD;
-    bar(ctx, x + padX, y + 44, w - padX * 2, 8, frac, c);
+    bar(ctx, r.x + padX, y + 44, w - padX * 2, 8, frac, c);
 
     ctx.font = HUD_FONT;
     ctx.fillStyle = TEXT_MAIN;
-    ctx.fillText(`状态: ${unitStatus(u)}`, x + padX, y + 72);
+    ctx.fillText(`状态: ${unitStatus(u)}`, r.x + padX, y + 72);
     return;
   }
 
@@ -276,25 +576,24 @@ export function drawSelectionCard(
     ([k, n]) => `${KIND_LABEL[k] ?? k}  x${n}`,
   );
   const h = 26 + (rows.length + 1) * 18 + 6;
-  const y = viewH - h - 12;
-  panel(ctx, x, y, w, h);
+  const y = r.y + r.h - h;
+  panel(ctx, r.x, y, w, h);
 
   ctx.font = 'bold 14px ui-monospace, Menlo, Consolas, monospace';
   ctx.fillStyle = ACCENT;
-  ctx.fillText(`${sel.length} 个单位`, x + padX, y + 22);
+  ctx.fillText(`${sel.length} 个单位`, r.x + padX, y + 22);
 
   ctx.font = HUD_FONT;
   ctx.fillStyle = TEXT_MAIN;
-  rows.forEach((r, i) => ctx.fillText(r, x + padX, y + 22 + (i + 1) * 18));
+  rows.forEach((row, i) => ctx.fillText(row, r.x + padX, y + 22 + (i + 1) * 18));
   ctx.fillStyle = TEXT_DIM;
-  ctx.fillText(`移动中: ${moving}`, x + padX, y + 22 + (rows.length + 1) * 18);
+  ctx.fillText(`移动中: ${moving}`, r.x + padX, y + 22 + (rows.length + 1) * 18);
 }
 
 /** 右侧生产面板：图标占位 + 名称 + 进度条，数组顺序即队列顺序。 */
 export function drawProductionPanel(
   ctx: CanvasRenderingContext2D,
-  viewW: number,
-  viewH: number,
+  layout: HudLayout,
   items: readonly ProductionItem[],
 ): void {
   const slot = 44;
@@ -305,9 +604,8 @@ export function drawProductionPanel(
 
   const w = pad * 2 + visible.length * (slot + gap) - gap;
   const h = pad * 2 + slot + 16;
-  const mr = minimapRect(viewW, viewH);
-  const x = mr.x - w - 12;
-  const y = mr.y + mr.h - h;
+  const x = layout.prodPanel.x;
+  const y = layout.prodPanel.y;
   panel(ctx, x, y, w, h);
 
   ctx.font = '10px ui-monospace, Menlo, Consolas, monospace';
@@ -362,12 +660,14 @@ export function drawMinimap(
   map: GameMap,
   cam: Camera,
   units: readonly Unit[],
-  viewW: number,
-  viewH: number,
+  layout: HudLayout,
   enemies: readonly Unit[] = [],
   fog?: Fog,
 ): void {
-  const r = minimapRect(viewW, viewH);
+  const r = layout.minimap;
+  if (!r) return;
+  const viewW = layout.viewW;
+  const viewH = layout.viewH;
   const sx = r.w / (map.w * TILE_SIZE);
   const sy = r.h / (map.h * TILE_SIZE);
 
@@ -433,43 +733,62 @@ const BAR_BTN_H = 54;
 const BAR_GAP = 6;
 const BAR_PAD = 8;
 const BAR_BOTTOM = 8;
+const BAR_BTN_TOUCH = 56; // ≥44 CSS px touch target
 
-/** Bottom-centered rect covering the whole bar with `count` buttons. */
-export function buildBarRect(viewW: number, viewH: number, count: number): Rect {
-  const w = BAR_PAD * 2 + count * BAR_BTN_W + Math.max(0, count - 1) * BAR_GAP;
-  const h = BAR_PAD * 2 + BAR_BTN_H;
-  return { x: (viewW - w) / 2, y: viewH - h - BAR_BOTTOM, w, h };
+/** Button size for a mode. Mobile buttons are square 56px touch targets. */
+function barBtnSize(layout: HudLayout): { w: number; h: number } {
+  return layout.mode === 'desktop'
+    ? { w: BAR_BTN_W, h: BAR_BTN_H }
+    : { w: BAR_BTN_TOUCH, h: BAR_BTN_TOUCH };
+}
+
+/** Rect covering the whole bar with `count` buttons (inside layout.buildDock). */
+export function buildBarRect(layout: HudLayout, count: number): Rect {
+  const btn = barBtnSize(layout);
+  const w = BAR_PAD * 2 + count * btn.w + Math.max(0, count - 1) * BAR_GAP;
+  const h = BAR_PAD * 2 + btn.h;
+  if (layout.mode === 'desktop') {
+    return { x: (layout.viewW - w) / 2, y: layout.viewH - h - BAR_BOTTOM, w, h };
+  }
+  const d = layout.buildDock;
+  return {
+    x: Math.max(6, d.x + (d.w - w) / 2),
+    y: d.y + (d.h - h) / 2,
+    w: Math.min(w, layout.viewW - 12),
+    h,
+  };
 }
 
 /** Index of the bar button at (px,py), or -1. */
 export function buildBarHit(
-  viewW: number,
-  viewH: number,
+  layout: HudLayout,
   count: number,
   px: number,
   py: number,
 ): number {
-  const r = buildBarRect(viewW, viewH, count);
+  if (!layout.buildBarOpen) return -1;
+  const btn = barBtnSize(layout);
+  const r = buildBarRect(layout, count);
   if (px < r.x || px > r.x + r.w || py < r.y || py > r.y + r.h) return -1;
-  const i = Math.floor((px - r.x - BAR_PAD) / (BAR_BTN_W + BAR_GAP));
+  const i = Math.floor((px - r.x - BAR_PAD) / (btn.w + BAR_GAP));
   if (i < 0 || i >= count) return -1;
-  const bx = r.x + BAR_PAD + i * (BAR_BTN_W + BAR_GAP);
-  return px <= bx + BAR_BTN_W ? i : -1;
+  const bx = r.x + BAR_PAD + i * (btn.w + BAR_GAP);
+  return px <= bx + btn.w ? i : -1;
 }
 
 /** 底栏生产/建造按钮：名称 + 快捷键 + 造价，禁用时显示原因。 */
 export function drawBuildBar(
   ctx: CanvasRenderingContext2D,
-  viewW: number,
-  viewH: number,
+  layout: HudLayout,
   items: readonly BuildBarItem[],
 ): void {
-  if (items.length === 0) return;
-  const r = buildBarRect(viewW, viewH, items.length);
+  if (items.length === 0 || !layout.buildBarOpen) return;
+  const btn = barBtnSize(layout);
+  const r = buildBarRect(layout, items.length);
   panel(ctx, r.x, r.y, r.w, r.h);
 
   items.forEach((it, i) => {
-    const x = r.x + BAR_PAD + i * (BAR_BTN_W + BAR_GAP);
+    const x = r.x + BAR_PAD + i * (btn.w + BAR_GAP);
     const y = r.y + BAR_PAD;
     const dim = !it.enabled;
 
@@ -478,46 +797,269 @@ export function drawBuildBar(
       : dim
         ? 'rgba(255,255,255,0.03)'
         : 'rgba(255,255,255,0.07)';
-    ctx.fillRect(x, y, BAR_BTN_W, BAR_BTN_H);
+    ctx.fillRect(x, y, btn.w, btn.h);
     ctx.strokeStyle = it.active ? ACCENT : 'rgba(255,255,255,0.18)';
     ctx.lineWidth = 1;
-    ctx.strokeRect(x + 0.5, y + 0.5, BAR_BTN_W - 1, BAR_BTN_H - 1);
+    ctx.strokeRect(x + 0.5, y + 0.5, btn.w - 1, btn.h - 1);
 
     const text = dim ? TEXT_DIM : TEXT_MAIN;
     ctx.textBaseline = 'alphabetic';
-    ctx.font = 'bold 12px ui-monospace, Menlo, Consolas, monospace';
+    ctx.font =
+      layout.mode === 'desktop'
+        ? 'bold 12px ui-monospace, Menlo, Consolas, monospace'
+        : 'bold 14px ui-monospace, Menlo, Consolas, monospace';
     ctx.fillStyle = text;
-    ctx.fillText(it.label, x + 6, y + 15);
+    ctx.fillText(it.label, x + 6, y + (layout.mode === 'desktop' ? 15 : 18));
     if (it.hotkey) {
       ctx.font = '10px ui-monospace, Menlo, Consolas, monospace';
       ctx.fillStyle = dim ? TEXT_DIM : ACCENT;
       ctx.textAlign = 'right';
-      ctx.fillText(it.hotkey, x + BAR_BTN_W - 5, y + 13);
+      ctx.fillText(it.hotkey, x + btn.w - 5, y + 13);
       ctx.textAlign = 'left';
     }
 
-    ctx.font = '11px ui-monospace, Menlo, Consolas, monospace';
+    ctx.font =
+      layout.mode === 'desktop'
+        ? '11px ui-monospace, Menlo, Consolas, monospace'
+        : '13px ui-monospace, Menlo, Consolas, monospace';
     ctx.fillStyle = dim ? TEXT_DIM : WARN;
-    ctx.fillText(`$${it.cost}`, x + 6, y + 31);
+    ctx.fillText(`$${it.cost}`, x + 6, y + (layout.mode === 'desktop' ? 31 : 36));
 
     ctx.font = '9px ui-monospace, Menlo, Consolas, monospace';
     ctx.fillStyle = BAD;
-    if (!it.enabled && it.reason) ctx.fillText(it.reason, x + 6, y + 46);
+    if (!it.enabled && it.reason)
+      ctx.fillText(it.reason, x + 6, y + (layout.mode === 'desktop' ? 46 : 51));
   });
 }
 
 /** World coords for a click inside the minimap rect, or null if outside. */
 export function minimapToWorld(
   map: GameMap,
-  viewW: number,
-  viewH: number,
+  layout: HudLayout,
   px: number,
   py: number,
 ): { x: number; y: number } | null {
-  const r = minimapRect(viewW, viewH);
+  const r = layout.minimap;
+  if (!r) return null;
   if (px < r.x || px > r.x + r.w || py < r.y || py > r.y + r.h) return null;
   return {
     x: ((px - r.x) / r.w) * map.w * TILE_SIZE,
     y: ((py - r.y) / r.h) * map.h * TILE_SIZE,
   };
+}
+
+// ------------------------------------------------------------ action bar ----
+
+/** 底部拇指区操作栏（仅移动端）：建造 / 地图 / 停止 / 全屏。 */
+export function drawActionBar(
+  ctx: CanvasRenderingContext2D,
+  layout: HudLayout,
+  state: { buildOpen: boolean; minimapOn: boolean; fullscreenOn: boolean },
+): void {
+  const bar = layout.actionBar;
+  if (!bar) return;
+
+  ctx.fillStyle = PANEL_BG;
+  ctx.fillRect(bar.x, bar.y, bar.w, bar.h);
+  ctx.strokeStyle = PANEL_BORDER;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(bar.x, bar.y + 0.5);
+  ctx.lineTo(bar.x + bar.w, bar.y + 0.5);
+  ctx.stroke();
+
+  for (const b of layout.actionButtons) {
+    const r = b.rect;
+    const on =
+      (b.id === 'build' && state.buildOpen) ||
+      (b.id === 'map' && state.minimapOn) ||
+      (b.id === 'fullscreen' && state.fullscreenOn);
+    ctx.fillStyle = on ? 'rgba(93,255,93,0.14)' : 'rgba(255,255,255,0.06)';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeStyle = on ? ACCENT : 'rgba(255,255,255,0.18)';
+    ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+
+    ctx.font = `bold ${layout.font}px ui-monospace, Menlo, Consolas, monospace`;
+    ctx.fillStyle = on ? ACCENT : TEXT_MAIN;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(b.label, r.x + r.w / 2, r.y + r.h / 2 + 1);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+  }
+}
+
+// ------------------------------------------------------------ touch menu ----
+
+export type MenuCmd = 'move' | 'attack' | 'stop' | 'guard';
+
+export interface TouchMenuItem {
+  id: MenuCmd;
+  cx: number;
+  cy: number;
+  r: number;
+  label: string;
+}
+
+export interface TouchMenu {
+  /** Screen point the menu opened at (world anchor for move/attack). */
+  at: { x: number; y: number };
+  items: TouchMenuItem[];
+}
+
+const MENU_R = 30; // radius → 60px diameter buttons (≥56)
+const MENU_STEP = 68;
+
+/** Column of circular buttons at the touch point; flips side near an edge. */
+export function touchMenuLayout(
+  at: { x: number; y: number },
+  layout: HudLayout,
+): TouchMenu {
+  const defs: { id: MenuCmd; label: string }[] = [
+    { id: 'move', label: '移动' },
+    { id: 'attack', label: '攻击' },
+    { id: 'stop', label: '停止' },
+    { id: 'guard', label: '守卫' },
+  ];
+  const cx = Math.max(MENU_R + 8, Math.min(layout.viewW - MENU_R - 8, at.x + MENU_R + 14));
+  const up = at.y - MENU_STEP * defs.length - MENU_R > 8;
+  const items = defs.map((d, i) => ({
+    ...d,
+    cx,
+    cy: up ? at.y - 24 - i * MENU_STEP : at.y + 24 + i * MENU_STEP,
+    r: MENU_R,
+  }));
+  return { at, items };
+}
+
+export function touchMenuHit(menu: TouchMenu, px: number, py: number): MenuCmd | null {
+  for (const it of menu.items) {
+    if (Math.hypot(px - it.cx, py - it.cy) <= it.r) return it.id;
+  }
+  return null;
+}
+
+export function drawTouchMenu(ctx: CanvasRenderingContext2D, menu: TouchMenu): void {
+  // Anchor dot where the long-press happened.
+  ctx.fillStyle = 'rgba(93,255,93,0.5)';
+  ctx.beginPath();
+  ctx.arc(menu.at.x, menu.at.y, 5, 0, Math.PI * 2);
+  ctx.fill();
+
+  for (const it of menu.items) {
+    ctx.fillStyle = 'rgba(10,14,8,0.88)';
+    ctx.beginPath();
+    ctx.arc(it.cx, it.cy, it.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = PANEL_BORDER;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    ctx.font = 'bold 14px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillStyle = TEXT_MAIN;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(it.label, it.cx, it.cy + 1);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+  }
+}
+
+// ------------------------------------------------------------- touch guide ----
+
+export interface GuideStepDef {
+  title: string;
+  lines: readonly string[];
+  primary: string;
+}
+
+export const TOUCH_GUIDE_STEPS: readonly GuideStepDef[] = [
+  {
+    title: '① 点选',
+    lines: ['轻点己方单位 → 选中', '轻点敌人 → 集火攻击', '轻点空地 → 移动 / 取消选择'],
+    primary: '下一步',
+  },
+  {
+    title: '② 框选',
+    lines: ['单指拖动画出选框', '松手选中框内所有单位'],
+    primary: '下一步',
+  },
+  {
+    title: '③ 视野与指令',
+    lines: ['双指捏合 → 缩放视野', '双指拖动 → 平移地图', '长按 → 指令菜单'],
+    primary: '开始',
+  },
+];
+
+export interface GuideLayout {
+  card: Rect;
+  primary: Rect;
+  skip: Rect;
+  step: number;
+}
+
+export function touchGuideLayout(viewW: number, viewH: number, step: number): GuideLayout {
+  const w = Math.min(viewW - 40, 380);
+  const h = 220;
+  const card: Rect = { x: (viewW - w) / 2, y: (viewH - h) / 2 - 20, w, h };
+  const bw = 120;
+  const bh = 44;
+  return {
+    card,
+    primary: { x: card.x + w - bw - 16, y: card.y + h - bh - 14, w: bw, h: bh },
+    skip: { x: card.x + 16, y: card.y + h - bh - 14, w: 90, h: bh },
+    step,
+  };
+}
+
+export function guideHit(g: GuideLayout, px: number, py: number): 'primary' | 'skip' | null {
+  const inR = (r: Rect) => px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
+  if (inR(g.primary)) return 'primary';
+  if (inR(g.skip)) return 'skip';
+  return null;
+}
+
+export function drawTouchGuide(
+  ctx: CanvasRenderingContext2D,
+  viewW: number,
+  viewH: number,
+  step: number,
+): void {
+  const g = touchGuideLayout(viewW, viewH, step);
+  const def = TOUCH_GUIDE_STEPS[step] ?? TOUCH_GUIDE_STEPS[0]!;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(0, 0, viewW, viewH);
+
+  panel(ctx, g.card.x, g.card.y, g.card.w, g.card.h);
+  ctx.font = 'bold 18px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillStyle = ACCENT;
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(def.title, g.card.x + 20, g.card.y + 36);
+
+  ctx.font = '15px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillStyle = TEXT_MAIN;
+  def.lines.forEach((l, i) => ctx.fillText(l, g.card.x + 20, g.card.y + 66 + i * 26));
+
+  for (const [r, label, accent] of [
+    [g.primary, def.primary, true],
+    [g.skip, '跳过', false],
+  ] as const) {
+    ctx.fillStyle = accent ? 'rgba(93,255,93,0.14)' : 'rgba(255,255,255,0.06)';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeStyle = accent ? ACCENT : 'rgba(255,255,255,0.18)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+    ctx.font = 'bold 15px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillStyle = accent ? ACCENT : TEXT_DIM;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, r.x + r.w / 2, r.y + r.h / 2 + 1);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+  }
+
+  ctx.font = '12px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillStyle = TEXT_DIM;
+  ctx.fillText(`${step + 1}/${TOUCH_GUIDE_STEPS.length}`, g.card.x + g.card.w - 52, g.card.y + 20);
 }

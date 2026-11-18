@@ -4,7 +4,7 @@ import { TILE_SIZE, type GameMap } from './grid.js';
 import type { Point } from './selection.js';
 
 export const MIN_ZOOM = 0.5;
-export const MAX_ZOOM = 2;
+export const MAX_ZOOM = 2.5;
 
 /** (x, y) = world-pixel coordinate shown at the viewport's top-left corner. */
 export interface Camera {
