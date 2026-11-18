@@ -8,6 +8,7 @@ var MAP_W = 64;
 var MAP_H = 64;
 var GRASS = 0;
 var WATER = 1;
+var ORE = 2;
 function mulberry32(seed) {
   let a = seed >>> 0;
   return () => {
@@ -21,6 +22,13 @@ function mulberry32(seed) {
 function clamp(v, lo, hi) {
   return v < lo ? lo : v > hi ? hi : v;
 }
+function inCenterClearing(w, h, x, y) {
+  const cx = w >> 1;
+  const cy = h >> 1;
+  return x >= cx - 6 && x <= cx + 6 && y >= cy - 6 && y <= cy + 6;
+}
+var WALK_DX = [1, -1, 0, 0];
+var WALK_DY = [0, 0, 1, -1];
 function generateMap(seed, w = MAP_W, h = MAP_H) {
   const rng = mulberry32(seed);
   const tiles = new Uint8Array(w * h);
@@ -42,7 +50,56 @@ function generateMap(seed, w = MAP_W, h = MAP_H) {
       tiles[y * w + x] = GRASS;
     }
   }
-  return { w, h, seed, tiles };
+  const veins = 4 + Math.floor(rng() * 3);
+  for (let i = 0; i < veins; i++) {
+    let x = Math.floor(rng() * w);
+    let y = Math.floor(rng() * h);
+    let tries = 0;
+    while ((tiles[y * w + x] !== GRASS || inCenterClearing(w, h, x, y)) && tries++ < w * h) {
+      x = Math.floor(rng() * w);
+      y = Math.floor(rng() * h);
+    }
+    if (tries >= w * h) continue;
+    const steps = 12 + Math.floor(rng() * 13);
+    tiles[y * w + x] = ORE;
+    let placed = 1;
+    let attempts = 0;
+    while (placed < steps && attempts++ < steps * 60) {
+      const d = Math.floor(rng() * 4);
+      const nx = x + WALK_DX[d];
+      const ny = y + WALK_DY[d];
+      if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+      const c = tiles[ny * w + nx];
+      if (c !== ORE && (c !== GRASS || inCenterClearing(w, h, nx, ny))) continue;
+      x = nx;
+      y = ny;
+      if (c === GRASS) {
+        tiles[ny * w + nx] = ORE;
+        placed++;
+      }
+    }
+  }
+  const map2 = { w, h, seed, tiles };
+  let ore = countTerrain(map2, ORE);
+  let guard = 0;
+  while (ore < 40 && guard++ < w * h * 8) {
+    const i = Math.floor(rng() * tiles.length);
+    if (tiles[i] !== ORE) continue;
+    const d = Math.floor(rng() * 4);
+    const nx = i % w + WALK_DX[d];
+    const ny = (i / w | 0) + WALK_DY[d];
+    if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+    if (tiles[ny * w + nx] === GRASS && !inCenterClearing(w, h, nx, ny)) {
+      tiles[ny * w + nx] = ORE;
+      ore++;
+    }
+  }
+  return map2;
+}
+function countTerrain(map2, t) {
+  let n = 0;
+  for (let i = 0; i < map2.tiles.length; i++) if (map2.tiles[i] === t) n++;
+  return n;
 }
 
 // src/game/camera.ts
