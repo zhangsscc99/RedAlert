@@ -31,4 +31,5 @@ import "./stats.test.js";
 import "./unitRoles.test.js";
 import "./units.test.js";
 import "./upgrades.test.js";
+import "./veterancy.test.js";
 import "./weather.test.js";
