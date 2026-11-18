@@ -27,3 +27,16 @@
 - [ ] F102 矿车采集-回程循环｜verify: node --test client/src/game/economy.test.js｜risk: med
 - [ ] F103 建筑放置（格子吸附/占地判定）｜verify: node --test client/src/game/buildings.test.js｜risk: med
 - [ ] F104 兵营生产队列与资金扣款｜verify: node --test client/src/game/economy.test.js｜risk: med
+
+## M2 并行车道批（2026-11-18 13:15 UTC）
+
+- [ ] F201 矿石地形：grid 新增 ORE 地形（不可通行、可采集），generateMap 在中心空地外围撒 4~6 处矿脉，exports isOre/oreTiles，terrain 渲染矿石色｜verify: bash scripts/build-tests.sh && node --test client/src/game/grid.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F202 单位属性表：UnitKind(infantry/harvester/tank) + UNIT_STATS(hp/speed/cost/buildTime/radius/canHarvest) + spawnUnit(kind) 工厂，步兵行为不变｜verify: bash scripts/build-tests.sh && node --test client/src/game/units.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F203 建筑放置：buildings.ts（占地矩形、格子吸附、与水面/已有建筑/越界冲突判定、canPlace/place）｜verify: bash scripts/build-tests.sh && node --test client/src/game/buildings.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F204 经济内核：economy.ts（资金账户、采矿结算、生产队列扣款/出队，纯逻辑无 DOM）｜verify: bash scripts/build-tests.sh && node --test client/src/game/economy.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F205 战斗内核：combat.ts（血量、伤害、射程、冷却、死亡结算，纯函数）｜verify: bash scripts/build-tests.sh && node --test client/src/game/combat.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F206 敌方 AI 状态机：enemyAI.ts（攒矿→造兵→波次进攻，step() 输出指令数组，确定性可测）｜verify: bash scripts/build-tests.sh && node --test client/src/game/enemyAI.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F207 HUD 扩展：资源条、选中单位信息卡、消息提示队列（render/hud.ts）｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F208 选择增强：双击选同类、Ctrl+A 全选、框选顺序稳定（selection.ts）｜verify: bash scripts/build-tests.sh && node --test client/src/game/selection.test.js && (cd client && npx tsc --noEmit)｜risk: low
+- [ ] F209 相机体验：屏幕边缘滚动 + 平移平滑插值 + 限位不越界（camera.ts）｜verify: bash scripts/build-tests.sh && node --test client/src/game/camera.test.js && (cd client && npx tsc --noEmit)｜risk: low
+- [ ] F210 存档序列化：save.ts（版本化快照 serialize/parse + 校验，纯逻辑）｜verify: bash scripts/build-tests.sh && node --test client/src/game/save.test.js && (cd client && npx tsc --noEmit)｜risk: low
