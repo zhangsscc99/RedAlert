@@ -521,22 +521,48 @@ function place(buildings, kind, gx, gy, nextId) {
 }
 
 // src/game/economy.ts
-function createEconomy(start = 5e3) {
-  return { credits: start, earned: 0, spent: 0 };
+function createEconomy(start = 5e3, opts) {
+  const cap = opts?.cap;
+  const e = {
+    credits: cap !== void 0 ? Math.min(start, cap) : start,
+    earned: 0,
+    spent: 0,
+    cap,
+    maintenanceRate: opts?.maintenanceRate,
+    passiveRate: opts?.passiveRate,
+    storageFull: false,
+    broke: false,
+    lostToCap: 0
+  };
+  return e;
 }
 function canAfford(e, amount) {
   return amount >= 0 && e.credits >= amount;
+}
+function refreshFlags(e) {
+  e.broke = e.credits < 0;
+  if (e.cap === void 0 || e.credits < e.cap) e.storageFull = false;
 }
 function spend(e, amount) {
   if (!canAfford(e, amount)) return false;
   e.credits -= amount;
   e.spent += amount;
+  refreshFlags(e);
   return true;
 }
 function credit(e, amount) {
-  if (!(amount > 0)) return;
-  e.credits += amount;
-  e.earned += amount;
+  if (!(amount > 0)) return 0;
+  const room = e.cap !== void 0 ? Math.max(0, e.cap - e.credits) : amount;
+  const accepted = Math.min(amount, room);
+  if (accepted > 0) {
+    e.credits += accepted;
+    e.earned += accepted;
+  }
+  if (accepted < amount) {
+    e.storageFull = true;
+    e.lostToCap = (e.lostToCap ?? 0) + (amount - accepted);
+  }
+  return accepted;
 }
 function createQueue() {
   return [];
@@ -1090,8 +1116,21 @@ var HARVEST_CAPACITY = 700;
 var ORE_RESERVE = 350;
 var STUCK_SECONDS = 3;
 var STUCK_EPS = 1;
+var MAX_MINERS_PER_TILE = 1;
+var CLAIM_PENALTY = 4;
+var REPLAN_BEFORE_SWITCH = 1;
 function createHarvester(unit) {
-  return { unit, state: "idle", cargo: 0, target: null, stuckT: 0, lastX: unit.x, lastY: unit.y };
+  return {
+    unit,
+    state: "idle",
+    cargo: 0,
+    target: null,
+    noOre: false,
+    replans: 0,
+    stuckT: 0,
+    lastX: unit.x,
+    lastY: unit.y
+  };
 }
 var reservesByMap = /* @__PURE__ */ new WeakMap();
 function reserveTable(map) {
@@ -1163,6 +1202,7 @@ function resetWatchdog(h) {
 function toIdle(h) {
   h.state = "idle";
   h.target = null;
+  h.replans = 0;
   h.unit.path = [];
   resetWatchdog(h);
 }
@@ -1190,15 +1230,25 @@ function standTileFor(map, ore, ux, uy, blocked) {
 function onOreEdge(ux, uy, ore) {
   return Math.max(Math.abs(ux - ore.x), Math.abs(uy - ore.y)) <= 1;
 }
-function sendToOre(h, map, reserves, claims, blockers, blocked) {
+function oreScore(d2, claimants, reserve) {
+  const crowd = 1 + claimants * CLAIM_PENALTY;
+  const richness = 0.25 + reserve / ORE_RESERVE;
+  return d2 * crowd / richness;
+}
+function sendToOre(h, map, reserves, claims, blockers, blocked, exclude) {
   const ux = worldToTile(h.unit.x);
   const uy = worldToTile(h.unit.y);
   const own = h.target && (h.state === "toOre" || h.state === "mining") ? idx(map, h.target.x, h.target.y) : -1;
-  const candidates = oreTiles(map).filter((t) => {
+  const scored = oreTiles(map).map((t) => {
     const i = idx(map, t.x, t.y);
-    return reserves[i] > 0 && (!claims.has(i) || i === own);
-  }).sort((a, b) => (a.x - ux) ** 2 + (a.y - uy) ** 2 - ((b.x - ux) ** 2 + (b.y - uy) ** 2));
-  for (const ore of candidates) {
+    const reserve = reserves[i];
+    const claimants = (claims.get(i) ?? 0) - (i === own ? 1 : 0);
+    const d2 = (t.x - ux) ** 2 + (t.y - uy) ** 2;
+    return { t, i, reserve, claimants, score: oreScore(d2, claimants, reserve) };
+  }).filter((c) => c.reserve > 0 && !(exclude?.has(c.i) ?? false));
+  if (scored.length === 0) h.noOre = true;
+  const candidates = scored.filter((c) => c.claimants < MAX_MINERS_PER_TILE).sort((a, b) => a.score - b.score);
+  for (const { t: ore, i } of candidates) {
     if (onOreEdge(ux, uy, ore)) {
       h.target = { x: ore.x, y: ore.y };
       h.state = "mining";
@@ -1209,8 +1259,10 @@ function sendToOre(h, map, reserves, claims, blockers, blocked) {
       h.target = { x: ore.x, y: ore.y };
       h.state = "toOre";
     }
-    if (own >= 0) claims.delete(own);
-    claims.add(idx(map, ore.x, ore.y));
+    if (own >= 0) claims.set(own, (claims.get(own) ?? 1) - 1);
+    claims.set(i, (claims.get(i) ?? 0) + 1);
+    if (i !== own) h.replans = 0;
+    h.noOre = false;
     resetWatchdog(h);
     return true;
   }
@@ -1262,10 +1314,11 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles) {
   const reserves = reserveTable(map);
   const blockers = buildingBlockers(obstacles ?? buildings);
   const blocked = blockedTiles(map, blockers);
-  const claims = /* @__PURE__ */ new Set();
+  const claims = /* @__PURE__ */ new Map();
   for (const h of hs) {
     if (h.unit.kind === "harvester" && (h.state === "toOre" || h.state === "mining") && h.target !== null && isOre(map, h.target.x, h.target.y)) {
-      claims.add(idx(map, h.target.x, h.target.y));
+      const i = idx(map, h.target.x, h.target.y);
+      claims.set(i, (claims.get(i) ?? 0) + 1);
     }
   }
   for (const h of hs) {
@@ -1279,7 +1332,18 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles) {
       h.lastY = h.unit.y;
       if (stuckT >= STUCK_SECONDS) {
         h.unit.path = [];
-        const ok = h.state === "toOre" ? sendToOre(h, map, reserves, claims, blockers, blocked) : sendToRefinery(h, map, buildings, blockers);
+        let ok;
+        if (h.state === "toOre") {
+          h.replans = (h.replans ?? 0) + 1;
+          const cur = h.target !== null ? idx(map, h.target.x, h.target.y) : -1;
+          ok = false;
+          if (h.replans > REPLAN_BEFORE_SWITCH && cur >= 0) {
+            ok = sendToOre(h, map, reserves, claims, blockers, blocked, /* @__PURE__ */ new Set([cur]));
+          }
+          if (!ok) ok = sendToOre(h, map, reserves, claims, blockers, blocked);
+        } else {
+          ok = sendToRefinery(h, map, buildings, blockers);
+        }
         if (!ok) toIdle(h);
         continue;
       }
@@ -1377,13 +1441,22 @@ function isLowPower(power) {
 }
 
 // src/game/save.ts
-var SAVE_VERSION = 2;
-var cloneUnit = (u) => ({ id: u.id, kind: u.kind, x: u.x, y: u.y, hp: u.hp });
+var SAVE_VERSION = 3;
+var cloneUnit = (u) => {
+  const c = { id: u.id, kind: u.kind, x: u.x, y: u.y, hp: u.hp };
+  if (u.kills !== void 0) c.kills = u.kills;
+  return c;
+};
 var cloneBuilding = (b) => {
   const c = { id: b.id, kind: b.kind, gx: b.gx, gy: b.gy, hp: b.hp };
   if (b.done !== void 0) c.done = b.done;
+  if (b.level !== void 0) c.level = b.level;
+  if (b.repair !== void 0) c.repair = b.repair;
   return c;
 };
+var cloneStats = (s) => ({ ...s });
+var cloneWeather = (w) => ({ ...w });
+var cloneRadar = (r) => ({ ...r });
 function snapshot(input) {
   const s = {
     version: SAVE_VERSION,
@@ -1398,6 +1471,12 @@ function snapshot(input) {
   if (input.ai) s.ai = { ...input.ai };
   if (input.camera) s.camera = { ...input.camera };
   if (input.opts) s.opts = { ...input.opts };
+  if (input.fog) s.fog = { w: input.fog.w, h: input.fog.h, explored: Array.from(input.fog.explored) };
+  if (input.stats) s.stats = cloneStats(input.stats);
+  if (input.wave !== void 0) s.wave = input.wave;
+  if (input.difficulty !== void 0) s.difficulty = input.difficulty;
+  if (input.weather) s.weather = cloneWeather(input.weather);
+  if (input.radar) s.radar = cloneRadar(input.radar);
   return s;
 }
 

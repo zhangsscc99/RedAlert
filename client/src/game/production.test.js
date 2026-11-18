@@ -3,22 +3,48 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 // src/game/economy.ts
-function createEconomy(start = 5e3) {
-  return { credits: start, earned: 0, spent: 0 };
+function createEconomy(start = 5e3, opts) {
+  const cap = opts?.cap;
+  const e = {
+    credits: cap !== void 0 ? Math.min(start, cap) : start,
+    earned: 0,
+    spent: 0,
+    cap,
+    maintenanceRate: opts?.maintenanceRate,
+    passiveRate: opts?.passiveRate,
+    storageFull: false,
+    broke: false,
+    lostToCap: 0
+  };
+  return e;
 }
 function canAfford(e, amount) {
   return amount >= 0 && e.credits >= amount;
+}
+function refreshFlags(e) {
+  e.broke = e.credits < 0;
+  if (e.cap === void 0 || e.credits < e.cap) e.storageFull = false;
 }
 function spend(e, amount) {
   if (!canAfford(e, amount)) return false;
   e.credits -= amount;
   e.spent += amount;
+  refreshFlags(e);
   return true;
 }
 function credit(e, amount) {
-  if (!(amount > 0)) return;
-  e.credits += amount;
-  e.earned += amount;
+  if (!(amount > 0)) return 0;
+  const room = e.cap !== void 0 ? Math.max(0, e.cap - e.credits) : amount;
+  const accepted = Math.min(amount, room);
+  if (accepted > 0) {
+    e.credits += accepted;
+    e.earned += accepted;
+  }
+  if (accepted < amount) {
+    e.storageFull = true;
+    e.lostToCap = (e.lostToCap ?? 0) + (amount - accepted);
+  }
+  return accepted;
 }
 function enqueue(q, e, item) {
   if (!spend(e, item.cost)) return false;

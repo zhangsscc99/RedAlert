@@ -3,16 +3,33 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 // src/game/economy.ts
-function createEconomy(start = 5e3) {
-  return { credits: start, earned: 0, spent: 0 };
+function createEconomy(start = 5e3, opts) {
+  const cap = opts?.cap;
+  const e = {
+    credits: cap !== void 0 ? Math.min(start, cap) : start,
+    earned: 0,
+    spent: 0,
+    cap,
+    maintenanceRate: opts?.maintenanceRate,
+    passiveRate: opts?.passiveRate,
+    storageFull: false,
+    broke: false,
+    lostToCap: 0
+  };
+  return e;
 }
 function canAfford(e, amount) {
   return amount >= 0 && e.credits >= amount;
+}
+function refreshFlags(e) {
+  e.broke = e.credits < 0;
+  if (e.cap === void 0 || e.credits < e.cap) e.storageFull = false;
 }
 function spend(e, amount) {
   if (!canAfford(e, amount)) return false;
   e.credits -= amount;
   e.spent += amount;
+  refreshFlags(e);
   return true;
 }
 
