@@ -65,6 +65,7 @@ function menuLayout(viewW, viewH) {
   const top = Math.round(viewH * 0.44);
   const y0 = top + DIFF_H + 22;
   const ids = ["start", "continue", "settings"];
+  const half = (bw - DIFF_GAP) / 2;
   return {
     titleY: Math.round(viewH * 0.24),
     subtitleY: Math.round(viewH * 0.24) + 30,
@@ -72,9 +73,10 @@ function menuLayout(viewW, viewH) {
       d,
       rect: { x: cx - bw / 2 + i * (dw + DIFF_GAP), y: top, w: dw, h: DIFF_H }
     })),
+    campaign: { x: cx - bw / 2 + half + DIFF_GAP, y: y0, w: half, h: bh },
     buttons: ids.map((id, i) => ({
       id,
-      rect: { x: cx - bw / 2, y: y0 + i * (bh + BTN_GAP), w: bw, h: bh }
+      rect: id === "start" ? { x: cx - bw / 2, y: y0, w: half, h: bh } : { x: cx - bw / 2, y: y0 + i * (bh + BTN_GAP), w: bw, h: bh }
     }))
   };
 }
@@ -82,6 +84,7 @@ function menuHit(l, x, y) {
   for (const b of l.buttons) {
     if (inRect(b.rect, x, y)) return { kind: "button", id: b.id };
   }
+  if (inRect(l.campaign, x, y)) return { kind: "button", id: "campaign" };
   for (const d of l.difficulty) {
     if (inRect(d.rect, x, y)) return { kind: "difficulty", difficulty: d.d };
   }

@@ -89,6 +89,8 @@ export interface GUnit extends Unit {
   cooldownMax: number;
   repathT: number; // throttle for idle re-pathing (used by the enemy side)
   retreating: boolean; // pulled back by the deep AI until the next wave
+  /** Scripted marker carried by mission-spawned units (e.g. escort VIPs). */
+  tag?: string;
 }
 
 /** Building extended with a world-space center + Combatant fields. */
@@ -115,6 +117,17 @@ export const COMBAT_STATS: Record<UnitKind, { range: number; damage: number; coo
 export const REFINERY_TRICKLE = 5; // credits/sec per finished refinery
 export const ENEMY_REPATH_SECONDS = 1.2;
 
+/**
+ * Scripted starting-unit spec — structurally identical to missions.ts'
+ * SpawnSpec so MissionDef tables drop straight in (kept a separate type
+ * because missions.ts deliberately does not import this module).
+ */
+export interface SpawnPlan {
+  kind: UnitKind;
+  count: number;
+  tag?: string;
+}
+
 export interface GameOpts {
   credits?: number; // starting funds, default 5000
   infantry?: number; // starting player infantry, default 6
@@ -128,11 +141,35 @@ export interface GameOpts {
   deepAI?: boolean;
   /** Tier the AI muster size and wave gap scale with, default 'normal'. */
   aiDifficulty?: Difficulty;
+  /**
+   * Explicit player starting composition; overrides `infantry`. A `tag` marks
+   * the unit for mission logic and skips its harvester FSM (scripted cargo
+   * stays under player control instead of auto-mining).
+   */
+  playerArmy?: readonly SpawnPlan[];
+  /** Explicit enemy starting composition; overrides `enemyInfantry`. */
+  enemyArmy?: readonly SpawnPlan[];
+  /** Enemy buildings placed near the enemy anchor, on top of `enemyBase`. */
+  enemyStructures?: readonly BuildingKind[];
+  /**
+   * Suppress tickGame's win/lose phase transitions; the host (mission mode)
+   * owns the end state instead. Default false.
+   */
+  manualEnd?: boolean;
 }
+
+/**
+ * GameOpts after createGame fills defaults: every field resolved except the
+ * army/structure specs, where `undefined` means "use the legacy paths".
+ */
+export type ResolvedOpts = Required<
+  Omit<GameOpts, 'playerArmy' | 'enemyArmy' | 'enemyStructures'>
+> &
+  Pick<GameOpts, 'playerArmy' | 'enemyArmy' | 'enemyStructures'>;
 
 export interface GameState {
   seed: number;
-  opts: Required<GameOpts>;
+  opts: ResolvedOpts;
   map: GameMap;
   units: GUnit[]; // player units
   enemyUnits: GUnit[];
@@ -268,7 +305,7 @@ function findBuildSpot(
 }
 
 export function createGame(seed: number, opts: GameOpts = {}): GameState {
-  const o: Required<GameOpts> = {
+  const o: ResolvedOpts = {
     credits: opts.credits ?? 5000,
     infantry: opts.infantry ?? 6,
     enemyInfantry: opts.enemyInfantry ?? 4,
@@ -277,6 +314,10 @@ export function createGame(seed: number, opts: GameOpts = {}): GameState {
     waveIntervalScale: opts.waveIntervalScale ?? 1,
     deepAI: opts.deepAI ?? false,
     aiDifficulty: opts.aiDifficulty ?? 'normal',
+    playerArmy: opts.playerArmy,
+    enemyArmy: opts.enemyArmy,
+    enemyStructures: opts.enemyStructures,
+    manualEnd: opts.manualEnd ?? false,
   };
   const map = generateMap(seed);
   const g: GameState = {
@@ -311,9 +352,13 @@ export function createGame(seed: number, opts: GameOpts = {}): GameState {
   const hqSpot = findBuildSpot(map, [], 'hq', cx, cy);
   if (hqSpot) addBuilding(g, g.buildings, 'hq', hqSpot.x, hqSpot.y, 'player', true);
 
-  // Starting infantry on free tiles around the HQ.
-  for (const t of freeTilesNear(map, g.buildings, cx, cy, o.infantry)) {
-    g.units.push(makeGUnit(g.nextId++, 'infantry', t.x, t.y, 'player'));
+  // Starting units: an explicit army spec (missions) or `infantry` riflemen.
+  if (o.playerArmy) {
+    spawnArmy(g, g.units, o.playerArmy, 'player', 1, cx, cy);
+  } else {
+    for (const t of freeTilesNear(map, g.buildings, cx, cy, o.infantry)) {
+      g.units.push(makeGUnit(g.nextId++, 'infantry', t.x, t.y, 'player'));
+    }
   }
 
   // Enemy base in the far corner region; guards spawn next to it.
@@ -324,11 +369,55 @@ export function createGame(seed: number, opts: GameOpts = {}): GameState {
       g.enemyAnchor = { x: hq.gx + 2, y: hq.gy + BUILDING_DEFS.hq.h };
     }
   }
-  for (const t of freeTilesNear(map, allBuildings(g), g.enemyAnchor.x, g.enemyAnchor.y, o.enemyInfantry)) {
-    g.enemyUnits.push(makeGUnit(g.nextId++, 'infantry', t.x, t.y, 'enemy', o.enemyStrength));
+  // Mission-scripted structures cluster on the anchor; the first one moves it.
+  let anchored = o.enemyBase;
+  for (const kind of o.enemyStructures ?? []) {
+    const spot = findBuildSpot(map, allBuildings(g), kind, g.enemyAnchor.x, g.enemyAnchor.y);
+    if (!spot) continue;
+    const b = addBuilding(g, g.enemyBuildings, kind, spot.x, spot.y, 'enemy', true);
+    if (!anchored) {
+      g.enemyAnchor = { x: b.gx + (BUILDING_DEFS[kind].w >> 1), y: b.gy + BUILDING_DEFS[kind].h };
+      anchored = true;
+    }
+  }
+  if (o.enemyArmy) {
+    spawnArmy(g, g.enemyUnits, o.enemyArmy, 'enemy', o.enemyStrength, g.enemyAnchor.x, g.enemyAnchor.y);
+  } else {
+    for (const t of freeTilesNear(map, allBuildings(g), g.enemyAnchor.x, g.enemyAnchor.y, o.enemyInfantry)) {
+      g.enemyUnits.push(makeGUnit(g.nextId++, 'infantry', t.x, t.y, 'enemy', o.enemyStrength));
+    }
   }
   g.ai.army = g.enemyUnits.length;
   return g;
+}
+
+/** Drop a spec army on free tiles around (cx,cy), in declaration order. */
+function spawnArmy(
+  g: GameState,
+  list: GUnit[],
+  spec: readonly SpawnPlan[],
+  team: Team,
+  strength: number,
+  cx: number,
+  cy: number,
+): void {
+  const total = spec.reduce((n, s) => n + Math.max(0, s.count), 0);
+  const tiles = freeTilesNear(g.map, allBuildings(g), cx, cy, total, 24);
+  let i = 0;
+  for (const s of spec) {
+    for (let k = 0; k < s.count; k++) {
+      const t = tiles[i++];
+      if (!t) return;
+      const u = makeGUnit(g.nextId++, s.kind, t.x, t.y, team, team === 'enemy' ? strength : 1);
+      if (s.tag !== undefined) u.tag = s.tag;
+      list.push(u);
+      // Untagged harvesters get their ore FSM (spawnTrained parity); tagged
+      // ones stay scripted — an escort VIP must not wander off to a vein.
+      if (s.kind === 'harvester' && s.tag === undefined && team === 'player') {
+        g.harvesters.push(createHarvester(u));
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------- actions --
@@ -731,8 +820,11 @@ export function tickGame(g: GameState, dt: number): TickEvents {
     g.upgradeJobs = g.upgradeJobs.filter((j) => aliveB.has(j.buildingId));
   }
 
-  if (!g.buildings.some((b) => b.kind === 'hq')) g.phase = 'lost';
-  else if (g.enemyUnits.length === 0 && g.enemyBuildings.length === 0) g.phase = 'won';
+  // Mission mode owns the end state: objectives (not annihilation) decide it.
+  if (!g.opts.manualEnd) {
+    if (!g.buildings.some((b) => b.kind === 'hq')) g.phase = 'lost';
+    else if (g.enemyUnits.length === 0 && g.enemyBuildings.length === 0) g.phase = 'won';
+  }
   return ev;
 }
 
