@@ -1147,6 +1147,15 @@ function boardRow(i: number, s: unknown): string {
 }
 
 /**
+ * Resolve an API path against document.baseURI so requests land under the
+ * vite base (e.g. /redalert/) instead of the site root — works for any base.
+ */
+function apiUrl(path: string): string {
+  const base = document.baseURI.endsWith('/') ? document.baseURI : `${document.baseURI}/`;
+  return new URL(`api/${path}`, base).toString();
+}
+
+/**
  * Refresh the leaderboard panel. Any failure (offline, non-2xx, junk JSON)
  * degrades to「排行榜暂不可用」— it never throws into the game loop.
  */
@@ -1155,7 +1164,7 @@ function refreshBoard(missionId: string | null): void {
   boardCtx = ctx;
   boardLines = ['—— 排行榜 ——', '载入中…'];
   const q = missionId === null ? '' : `?mission=${encodeURIComponent(missionId)}`;
-  fetch(`/api/leaderboard${q}`)
+  fetch(apiUrl(`leaderboard${q}`))
     .then(async (r) => {
       if (!r.ok) throw new Error(`http ${r.status}`);
       const data: unknown = await r.json();
@@ -1183,7 +1192,7 @@ function submitScore(): void {
     mined: cap(stats.oreMined),
     durationSec: Math.min(86400, Math.max(1, mission ? mission.elapsed : game.elapsed)),
   };
-  fetch('/api/score', {
+  fetch(apiUrl('score'), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
