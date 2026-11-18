@@ -70,6 +70,14 @@ for (const [w, h] of VIEWPORTS) {
     assert.equal(settingsHit(l, 2, 2), null);
   });
 
+  test(`settings ${w}x${h}: all rows stay inside the viewport`, () => {
+    const l = settingsLayout(w, h);
+    for (const row of l.rows) {
+      assert.ok(row.rect.x >= 0 && row.rect.x + row.rect.w <= w);
+      assert.ok(row.rect.y >= 0 && row.rect.y + row.rect.h <= h);
+    }
+  });
+
   test(`gameover ${w}x${h}: retry/menu buttons hit correctly`, () => {
     const l = gameoverLayout(w, h);
     const retry = l.buttons.find((b) => b.id === 'retry')!;
@@ -81,5 +89,61 @@ for (const [w, h] of VIEWPORTS) {
       assert.ok(b.rect.x >= 0 && b.rect.x + b.rect.w <= w);
       assert.ok(b.rect.y >= 0 && b.rect.y + b.rect.h <= h);
     }
+  });
+}
+
+// F1102: small-viewport overflow regression — the bottom 「设置」/「回放」 row
+// and the hint line were clipped at 780x380.
+const FIT_VIEWPORTS: [number, number][] = [
+  [380, 320],
+  [780, 380],
+  [1024, 768],
+  [1440, 900],
+];
+
+const overlap = (a: Rect, b: Rect): boolean =>
+  a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+
+for (const [w, h] of FIT_VIEWPORTS) {
+  test(`menu ${w}x${h}: every rect fits the viewport and none overlap`, () => {
+    const l = menuLayout(w, h);
+    const rects = [
+      ...l.buttons.map((b) => b.rect),
+      ...l.difficulty.map((d) => d.rect),
+      l.campaign,
+      l.replay,
+    ];
+    for (const r of rects) {
+      assert.ok(r.y >= 0, `rect ${JSON.stringify(r)} above viewport`);
+      assert.ok(r.y + r.h <= h, `rect ${JSON.stringify(r)} below viewport ${h}`);
+      assert.ok(r.x >= 0, `rect ${JSON.stringify(r)} left of viewport`);
+      assert.ok(r.x + r.w <= w, `rect ${JSON.stringify(r)} right of viewport ${w}`);
+    }
+    for (let i = 0; i < rects.length; i++) {
+      for (let j = i + 1; j < rects.length; j++) {
+        assert.ok(!overlap(rects[i]!, rects[j]!), `rects ${i} and ${j} overlap`);
+      }
+    }
+    // Hint text (12px font) must clear every rect.
+    for (const r of rects) {
+      assert.ok(r.y + r.h <= l.hintY - 12, `rect ${JSON.stringify(r)} crowds hint at ${l.hintY}`);
+    }
+    assert.ok(l.hintY <= h);
+  });
+
+  test(`settings ${w}x${h}: every row fits, none overlap, hint is clear`, () => {
+    const l = settingsLayout(w, h);
+    const rects = l.rows.map((r) => r.rect);
+    for (const r of rects) {
+      assert.ok(r.y >= 0 && r.y + r.h <= h, `row ${JSON.stringify(r)} overflows height ${h}`);
+      assert.ok(r.x >= 0 && r.x + r.w <= w, `row ${JSON.stringify(r)} overflows width ${w}`);
+      assert.ok(r.y + r.h <= l.hintY - 12, `row ${JSON.stringify(r)} crowds hint at ${l.hintY}`);
+    }
+    for (let i = 0; i < rects.length; i++) {
+      for (let j = i + 1; j < rects.length; j++) {
+        assert.ok(!overlap(rects[i]!, rects[j]!), `rows ${i} and ${j} overlap`);
+      }
+    }
+    assert.ok(l.hintY <= h);
   });
 }

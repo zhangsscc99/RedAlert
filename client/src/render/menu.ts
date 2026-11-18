@@ -17,6 +17,8 @@ export interface MenuLayout {
   titleY: number;
   /** Baseline y of the subtitle line. */
   subtitleY: number;
+  /** Baseline y of the 「难度」 label above the toggle row. */
+  diffLabelY: number;
   /** Difficulty toggle row, in easy/normal/hard order. */
   difficulty: { d: Difficulty; rect: Rect }[];
   /** 战役入口：与「遭遇战」(start) 并列第一行的右半格。 */
@@ -24,6 +26,8 @@ export interface MenuLayout {
   /** 回放入口：与「设置」并列最后一行的左半格。 */
   replay: Rect;
   buttons: { id: MenuButton; rect: Rect }[];
+  /** Baseline y of the bottom hint line (「Enter 开局 · Esc 返回」). */
+  hintY: number;
 }
 
 export type SettingRow = 'mute' | 'grid' | 'back';
@@ -31,6 +35,8 @@ export type SettingRow = 'mute' | 'grid' | 'back';
 export interface SettingsLayout {
   titleY: number;
   rows: { id: SettingRow; rect: Rect }[];
+  /** Baseline y of the bottom hint line (「Esc 返回主菜单」). */
+  hintY: number;
 }
 
 export interface GameOverLayout {
@@ -44,6 +50,12 @@ const BTN_H = 52;
 const BTN_GAP = 14;
 const DIFF_H = 34;
 const DIFF_GAP = 8;
+const BTN_H_MIN = 36;
+const BTN_GAP_MIN = 6;
+const DIFF_H_MIN = 28;
+/** Bottom hint line: font px + breathing room below the baseline. */
+const HINT_FONT = 12;
+const HINT_ZONE = HINT_FONT + 6;
 
 const inRect = (r: Rect, x: number, y: number): boolean =>
   x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
@@ -53,34 +65,94 @@ function colW(viewW: number): number {
   return Math.max(180, Math.min(320, viewW - 64));
 }
 
+/**
+ * Vertical budget: stack title / middle / button-rows / bottom-hint zones and
+ * shrink them proportionally when the viewport is too short for the natural
+ * sizes. Row heights and gaps clamp at touch-safe minimums; the hint zone
+ * always keeps >=8px clear of the row above so nothing overlaps or clips.
+ */
+interface VZones {
+  /** Baselines for text zones, top to bottom. */
+  baselines: number[];
+  /** y of the first rect zone after the text header. */
+  midY: number;
+  /** y of the first button row. */
+  rowsY: number;
+  bh: number;
+  gap: number;
+  midH: number;
+  hintY: number;
+}
+
+function vstack(
+  viewH: number,
+  zones: { header: number[]; mid: number; rows: number },
+): VZones {
+  const nat = { top: 12, gapA: 8, gapB: 14, gapHint: 12, bottom: 6 };
+  const natRows = zones.rows * BTN_H + (zones.rows - 1) * BTN_GAP;
+  const natHeader = zones.header.reduce((a, b) => a + b, 0);
+  const natTotal =
+    nat.top + natHeader + nat.gapA + zones.mid + nat.gapB + natRows + nat.gapHint + HINT_ZONE + nat.bottom;
+  const s = Math.min(1, viewH / natTotal);
+  const bh = Math.max(BTN_H_MIN, Math.round(BTN_H * s));
+  const gap = Math.max(BTN_GAP_MIN, Math.round(BTN_GAP * s));
+  const midH = Math.max(Math.min(DIFF_H_MIN, zones.mid), Math.round(zones.mid * s));
+  const scaled = zones.header.map((h) => h * s);
+  const top = nat.top * s;
+  const gapA = nat.gapA * s;
+  const gapB = nat.gapB * s;
+  const gapHint = Math.max(8, nat.gapHint * s);
+  const rowsH = zones.rows * bh + (zones.rows - 1) * gap;
+  const total = top + natHeader * s + gapA + midH + gapB + rowsH + gapHint + HINT_ZONE + nat.bottom;
+  let y = Math.max(0, (viewH - total) / 2) + top;
+  const baselines = scaled.map((h) => {
+    const b = y + h * 0.8;
+    y += h;
+    return Math.round(b);
+  });
+  y += gapA;
+  const midY = y;
+  y += midH + gapB;
+  const rowsY = y;
+  const hintY = Math.round(Math.min(viewH - nat.bottom - 3, rowsY + rowsH + gapHint + HINT_FONT));
+  return { baselines, midY, rowsY, bh, gap, midH, hintY };
+}
+
 export function menuLayout(viewW: number, viewH: number): MenuLayout {
   const bw = colW(viewW);
-  const bh = viewH < 480 ? 44 : BTN_H;
-  const dw = (bw - 2 * DIFF_GAP) / 3;
   const cx = viewW / 2;
-  const top = Math.round(viewH * 0.44);
-  const y0 = top + DIFF_H + 22;
+  const titleFont = viewW < 480 ? 44 : 64;
+  const v = vstack(viewH, {
+    header: [titleFont * 1.05, 22, 16], // title, subtitle, 「难度」 label
+    mid: DIFF_H,
+    rows: 3,
+  });
+  const bh = v.bh;
+  const dw = (bw - 2 * DIFF_GAP) / 3;
+  const y0 = v.rowsY;
   const ids: MenuButton[] = ['start', 'continue', 'settings'];
   // 「战役」与「遭遇战」并列第一行：start 占左半，campaign 占右半。
   const half = (bw - DIFF_GAP) / 2;
   return {
-    titleY: Math.round(viewH * 0.24),
-    subtitleY: Math.round(viewH * 0.24) + 30,
+    titleY: v.baselines[0]!,
+    subtitleY: v.baselines[1]!,
+    diffLabelY: v.baselines[2]!,
     difficulty: DIFF_ORDER.map((d, i) => ({
       d,
-      rect: { x: cx - bw / 2 + i * (dw + DIFF_GAP), y: top, w: dw, h: DIFF_H },
+      rect: { x: cx - bw / 2 + i * (dw + DIFF_GAP), y: v.midY, w: dw, h: v.midH },
     })),
     campaign: { x: cx - bw / 2 + half + DIFF_GAP, y: y0, w: half, h: bh },
-    replay: { x: cx - bw / 2, y: y0 + 2 * (bh + BTN_GAP), w: half, h: bh },
+    replay: { x: cx - bw / 2, y: y0 + 2 * (bh + v.gap), w: half, h: bh },
     buttons: ids.map((id, i) => ({
       id,
       rect:
         id === 'start'
           ? { x: cx - bw / 2, y: y0, w: half, h: bh }
           : id === 'settings'
-            ? { x: cx - bw / 2 + half + DIFF_GAP, y: y0 + i * (bh + BTN_GAP), w: half, h: bh }
-            : { x: cx - bw / 2, y: y0 + i * (bh + BTN_GAP), w: bw, h: bh },
+            ? { x: cx - bw / 2 + half + DIFF_GAP, y: y0 + i * (bh + v.gap), w: half, h: bh }
+            : { x: cx - bw / 2, y: y0 + i * (bh + v.gap), w: bw, h: bh },
     })),
+    hintY: v.hintY,
   };
 }
 
@@ -98,16 +170,20 @@ export function menuHit(l: MenuLayout, x: number, y: number): MenuHit | null {
 
 export function settingsLayout(viewW: number, viewH: number): SettingsLayout {
   const bw = colW(viewW);
-  const bh = viewH < 480 ? 44 : BTN_H;
   const cx = viewW / 2;
-  const y0 = Math.round(viewH * 0.42);
+  const v = vstack(viewH, {
+    header: [34 * 1.1], // 「设置」 title
+    mid: 0,
+    rows: 3,
+  });
   const ids: SettingRow[] = ['mute', 'grid', 'back'];
   return {
-    titleY: Math.round(viewH * 0.26),
+    titleY: v.baselines[0]!,
     rows: ids.map((id, i) => ({
       id,
-      rect: { x: cx - bw / 2, y: y0 + i * (bh + BTN_GAP), w: bw, h: bh },
+      rect: { x: cx - bw / 2, y: v.rowsY + i * (v.bh + v.gap), w: bw, h: v.bh },
     })),
+    hintY: v.hintY,
   };
 }
 
@@ -221,7 +297,7 @@ export function drawMenu(
   ctx.font = `12px ${FONT}`;
   ctx.fillStyle = TEXT_DIM;
   ctx.textAlign = 'center';
-  ctx.fillText('难度', viewW / 2, l.difficulty[0]!.rect.y - 8);
+  ctx.fillText('难度', viewW / 2, l.diffLabelY);
   ctx.textAlign = 'left';
   for (const d of l.difficulty) {
     button(ctx, d.rect, DIFFICULTY[d.d].label, {
@@ -252,7 +328,7 @@ export function drawMenu(
   ctx.font = `12px ${FONT}`;
   ctx.fillStyle = TEXT_DIM;
   ctx.textAlign = 'center';
-  ctx.fillText('Enter 开局 · Esc 返回', viewW / 2, viewH - 24);
+  ctx.fillText('Enter 开局 · Esc 返回', viewW / 2, l.hintY);
   ctx.textAlign = 'left';
 }
 
@@ -289,7 +365,7 @@ export function drawSettings(
   ctx.font = `12px ${FONT}`;
   ctx.fillStyle = TEXT_DIM;
   ctx.textAlign = 'center';
-  ctx.fillText('Esc 返回主菜单', viewW / 2, viewH - 24);
+  ctx.fillText('Esc 返回主菜单', viewW / 2, l.hintY);
   ctx.textAlign = 'left';
 }
 
