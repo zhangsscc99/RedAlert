@@ -104,7 +104,7 @@ function countTerrain(map2, t) {
 
 // src/game/camera.ts
 var MIN_ZOOM = 0.5;
-var MAX_ZOOM = 2;
+var MAX_ZOOM = 2.5;
 function createCamera(map2, viewW, viewH) {
   const worldW = map2.w * TILE_SIZE;
   const worldH = map2.h * TILE_SIZE;

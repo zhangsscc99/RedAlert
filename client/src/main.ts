@@ -65,18 +65,34 @@ import {
 import { drawEffects } from './render/effects.js';
 import { bakeFog, createFogLayer, drawFog, type FogLayer } from './render/fog.js';
 import {
+  actionButtonAt,
   buildBarHit,
+  computeHudLayout,
+  drawActionBar,
   drawBuildBar,
   drawHud,
   drawMessages,
   drawMinimap,
   drawSelectBox,
+  drawSelectionCard,
+  drawTouchGuide,
+  drawTouchMenu,
+  guideHit,
   minimapToWorld,
   pushMessage,
+  TOUCH_GUIDE_STEPS,
+  touchGuideLayout,
+  touchMenuHit,
+  touchMenuLayout,
+  type ActionId,
   type BuildBarItem,
+  type HudLayout,
   type HudMessage,
+  type MenuCmd,
   type ProductionItem,
+  type TouchMenu,
 } from './render/hud.js';
+import { createGestureRecognizer, type Gesture } from './input/gestures.js';
 
 const MAP_SEED = 1337;
 const CLICK_DRAG_THRESHOLD = 5; // screen px
@@ -97,6 +113,7 @@ let fogT = 0;
 let viewW = 0;
 let viewH = 0;
 let dpr = 1;
+const isTouch = matchMedia('(pointer: coarse)').matches;
 const camera = createCamera(map, window.innerWidth, window.innerHeight);
 
 const effects: Effect[] = [];
@@ -109,7 +126,8 @@ let paused = false;
 let speedIdx = 0;
 
 function resize(): void {
-  dpr = window.devicePixelRatio || 1;
+  // Cap DPR on touch devices — full-res retina rendering burns GPU/battery.
+  dpr = Math.min(window.devicePixelRatio || 1, isTouch ? 2 : 3);
   viewW = window.innerWidth;
   viewH = window.innerHeight;
   canvas.width = Math.round(viewW * dpr);
@@ -138,6 +156,76 @@ let moveMarker: { x: number; y: number; t: number } | null = null;
 let pendingBuild: BuildingKind | null = null;
 const msgs: HudMessage[] = [];
 const keys = new Set<string>();
+
+// ------------------------------------------------------------------ touch --
+
+const gestures = createGestureRecognizer();
+/** Mobile build bar is collapsed until the 建造 action opens it. */
+let buildBarOpen = !isTouch;
+let minimapCollapsed = false;
+let touchMenu: TouchMenu | null = null;
+let guideStep = -1; // -1 = hidden
+const fullscreenOK = typeof document.documentElement.requestFullscreen === 'function';
+let fullscreenOn = false;
+
+if (isTouch) {
+  try {
+    if (!localStorage.getItem('redalert.touchGuide')) guideStep = 0;
+  } catch {
+    guideStep = 0; // storage unavailable → still show the guide
+  }
+}
+document.addEventListener('fullscreenchange', () => {
+  fullscreenOn = document.fullscreenElement === document.documentElement;
+});
+
+interface RaDebug {
+  readonly units: readonly GUnit[];
+  readonly selectedCount: number;
+  readonly selectionCount: number;
+  readonly camera: typeof camera;
+  readonly isTouch: boolean;
+  readonly guideStep: number;
+}
+
+declare global {
+  interface Window {
+    __raDebug?: RaDebug;
+  }
+}
+
+window.__raDebug = {
+  get units() {
+    return game.units;
+  },
+  get selectedCount() {
+    return game.units.filter((u) => u.selected).length;
+  },
+  get selectionCount() {
+    return game.units.filter((u) => u.selected).length;
+  },
+  get camera() {
+    return camera;
+  },
+  get isTouch() {
+    return isTouch;
+  },
+  get guideStep() {
+    return guideStep;
+  },
+};
+
+function hudLayout(): HudLayout {
+  const prod = productionItems();
+  return computeHudLayout(viewW, viewH, {
+    isTouch,
+    minimapCollapsed,
+    buildBarOpen,
+    fullscreen: fullscreenOK,
+    hasSelection: selectedIds().size > 0,
+    prodCount: prod.length,
+  });
+}
 
 function canvasPos(e: PointerEvent | WheelEvent): Point {
   const r = canvas.getBoundingClientRect();
@@ -235,6 +323,25 @@ function issueAttack(target: Targetable): void {
   moveMarker = { x: target.x, y: target.y, t: performance.now() };
 }
 
+/** Box-select shared by mouse drag and touch dragbox gestures. */
+function boxSelect(aScreen: Point, bScreen: Point, additive: boolean): void {
+  const a = screenToWorld(camera, aScreen.x, aScreen.y);
+  const b = screenToWorld(camera, bScreen.x, bScreen.y);
+  selectUnits(game.units, unitsInRect(game.units, normRect(a, b)), additive);
+}
+
+/** A visible enemy unit, else an explored enemy building under a world point. */
+function enemyTargetAt(w: Point): Targetable | null {
+  const eu = unitAt(filterVisibleEnemies(fog, game.enemyUnits), w, (UNIT_RADIUS + 6) / camera.zoom);
+  if (eu) return eu;
+  const b = buildingAt(game.enemyBuildings, worldToTile(w.x), worldToTile(w.y)) as GBuilding | null;
+  if (b) {
+    const d = BUILDING_DEFS[b.kind];
+    if (isExplored(fog, b.gx + (d.w >> 1), b.gy + (d.h >> 1))) return b;
+  }
+  return null;
+}
+
 function issueAttackMove(w: Point): void {
   const goal = snapToPassable(map, worldToTile(w.x), worldToTile(w.y));
   if (!goal) return;
@@ -270,6 +377,150 @@ function guardSelected(): void {
   dropOrdersFor(sel);
   for (const id of sel) attackMove.delete(id);
   for (const u of game.units) orders.push(...guard([u], { x: u.x, y: u.y }));
+}
+
+// -------------------------------------------------------------- gestures ---
+
+function guideAdvance(skip: boolean): void {
+  if (skip || guideStep >= TOUCH_GUIDE_STEPS.length - 1) {
+    guideStep = -1;
+    try {
+      localStorage.setItem('redalert.touchGuide', '1');
+    } catch {
+      /* storage may be unavailable */
+    }
+  } else {
+    guideStep++;
+  }
+}
+
+function handleAction(id: ActionId): void {
+  switch (id) {
+    case 'build':
+      buildBarOpen = !buildBarOpen;
+      break;
+    case 'map':
+      minimapCollapsed = !minimapCollapsed;
+      break;
+    case 'stop':
+      stopSelected();
+      break;
+    case 'fullscreen': {
+      const p = fullscreenOn
+        ? document.exitFullscreen?.()
+        : document.documentElement.requestFullscreen?.();
+      void p?.catch(() => {}); // iOS etc. — fail silently
+      break;
+    }
+  }
+}
+
+function runMenuCmd(cmd: MenuCmd, at: Point): void {
+  const w = screenToWorld(camera, at.x, at.y);
+  switch (cmd) {
+    case 'move':
+      issueMove(w);
+      break;
+    case 'attack': {
+      const t = enemyTargetAt(w);
+      if (t) issueAttack(t);
+      else issueAttackMove(w);
+      break;
+    }
+    case 'stop':
+      stopSelected();
+      break;
+    case 'guard':
+      guardSelected();
+      break;
+  }
+}
+
+/** Touch tap: HUD → placement → world pick (select / attack / move). */
+function onTap(p: Point): void {
+  const lay = hudLayout();
+  mouse = p;
+
+  if (guideStep >= 0) {
+    const hit = guideHit(touchGuideLayout(viewW, viewH, guideStep), p.x, p.y);
+    if (hit === 'primary') guideAdvance(false);
+    else if (hit === 'skip') guideAdvance(true);
+    return;
+  }
+
+  if (touchMenu) {
+    const cmd = touchMenuHit(touchMenu, p.x, p.y);
+    if (cmd) runMenuCmd(cmd, touchMenu.at);
+    touchMenu = null; // tap outside just dismisses
+    return;
+  }
+
+  const ab = actionButtonAt(lay, p.x, p.y);
+  if (ab) {
+    handleAction(ab);
+    return;
+  }
+
+  const bi = buildBarHit(lay, BAR_DEFS.length, p.x, p.y);
+  if (bi >= 0) {
+    activateBarItem(bi);
+    return;
+  }
+
+  const mm = minimapToWorld(map, lay, p.x, p.y);
+  if (mm) {
+    camera.x = mm.x - viewW / camera.zoom / 2;
+    camera.y = mm.y - viewH / camera.zoom / 2;
+    return;
+  }
+
+  if (pendingBuild) {
+    const g = ghostAnchor(p);
+    const r = buildAt(game, pendingBuild, g.x, g.y);
+    pushMessage(
+      msgs,
+      r.ok ? `${BUILDING_DEFS[pendingBuild].label} 已落地` : failText(r.ok ? '' : r.reason),
+    );
+    if (r.ok) pendingBuild = null;
+    return;
+  }
+
+  const w = screenToWorld(camera, p.x, p.y);
+  const mine = unitAt(game.units, w, (UNIT_RADIUS + 10) / camera.zoom);
+  if (mine) {
+    selectUnits(game.units, mine, false);
+    return;
+  }
+  const target = enemyTargetAt(w);
+  if (target) {
+    if (selectedIds().size > 0) issueAttack(target);
+    return;
+  }
+  if (selectedIds().size > 0) issueMove(w);
+  else selectUnits(game.units, null, false);
+}
+
+function handleGesture(g: Gesture): void {
+  if (g.type === 'tap') {
+    onTap({ x: g.x, y: g.y });
+    return;
+  }
+  if (guideStep >= 0) return; // guide eats everything but taps
+  switch (g.type) {
+    case 'longpress':
+      if (game.phase === 'playing')
+        touchMenu = touchMenuLayout({ x: g.x, y: g.y }, hudLayout());
+      break;
+    case 'dragbox':
+      boxSelect(g.from, g.to, false);
+      break;
+    case 'pan':
+      panBy(camera, g.dx, g.dy);
+      break;
+    case 'pinch':
+      zoomAt(camera, g.center.x, g.center.y, g.scale);
+      break;
+  }
 }
 
 /** Re-path a single unit toward a tile, ignoring selection state. */
@@ -456,16 +707,25 @@ function tryTrain(kind: UnitKind): void {
   pushMessage(msgs, r.ok ? `${kind} 已入队` : failText(r.ok ? '' : r.reason));
 }
 
-canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+// Long-press menus / double-tap zoom are blocked globally, not just on canvas.
+document.addEventListener('contextmenu', (e) => e.preventDefault());
 
 canvas.addEventListener('pointerdown', (e) => {
   canvas.setPointerCapture(e.pointerId);
   const p = canvasPos(e);
+
+  // Touch fingers go to the gesture recognizer; mouse keeps the logic below.
+  if (e.pointerType === 'touch') {
+    gestures.down(e.pointerId, p.x, p.y, performance.now());
+    e.preventDefault();
+    return;
+  }
+
   dragStart = p;
   dragPrev = p;
 
   // HUD build bar swallows clicks before anything else.
-  const bi = buildBarHit(viewW, viewH, BAR_DEFS.length, p.x, p.y);
+  const bi = buildBarHit(hudLayout(), BAR_DEFS.length, p.x, p.y);
   if (bi >= 0) {
     if (e.button === 0) activateBarItem(bi);
     dragMode = 'none';
@@ -474,7 +734,7 @@ canvas.addEventListener('pointerdown', (e) => {
 
   // A + left click = attack-move (works on the minimap too).
   if (e.button === 0 && keys.has('a') && !pendingBuild) {
-    const w = minimapToWorld(map, viewW, viewH, p.x, p.y) ?? screenToWorld(camera, p.x, p.y);
+    const w = minimapToWorld(map, hudLayout(), p.x, p.y) ?? screenToWorld(camera, p.x, p.y);
     issueAttackMove(w);
     dragMode = 'none';
     return;
@@ -482,7 +742,7 @@ canvas.addEventListener('pointerdown', (e) => {
 
   // Placement mode: left = build here, right = cancel. Minimap still works.
   if (pendingBuild) {
-    const mm = e.button === 0 ? minimapToWorld(map, viewW, viewH, p.x, p.y) : null;
+    const mm = e.button === 0 ? minimapToWorld(map, hudLayout(), p.x, p.y) : null;
     if (mm) {
       camera.x = mm.x - viewW / camera.zoom / 2;
       camera.y = mm.y - viewH / camera.zoom / 2;
@@ -505,11 +765,11 @@ canvas.addEventListener('pointerdown', (e) => {
   }
 
   if (e.button === 0) {
-    dragMode = minimapToWorld(map, viewW, viewH, p.x, p.y) ? 'minimap' : 'maybeSelect';
-    if (dragMode === 'minimap') {
-      const w = minimapToWorld(map, viewW, viewH, p.x, p.y)!;
-      camera.x = w.x - viewW / camera.zoom / 2;
-      camera.y = w.y - viewH / camera.zoom / 2;
+    const mm = minimapToWorld(map, hudLayout(), p.x, p.y);
+    dragMode = mm ? 'minimap' : 'maybeSelect';
+    if (mm) {
+      camera.x = mm.x - viewW / camera.zoom / 2;
+      camera.y = mm.y - viewH / camera.zoom / 2;
     }
   } else if (e.button === 1) {
     dragMode = 'panMiddle';
@@ -522,6 +782,12 @@ canvas.addEventListener('pointerdown', (e) => {
 canvas.addEventListener('pointermove', (e) => {
   const p = canvasPos(e);
   mouse = p;
+
+  if (e.pointerType === 'touch') {
+    gestures.move(e.pointerId, p.x, p.y, performance.now());
+    return;
+  }
+
   mouseInside = true;
   const dx = p.x - dragPrev.x;
   const dy = p.y - dragPrev.y;
@@ -532,7 +798,7 @@ canvas.addEventListener('pointermove', (e) => {
 
   if (dragMode === 'panMiddle' || dragMode === 'panRight') panBy(camera, dx, dy);
   if (dragMode === 'minimap') {
-    const w = minimapToWorld(map, viewW, viewH, p.x, p.y);
+    const w = minimapToWorld(map, hudLayout(), p.x, p.y);
     if (w) {
       camera.x = w.x - viewW / camera.zoom / 2;
       camera.y = w.y - viewH / camera.zoom / 2;
@@ -543,35 +809,32 @@ canvas.addEventListener('pointermove', (e) => {
 
 canvas.addEventListener('pointerup', (e) => {
   const p = canvasPos(e);
+
+  if (e.pointerType === 'touch') {
+    for (const g of gestures.up(e.pointerId, p.x, p.y, performance.now())) handleGesture(g);
+    return;
+  }
+
   const additive = e.shiftKey;
   const units = game.units;
 
   if (dragMode === 'box') {
-    const a = screenToWorld(camera, dragStart.x, dragStart.y);
-    const b = screenToWorld(camera, p.x, p.y);
-    selectUnits(units, unitsInRect(units, normRect(a, b)), additive);
+    boxSelect(dragStart, p, additive);
   } else if (dragMode === 'maybeSelect') {
     const w = screenToWorld(camera, p.x, p.y);
     selectUnits(units, unitAt(units, w, (UNIT_RADIUS + 4) / camera.zoom), additive);
   } else if (dragMode === 'maybeOrder') {
     const w = screenToWorld(camera, p.x, p.y);
     // Right-click a visible enemy to focus fire; empty ground stays "move".
-    const eu = unitAt(filterVisibleEnemies(fog, game.enemyUnits), w, (UNIT_RADIUS + 6) / camera.zoom);
-    let target: Targetable | null = eu;
-    if (!target) {
-      const b = buildingAt(game.enemyBuildings, worldToTile(w.x), worldToTile(w.y)) as GBuilding | null;
-      if (b) {
-        const d = BUILDING_DEFS[b.kind];
-        if (isExplored(fog, b.gx + (d.w >> 1), b.gy + (d.h >> 1))) target = b;
-      }
-    }
+    const target = enemyTargetAt(w);
     if (target) issueAttack(target);
     else issueMove(w);
   }
   dragMode = 'none';
 });
 
-canvas.addEventListener('pointercancel', () => {
+canvas.addEventListener('pointercancel', (e) => {
+  if (e.pointerType === 'touch') gestures.cancel(e.pointerId);
   dragMode = 'none';
 });
 canvas.addEventListener('pointerleave', () => {
@@ -760,17 +1023,23 @@ function productionItems(): ProductionItem[] {
 }
 
 let last = performance.now();
+let rafId = 0;
+let loopRunning = false;
 function frame(now: number): void {
   const dt = Math.min((now - last) / 1000, 0.05);
   last = now;
   const gameDt = paused ? 0 : dt * SPEEDS[speedIdx]!;
 
   applyKeyPan(dt);
-  if (mouseInside && dragMode !== 'panMiddle' && dragMode !== 'panRight') {
+  // Edge pan is mouse-only — on touch it fights with drag/pinch gestures.
+  if (!isTouch && mouseInside && dragMode !== 'panMiddle' && dragMode !== 'panRight') {
     const vel = edgePanVelocity(mouse, viewW, viewH, EDGE_PAN_MARGIN);
     if (vel.x !== 0 || vel.y !== 0) applyEdgePan(camera, vel, dt);
   }
   clampToMap(camera, map, viewW, viewH);
+
+  // Drain pending pan/pinch and check for long-press timeouts.
+  for (const g of gestures.tick(now)) handleGesture(g);
 
   if (gameDt > 0 && game.phase === 'playing') {
     const prev = snapshotCombat();
@@ -817,7 +1086,10 @@ function frame(now: number): void {
     drawPlacementPreview(ctx, camera, pendingBuild, g.x, g.y, ok);
   }
   if (dragMode === 'box') drawSelectBox(ctx, normRect(dragStart, mouse));
+  const touchBox = gestures.dragBox;
+  if (touchBox) drawSelectBox(ctx, normRect(touchBox.from, touchBox.to));
 
+  const lay = hudLayout();
   const mw = screenToWorld(camera, mouse.x, mouse.y);
   const tx = worldToTile(mw.x);
   const ty = worldToTile(mw.y);
@@ -831,17 +1103,42 @@ function frame(now: number): void {
       units: game.units.length,
       buildings: game.buildings.length,
     },
-    viewW,
-    { viewH, production: productionItems() },
+    lay,
+    { production: productionItems() },
   );
-  drawBuildBar(ctx, viewW, viewH, barItems());
+  drawBuildBar(ctx, lay, barItems());
   drawTimer();
-  drawMessages(ctx, msgs, viewW, viewH);
-  drawMinimap(ctx, map, camera, game.units, viewW, viewH, visibleEnemies, fog);
+  drawMessages(ctx, msgs, lay);
+  drawSelectionCard(ctx, game.units, lay);
+  drawMinimap(ctx, map, camera, game.units, lay, visibleEnemies, fog);
+  drawActionBar(ctx, lay, {
+    buildOpen: buildBarOpen,
+    minimapOn: lay.minimap !== null,
+    fullscreenOn,
+  });
   drawPaused();
   drawBanner();
+  if (touchMenu) drawTouchMenu(ctx, touchMenu);
+  if (guideStep >= 0) drawTouchGuide(ctx, viewW, viewH, guideStep);
 
-  requestAnimationFrame(frame);
+  rafId = requestAnimationFrame(frame);
 }
+
+function startLoop(): void {
+  if (loopRunning) return;
+  loopRunning = true;
+  last = performance.now();
+  rafId = requestAnimationFrame(frame);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    loopRunning = false;
+    cancelAnimationFrame(rafId);
+  } else {
+    startLoop();
+  }
+});
+
 refreshFog();
-requestAnimationFrame(frame);
+startLoop();

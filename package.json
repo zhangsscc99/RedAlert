@@ -11,5 +11,8 @@
     "typecheck": "npm run typecheck -w redalert-client",
     "test": "bash scripts/build-tests.sh && node --test client/src/game/",
     "deploy": "bash scripts/ci-deploy.sh"
+  },
+  "devDependencies": {
+    "playwright": "^1.65.1"
   }
 }
