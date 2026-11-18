@@ -111,3 +111,24 @@
 - [x] F608 敌方 AI 深度：enemyAI.ts 加侦察试探、集结后进攻、血量低撤退、多兵种搭配与难度缩放（默认行为与现有一致，新行为按参数开启）｜verify: bash scripts/build-tests.sh && node --test client/src/game/enemyAI.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
 - [x] F609 战斗深度：combat.ts 加护甲类型与克制（复用 unitRoles 矩阵）、溅射伤害、集火目标保持、射击遮挡判定，纯函数可测，旧导出签名不变｜verify: bash scripts/build-tests.sh && node --test client/src/game/combat.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
 - [x] F610 生产队列深度：production.ts 加多兵营并行队列、集结点（rally point）、取消退款按进度折算、升级任务排队（复用 upgrades 表，不改旧签名）｜verify: bash scripts/build-tests.sh && node --test client/src/game/production.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
+
+## M7 并行车道批（2026-11-18 18:25 UTC）— 建筑操作上线 + 内容与手感纵深
+
+> 现状判断（本轮 grep 实测）：`upgrades.ts` / `repair.ts` / `replay.ts` / `onboarding.ts` 在
+> `main.ts` 与 `gameState.ts` 里引用数全部为 **0**；玩家能建矿厂/兵营/炮塔，却不能**升级、出售、维修**，
+> 建筑一被打就永久残血；结算只有一句话，没有战报，也没有新手引导；唯一玩法是无尽遭遇战，
+> 没有关卡、没有老兵成长、敌方 AI 也只会攒钱出步兵。`index.html` 的标题还写着「RedAlert — M1」。
+> 本批 F701 是**唯一**允许改 `main.ts` / `index.html` / `render/hud.ts` / `gameState.ts` 的车道；
+> 其余九条各自独占文件，只加不改旧签名，禁止改 FEATURES.md。
+> F702（战役关卡内核）与 F703（老兵等级内核）本轮只落纯逻辑模块，接线留给下一轮 F801/F802，别当孤儿模块放着不管。
+
+- [ ] F701 建筑操作与战报上线：选中己方建筑后 HUD 显示「升级 / 出售 / 维修」三个动作，接 upgrades.ts 三级升级（费用、耗时、完成提示）、出售按建造进度退款、repair.ts 工程师维修队列与扣费；结算画面用 stats.ts 出完整战报（击杀/建造/采矿/时长/历史最佳）；首局桌面端用 onboarding.ts 显示四步引导条（可跳过）；index.html 标题改为「RedAlert — 苏联来袭」｜verify: bash scripts/build-tests.sh && node --test client/src/game/upgrades.test.js && node --test client/src/game/repair.test.js && node --test client/src/game/stats.test.js && (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: med
+- [ ] F702 战役关卡内核：新增 game/missions.ts（5 关目标定义 destroy/capture/survive/escort、关卡初始资金与敌方编成、目标推进与星评价判定、确定性可测），纯逻辑不碰 main.ts/gameState.ts｜verify: bash scripts/build-tests.sh && node --test client/src/game/missions.test.js && (cd client && npx tsc --noEmit)｜risk: low
+- [ ] F703 老兵等级内核：新增 game/veterancy.ts（击杀累计经验、新兵/老兵/精英三级、伤害与护甲加成表、升级事件流、可序列化），纯逻辑不改 units.ts/combat.ts｜verify: bash scripts/build-tests.sh && node --test client/src/game/veterancy.test.js && (cd client && npx tsc --noEmit)｜risk: low
+- [ ] F704 敌方经济与基地：enemyAI.ts 让敌方按资金自建矿厂/兵营/炮塔、多波次扩张、失去建筑后重建、炮塔参与防守、难度参数控制扩张节奏（默认行为与现有测试一致，新行为按参数开启）｜verify: bash scripts/build-tests.sh && node --test client/src/game/enemyAI.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F705 单位表现细化：render/units.ts 加脚下投影、受击闪白、阵亡残骸与淡出、移动尘土尾迹、低血抖动（drawUnits 签名不变）｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F706 地形多样化：render/terrain.ts 加土路/石板路纹理、悬崖边缘阴影、随机岩石与草丛装饰、水岸波光（drawTerrain/prerenderMap/prerenderGrid 签名不变，离屏预渲染）｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F707 群体寻路与编队：pathfind.ts 新增 formationSlots（编队目标点分配）与 findPathGroup（软避让代价 + 拥堵降级为逐个 findPathSmooth），旧 findPath/findPathSmooth 签名与语义不变｜verify: bash scripts/build-tests.sh && node --test client/src/game/pathfind.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F708 存档 v3：save.ts 快照加入迷雾已探明位图、统计快照、建筑等级与受损状态、老兵经验、天气/雷达种子，兼容读 v1/v2；saveload.ts 三槽位保持旧 API 与旧存档可读｜verify: bash scripts/build-tests.sh && node --test client/src/game/save.test.js && node --test client/src/game/saveload.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F709 自适应音频：music.ts 加战斗强度驱动的三段编曲（平静/交战/溃败）无缝切换与音量回退；sfx.ts 加单位应答音（选中/下令/阵亡，振荡器合成、无外部素材）与分组音量｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F710 战斗反馈特效：game/effects.ts 加弹坑残留、残骸粒子、爆炸冲击波环与震屏强度数值，render/effects.ts 绘制（updateEffects/drawEffects 签名不变）｜verify: bash scripts/build-tests.sh && node --test client/src/game/effects.test.js && (cd client && npx tsc --noEmit)｜risk: low
