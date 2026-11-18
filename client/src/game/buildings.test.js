@@ -19,6 +19,20 @@ function worldToTile(px) {
   return Math.floor(px / TILE_SIZE);
 }
 
+// src/game/economy.ts
+function createEconomy(start = 5e3) {
+  return { credits: start, earned: 0, spent: 0 };
+}
+function canAfford(e, amount) {
+  return amount >= 0 && e.credits >= amount;
+}
+function spend(e, amount) {
+  if (!canAfford(e, amount)) return false;
+  e.credits -= amount;
+  e.spent += amount;
+  return true;
+}
+
 // src/game/buildings.ts
 var BUILDING_DEFS = {
   hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2e3, label: "HQ", buildable: false },
@@ -85,6 +99,85 @@ function buildingAt(buildings, gx, gy) {
     if (gx >= b.gx && gx < b.gx + d.w && gy >= b.gy && gy < b.gy + d.h) return b;
   }
   return null;
+}
+function buildingCenter(b) {
+  const def = BUILDING_DEFS[b.kind];
+  return { x: (b.gx + def.w / 2) * TILE_SIZE, y: (b.gy + def.h / 2) * TILE_SIZE };
+}
+function isAdjacentTo(b, gx, gy) {
+  const def = BUILDING_DEFS[b.kind];
+  return gx >= b.gx - 1 && gx <= b.gx + def.w && gy >= b.gy - 1 && gy <= b.gy + def.h;
+}
+var RADAR_SCAN = { radius: 12 * TILE_SIZE, period: 5 };
+function createRadarScan(buildingId, opts = {}) {
+  return {
+    buildingId,
+    radius: opts.radius ?? RADAR_SCAN.radius,
+    period: opts.period ?? RADAR_SCAN.period,
+    timer: 0,
+    revealed: /* @__PURE__ */ new Set()
+  };
+}
+function tickRadarScan(scan, b, dt, targets) {
+  const out = [];
+  if (!(dt > 0) || !b.done || !(scan.period > 0)) return out;
+  scan.timer += dt;
+  const r2 = scan.radius * scan.radius;
+  const c = buildingCenter(b);
+  while (scan.timer >= scan.period) {
+    scan.timer -= scan.period;
+    const inRange = /* @__PURE__ */ new Set();
+    for (const t of targets) {
+      const dx = t.x - c.x;
+      const dy = t.y - c.y;
+      if (dx * dx + dy * dy > r2) continue;
+      inRange.add(t.id);
+      if (!scan.revealed.has(t.id)) {
+        scan.revealed.add(t.id);
+        out.push({ x: t.x, y: t.y });
+      }
+    }
+    for (const id of scan.revealed) {
+      if (!inRange.has(id)) scan.revealed.delete(id);
+    }
+  }
+  return out;
+}
+var DEPOT_REPAIR = { rate: 20, costPerHp: 0.5 };
+function tickDepotRepair(depot, vehicles, dt, e, opts = {}) {
+  const result = { healed: [], spent: 0, paused: false };
+  const rate = opts.rate ?? DEPOT_REPAIR.rate;
+  const costPerHp = opts.costPerHp ?? DEPOT_REPAIR.costPerHp;
+  if (!(dt > 0) || !depot.done || !(rate > 0) || !(costPerHp >= 0)) return result;
+  for (const v of vehicles) {
+    if (v.hp <= 0 || v.hp >= v.maxHp) continue;
+    if (!isAdjacentTo(depot, worldToTile(v.x), worldToTile(v.y))) continue;
+    if (e.credits <= 0) {
+      result.paused = true;
+      break;
+    }
+    let heal = Math.min(rate * dt, v.maxHp - v.hp);
+    let cost = heal * costPerHp;
+    if (cost > e.credits) {
+      heal = e.credits / costPerHp;
+      cost = e.credits;
+      result.paused = true;
+    }
+    if (!(heal > 0) || !spend(e, cost)) {
+      result.paused = true;
+      break;
+    }
+    v.hp += heal;
+    result.spent += cost;
+    result.healed.push({ id: v.id, hp: v.hp });
+    if (result.paused) break;
+  }
+  return result;
+}
+function claimCompletionYield(b, claimed, supply) {
+  if (!b.done || claimed.has(b.id)) return null;
+  claimed.add(b.id);
+  return { ...supply };
 }
 
 // src/game/buildings.test.ts
@@ -218,4 +311,140 @@ test("place appends a not-yet-done building at full hp", () => {
   assert.equal(b.hp, BUILDING_DEFS.refinery.hp);
   assert.equal(b.maxHp, BUILDING_DEFS.refinery.hp);
   assert.equal(b.done, false);
+});
+test("buildingCenter returns the footprint centre in world px", () => {
+  const hq = place([], "hq", 4, 4, 1);
+  assert.deepEqual(buildingCenter(hq), { x: (4 + 2) * TILE_SIZE, y: (4 + 1.5) * TILE_SIZE });
+  const wall = place([], "wall", 0, 0, 2);
+  assert.deepEqual(buildingCenter(wall), { x: TILE_SIZE / 2, y: TILE_SIZE / 2 });
+});
+test("isAdjacentTo covers the footprint and its 1-tile ring only", () => {
+  const hq = place([], "hq", 4, 4, 1);
+  assert.equal(isAdjacentTo(hq, 5, 5), true);
+  for (const [x, y] of [[3, 5], [8, 5], [5, 3], [5, 7], [3, 3], [8, 3], [3, 7], [8, 7]]) {
+    assert.equal(isAdjacentTo(hq, x, y), true, `${x},${y}`);
+  }
+  assert.equal(isAdjacentTo(hq, 2, 5), false);
+  assert.equal(isAdjacentTo(hq, 9, 5), false);
+  assert.equal(isAdjacentTo(hq, 5, 8), false);
+  assert.equal(isAdjacentTo(hq, 2, 2), false);
+});
+function doneHq(id = 1, gx = 10, gy = 10) {
+  const b = place([], "hq", gx, gy, id);
+  b.done = true;
+  return b;
+}
+test("tickRadarScan pulses on its period and reports new contacts once", () => {
+  const hq = doneHq();
+  const scan = createRadarScan(hq.id, { radius: 100, period: 2 });
+  const foe = { id: 7, x: 384 + 50, y: 368 };
+  assert.deepEqual(tickRadarScan(scan, hq, 1, [foe]), []);
+  assert.deepEqual(tickRadarScan(scan, hq, 1, [foe]), [{ x: foe.x, y: foe.y }]);
+  assert.deepEqual(tickRadarScan(scan, hq, 2, [foe]), []);
+  assert.deepEqual(tickRadarScan(scan, hq, 2, [foe]), []);
+  const other = { id: 8, x: 384 - 40, y: 368 + 30 };
+  const out = tickRadarScan(scan, hq, 4, [foe, other]);
+  assert.deepEqual(out, [{ x: other.x, y: other.y }]);
+});
+test("tickRadarScan forgets contacts that leave the radius and ignores far units", () => {
+  const hq = doneHq();
+  const scan = createRadarScan(hq.id, { radius: 100, period: 1 });
+  const near = { id: 7, x: 430, y: 368 };
+  const far = { id: 9, x: 430 + 200, y: 368 };
+  assert.deepEqual(tickRadarScan(scan, hq, 1, [near, far]), [{ x: near.x, y: near.y }]);
+  assert.deepEqual(tickRadarScan(scan, hq, 1, [near, far]), []);
+  assert.equal(scan.revealed.has(9), false);
+  near.x = 1e4;
+  assert.deepEqual(tickRadarScan(scan, hq, 1, [near]), []);
+  assert.equal(scan.revealed.has(near.id), false);
+  near.x = 430;
+  assert.deepEqual(tickRadarScan(scan, hq, 1, [near]), [{ x: near.x, y: near.y }]);
+});
+test("tickRadarScan ignores bad dt and a dish still under construction", () => {
+  const hq = doneHq();
+  const scan = createRadarScan(hq.id, { radius: 100, period: 2 });
+  const foe = { id: 7, x: 400, y: 368 };
+  assert.deepEqual(tickRadarScan(scan, hq, 0, [foe]), []);
+  assert.deepEqual(tickRadarScan(scan, hq, -3, [foe]), []);
+  assert.equal(scan.timer, 0);
+  hq.done = false;
+  assert.deepEqual(tickRadarScan(scan, hq, 10, [foe]), []);
+  assert.equal(scan.timer, 0);
+  hq.done = true;
+  assert.deepEqual(tickRadarScan(scan, hq, 2, [foe]), [{ x: foe.x, y: foe.y }]);
+});
+function vehicle(id, tx, ty, hp, maxHp = 100) {
+  return { id, x: tx * TILE_SIZE + TILE_SIZE / 2, y: ty * TILE_SIZE + TILE_SIZE / 2, hp, maxHp };
+}
+test("tickDepotRepair welds adjacent damaged vehicles and bills the wallet", () => {
+  const depot = doneHq(1, 10, 10);
+  const e = createEconomy(100);
+  const tank = vehicle(5, 9, 10, 50);
+  const far = vehicle(6, 20, 20, 10);
+  const full = vehicle(7, 9, 11, 100);
+  const r = tickDepotRepair(depot, [tank, far, full], 1, e);
+  assert.equal(r.paused, false);
+  assert.deepEqual(r.healed, [{ id: 5, hp: 50 + DEPOT_REPAIR.rate }]);
+  assert.ok(Math.abs(r.spent - DEPOT_REPAIR.rate * DEPOT_REPAIR.costPerHp) < 1e-9);
+  assert.equal(tank.hp, 50 + DEPOT_REPAIR.rate);
+  assert.equal(far.hp, 10);
+  assert.equal(full.hp, 100);
+  assert.ok(Math.abs(e.credits - (100 - DEPOT_REPAIR.rate * DEPOT_REPAIR.costPerHp)) < 1e-9);
+});
+test("tickDepotRepair caps the weld at maxHp and pauses on empty funds", () => {
+  const depot = doneHq(1, 10, 10);
+  const e = createEconomy(100);
+  const almost = vehicle(5, 9, 10, 95);
+  const r = tickDepotRepair(depot, [almost], 1, e);
+  assert.equal(almost.hp, 100);
+  assert.ok(Math.abs(r.spent - 5 * DEPOT_REPAIR.costPerHp) < 1e-9);
+  const broke = createEconomy(0);
+  const hurt = vehicle(6, 9, 10, 50);
+  const r2 = tickDepotRepair(depot, [hurt], 1, broke);
+  assert.equal(r2.paused, true);
+  assert.deepEqual(r2.healed, []);
+  assert.equal(hurt.hp, 50);
+});
+test("tickDepotRepair partial-welds the first vehicle then stops when broke", () => {
+  const depot = doneHq(1, 10, 10);
+  const funds = 4;
+  const e = createEconomy(funds);
+  const a = vehicle(5, 9, 10, 50);
+  const b = vehicle(6, 9, 11, 50);
+  const r = tickDepotRepair(depot, [a, b], 1, e);
+  assert.equal(r.paused, true);
+  assert.equal(a.hp, 50 + funds / DEPOT_REPAIR.costPerHp);
+  assert.equal(b.hp, 50);
+  assert.equal(e.credits, 0);
+  assert.ok(Math.abs(r.spent - funds) < 1e-9);
+  e.credits = 100;
+  const r2 = tickDepotRepair(depot, [a, b], 1, e);
+  assert.equal(r2.paused, false);
+  assert.equal(r2.healed.length, 2);
+});
+test("tickDepotRepair does nothing for a depot under construction or dt <= 0", () => {
+  const depot = place([], "hq", 10, 10, 1);
+  const e = createEconomy(100);
+  const hurt = vehicle(5, 9, 10, 50);
+  const r = tickDepotRepair(depot, [hurt], 5, e);
+  assert.deepEqual(r, { healed: [], spent: 0, paused: false });
+  assert.equal(hurt.hp, 50);
+  assert.equal(e.credits, 100);
+  depot.done = true;
+  assert.deepEqual(tickDepotRepair(depot, [hurt], 0, e), { healed: [], spent: 0, paused: false });
+  assert.equal(hurt.hp, 50);
+});
+test("claimCompletionYield pays out exactly once per finished building", () => {
+  const claimed = /* @__PURE__ */ new Set();
+  const supply = { credits: 250, power: 20, morale: 1 };
+  const raw = place([], "power", 0, 0, 1);
+  assert.equal(claimCompletionYield(raw, claimed, supply), null);
+  raw.done = true;
+  const y = claimCompletionYield(raw, claimed, supply);
+  assert.deepEqual(y, supply);
+  assert.equal(claimCompletionYield(raw, claimed, supply), null);
+  y.credits = -999;
+  const other = place([], "barracks", 4, 4, 2);
+  other.done = true;
+  assert.deepEqual(claimCompletionYield(other, claimed, supply), supply);
 });
