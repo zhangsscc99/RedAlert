@@ -60,7 +60,20 @@ export function prerenderMap(map: GameMap): HTMLCanvasElement {
     }
   }
 
-  // Faint grid lines.
+  return canvas;
+}
+
+/**
+ * Grid lines on a transparent layer the size of the map. Kept separate from
+ * prerenderMap so the settings toggle can blit it only when enabled —
+ * draw with the same camera transform as drawTerrain.
+ */
+export function prerenderGrid(map: GameMap): HTMLCanvasElement {
+  const canvas = document.createElement('canvas');
+  canvas.width = map.w * TILE_SIZE;
+  canvas.height = map.h * TILE_SIZE;
+  const ctx = canvas.getContext('2d')!;
+
   ctx.strokeStyle = 'rgba(0,0,0,0.08)';
   ctx.lineWidth = 1;
   ctx.beginPath();
@@ -73,7 +86,6 @@ export function prerenderMap(map: GameMap): HTMLCanvasElement {
     ctx.lineTo(map.w * TILE_SIZE, y * TILE_SIZE + 0.5);
   }
   ctx.stroke();
-
   return canvas;
 }
 

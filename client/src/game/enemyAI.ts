@@ -13,6 +13,8 @@ export interface AIState {
   wave: number; // attack waves launched so far
   timer: number; // fractional-second accumulator feeding fixed AI ticks
   seed: number;
+  /** Multiplier on AI_INCOME_PER_TICK; >1 banks faster → shorter wave gaps. */
+  incomeScale: number;
   rng: () => number;
 }
 
@@ -31,7 +33,7 @@ export const AI_ARMY_PER_WAVE = 15; // attack once the army reaches this size
 
 const ATTACK_JITTER_TILES = 6; // waves head for the map center ± this many tiles
 
-export function createAIState(seed: number): AIState {
+export function createAIState(seed: number, incomeScale = 1): AIState {
   return {
     phase: 'gather',
     credits: 0,
@@ -39,6 +41,7 @@ export function createAIState(seed: number): AIState {
     wave: 0,
     timer: 0,
     seed,
+    incomeScale,
     rng: mulberry32(seed),
   };
 }
@@ -54,7 +57,7 @@ export function stepAI(s: AIState, dt: number): AICommand[] {
   s.timer += dt;
   while (s.timer >= AI_TICK) {
     s.timer -= AI_TICK;
-    s.credits += AI_INCOME_PER_TICK;
+    s.credits += AI_INCOME_PER_TICK * s.incomeScale;
     switch (s.phase) {
       case 'gather':
         if (s.credits >= AI_BUILD_CREDITS) s.phase = 'build';

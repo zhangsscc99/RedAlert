@@ -25,7 +25,6 @@ import {
   isExplored,
   normRect,
   panBy,
-  restart,
   screenToWorld,
   selectGroup,
   selectUnits,
@@ -41,12 +40,15 @@ import {
   unitSource,
   updateEffects,
   updateFog,
+  restoreGame,
+  snapshotGame,
   updateOrders,
   worldToTile,
   zoomAt,
   type BuildingKind,
   type Effect,
   type Fog,
+  type GameState,
   type GBuilding,
   type GUnit,
   type Order,
@@ -55,7 +57,15 @@ import {
   type Targetable,
   type UnitKind,
 } from './game/index.ts';
-import { drawTerrain, prerenderMap } from './render/terrain.js';
+import { DIFFICULTY, type Difficulty } from './game/balance.js';
+import {
+  latestSlot,
+  loadSlot,
+  saveSlot,
+  type SlotId,
+  type SlotStorage,
+} from './game/saveload.js';
+import { drawTerrain, prerenderGrid, prerenderMap } from './render/terrain.js';
 import { drawUnits } from './render/units.js';
 import {
   drawBuildings,
@@ -92,7 +102,20 @@ import {
   type ProductionItem,
   type TouchMenu,
 } from './render/hud.js';
+import {
+  drawGameOver,
+  drawMenu,
+  drawSettings,
+  gameoverHit,
+  gameoverLayout,
+  menuHit,
+  menuLayout,
+  settingsHit,
+  settingsLayout,
+} from './render/menu.js';
 import { createGestureRecognizer, type Gesture } from './input/gestures.js';
+import { createSfx } from './audio/sfx.js';
+import { loadSettings, saveSettings } from './settings.js';
 
 const MAP_SEED = 1337;
 const CLICK_DRAG_THRESHOLD = 5; // screen px
@@ -106,9 +129,20 @@ const ctx = canvas.getContext('2d')!;
 let game = createGame(MAP_SEED);
 let map = game.map;
 let mapCanvas = prerenderMap(map);
+let gridCanvas = prerenderGrid(map);
 let fog: Fog = createFog(map);
 let fogLayer: FogLayer = createFogLayer(fog);
 let fogT = 0;
+
+// --------------------------------------------------------- shell state ----
+
+type Screen = 'menu' | 'settings' | 'playing';
+let screen: Screen = 'menu';
+const settings = loadSettings();
+let difficulty: Difficulty = settings.difficulty;
+let activeSlot: SlotId = 1; // save slot bound to this session's match
+const sfx = createSfx();
+sfx.setEnabled(!settings.mute);
 
 let viewW = 0;
 let viewH = 0;
@@ -132,6 +166,9 @@ function resize(): void {
   viewH = window.innerHeight;
   canvas.width = Math.round(viewW * dpr);
   canvas.height = Math.round(viewH * dpr);
+  if (camera.bounds) {
+    camera.bounds = { worldW: map.w * TILE_SIZE, worldH: map.h * TILE_SIZE, viewW, viewH };
+  }
 }
 window.addEventListener('resize', resize);
 resize();
@@ -186,6 +223,7 @@ interface RaDebug {
   readonly camera: typeof camera;
   readonly isTouch: boolean;
   readonly guideStep: number;
+  readonly screen: Screen;
 }
 
 declare global {
@@ -213,6 +251,9 @@ window.__raDebug = {
   get guideStep() {
     return guideStep;
   },
+  get screen() {
+    return screen;
+  },
 };
 
 function hudLayout(): HudLayout {
@@ -230,6 +271,145 @@ function hudLayout(): HudLayout {
 function canvasPos(e: PointerEvent | WheelEvent): Point {
   const r = canvas.getBoundingClientRect();
   return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+
+// ----------------------------------------------------------------- shell ---
+// Start menu / settings / game-over live outside the match: `screen` gates
+// every game-world input path below.
+
+function storage(): SlotStorage | null {
+  try {
+    return localStorage;
+  } catch {
+    return null;
+  }
+}
+
+/** Archive the live match into the session slot. Never throws. */
+function persist(): void {
+  const s = storage();
+  if (!s || game.phase !== 'playing') return;
+  try {
+    saveSlot(s, activeSlot, snapshotGame(game, camera), { phase: game.phase });
+  } catch {
+    /* storage full/blocked — play on without a save */
+  }
+}
+
+function continueInfo(): { canContinue: boolean; label?: string } {
+  const s = storage();
+  const latest = s ? latestSlot(s) : null;
+  if (!latest?.meta) return { canContinue: false };
+  const t = Math.max(0, Math.floor(latest.meta.elapsed));
+  const mm = String(Math.floor(t / 60)).padStart(2, '0');
+  const ss = String(t % 60).padStart(2, '0');
+  return { canContinue: true, label: `槽${latest.id} ${mm}:${ss}` };
+}
+
+/** Swap in a fresh/restored GameState and reset all per-match UI state. */
+function applyGame(g: GameState): void {
+  game = g;
+  map = game.map;
+  mapCanvas = prerenderMap(map);
+  gridCanvas = prerenderGrid(map);
+  pendingBuild = null;
+  msgs.length = 0;
+  effects.length = 0;
+  orders.length = 0;
+  attackMove.clear();
+  groups.clear();
+  touchMenu = null;
+  paused = false;
+  speedIdx = 0;
+  fogT = 0;
+  fog = createFog(map);
+  fogLayer = createFogLayer(fog);
+  refreshFog();
+}
+
+function recenterCamera(): void {
+  const c = createCamera(map, viewW, viewH);
+  camera.x = c.x;
+  camera.y = c.y;
+  camera.zoom = c.zoom;
+  camera.bounds = c.bounds;
+}
+
+function startGame(): void {
+  const d = DIFFICULTY[difficulty];
+  applyGame(
+    createGame(MAP_SEED, {
+      credits: d.startCredits,
+      enemyInfantry: d.enemyStartInfantry,
+      enemyStrength: d.enemyStrengthScale,
+      waveIntervalScale: d.waveIntervalScale,
+    }),
+  );
+  recenterCamera();
+  activeSlot = 1; // new campaign occupies slot 1
+  persist();
+  screen = 'playing';
+}
+
+function continueGame(): void {
+  const s = storage();
+  if (!s) return;
+  const latest = latestSlot(s);
+  if (!latest || latest.meta === null) return;
+  const saved = loadSlot(s, latest.id);
+  if (!saved) return;
+  const g = restoreGame(saved);
+  if (!g) return;
+  applyGame(g);
+  if (saved.camera) {
+    camera.x = saved.camera.x;
+    camera.y = saved.camera.y;
+    camera.zoom = saved.camera.zoom;
+  }
+  activeSlot = latest.id; // archive back into the slot we loaded from
+  screen = 'playing';
+}
+
+function onMenuTap(p: Point): void {
+  const hit = menuHit(menuLayout(viewW, viewH), p.x, p.y);
+  if (!hit) return;
+  if (hit.kind === 'difficulty') {
+    difficulty = hit.difficulty;
+    settings.difficulty = difficulty;
+    saveSettings(settings);
+    return;
+  }
+  switch (hit.id) {
+    case 'start':
+      startGame();
+      break;
+    case 'continue':
+      continueGame();
+      break;
+    case 'settings':
+      screen = 'settings';
+      break;
+  }
+}
+
+function onSettingsTap(p: Point): void {
+  const hit = settingsHit(settingsLayout(viewW, viewH), p.x, p.y);
+  if (hit === 'mute') {
+    settings.mute = !settings.mute;
+    sfx.setEnabled(!settings.mute);
+    saveSettings(settings);
+  } else if (hit === 'grid') {
+    settings.grid = !settings.grid;
+    saveSettings(settings);
+  } else if (hit === 'back') {
+    screen = 'menu';
+  }
+}
+
+function onGameOverTap(p: Point): void {
+  const hit = gameoverHit(gameoverLayout(viewW, viewH), p.x, p.y);
+  if (hit === 'retry') startGame();
+  else if (hit === 'menu') screen = 'menu';
 }
 
 // --------------------------------------------------------------- helpers ---
@@ -475,13 +655,7 @@ function onTap(p: Point): void {
   }
 
   if (pendingBuild) {
-    const g = ghostAnchor(p);
-    const r = buildAt(game, pendingBuild, g.x, g.y);
-    pushMessage(
-      msgs,
-      r.ok ? `${BUILDING_DEFS[pendingBuild].label} 已落地` : failText(r.ok ? '' : r.reason),
-    );
-    if (r.ok) pendingBuild = null;
+    doBuild(p);
     return;
   }
 
@@ -502,17 +676,23 @@ function onTap(p: Point): void {
 
 function handleGesture(g: Gesture): void {
   if (g.type === 'tap') {
-    onTap({ x: g.x, y: g.y });
+    const p = { x: g.x, y: g.y };
+    if (screen === 'menu') onMenuTap(p);
+    else if (screen === 'settings') onSettingsTap(p);
+    else if (game.phase !== 'playing') onGameOverTap(p);
+    else onTap(p);
     return;
   }
-  if (guideStep >= 0) return; // guide eats everything but taps
+  if (screen !== 'playing' || guideStep >= 0 || game.phase !== 'playing') return;
   switch (g.type) {
     case 'longpress':
-      if (game.phase === 'playing')
-        touchMenu = touchMenuLayout({ x: g.x, y: g.y }, hudLayout());
+      touchMenu = touchMenuLayout({ x: g.x, y: g.y }, hudLayout());
       break;
     case 'dragbox':
-      boxSelect(g.from, g.to, false);
+      // A box drag starting on the open radial menu dismisses it instead of
+      // selecting through the menu items.
+      if (touchMenu) touchMenu = null;
+      else boxSelect(g.from, g.to, false);
       break;
     case 'pan':
       panBy(camera, g.dx, g.dy);
@@ -650,32 +830,18 @@ function diffCombat(prev: Map<number, CombatSnap>): void {
         fromX: shooter.x,
         fromY: shooter.y,
       });
+      sfx.play(shooter.kind === 'tank' || shooter.kind === 'turret' ? 'cannon' : 'rifle');
     } else {
       spawnDamageText(effects, c.x, c.y, dmg);
     }
   }
   for (const [id, p] of prev) {
-    if (!nowIds.has(id)) spawnExplosion(effects, p.x, p.y, Math.max(16, p.r * 2));
+    if (!nowIds.has(id)) {
+      spawnExplosion(effects, p.x, p.y, Math.max(16, p.r * 2));
+      sfx.play('explosion');
+    }
   }
   effectsFromCombatEvents(events, effects);
-}
-
-function resetGame(): void {
-  game = restart(game);
-  map = game.map;
-  mapCanvas = prerenderMap(map);
-  pendingBuild = null;
-  msgs.length = 0;
-  effects.length = 0;
-  orders.length = 0;
-  attackMove.clear();
-  groups.clear();
-  paused = false;
-  speedIdx = 0;
-  fogT = 0;
-  fog = createFog(map);
-  fogLayer = createFogLayer(fog);
-  refreshFog();
 }
 
 /** Footprint top-left tile so the ghost stays centered under the cursor. */
@@ -707,6 +873,21 @@ function tryTrain(kind: UnitKind): void {
   pushMessage(msgs, r.ok ? `${kind} 已入队` : failText(r.ok ? '' : r.reason));
 }
 
+/** Shared by the mouse placement path and touch tap: charge + drop + sfx. */
+function doBuild(p: Point): void {
+  if (!pendingBuild) return;
+  const g = ghostAnchor(p);
+  const r = buildAt(game, pendingBuild, g.x, g.y);
+  pushMessage(
+    msgs,
+    r.ok ? `${BUILDING_DEFS[pendingBuild].label} 已落地` : failText(r.ok ? '' : r.reason),
+  );
+  if (r.ok) {
+    pendingBuild = null;
+    sfx.play('build');
+  }
+}
+
 // Long-press menus / double-tap zoom are blocked globally, not just on canvas.
 document.addEventListener('contextmenu', (e) => e.preventDefault());
 
@@ -718,6 +899,20 @@ canvas.addEventListener('pointerdown', (e) => {
   if (e.pointerType === 'touch') {
     gestures.down(e.pointerId, p.x, p.y, performance.now());
     e.preventDefault();
+    return;
+  }
+
+  // Shell screens swallow every mouse button before world input sees it.
+  if (screen === 'menu') {
+    if (e.button === 0) onMenuTap(p);
+    return;
+  }
+  if (screen === 'settings') {
+    if (e.button === 0) onSettingsTap(p);
+    return;
+  }
+  if (game.phase !== 'playing') {
+    if (e.button === 0) onGameOverTap(p);
     return;
   }
 
@@ -750,13 +945,7 @@ canvas.addEventListener('pointerdown', (e) => {
       return;
     }
     if (e.button === 0) {
-      const g = ghostAnchor(p);
-      const r = buildAt(game, pendingBuild, g.x, g.y);
-      pushMessage(
-        msgs,
-        r.ok ? `${BUILDING_DEFS[pendingBuild].label} 已落地` : failText(r.ok ? '' : r.reason),
-      );
-      if (r.ok) pendingBuild = null;
+      doBuild(p);
     } else if (e.button === 2) {
       pendingBuild = null;
     }
@@ -789,6 +978,7 @@ canvas.addEventListener('pointermove', (e) => {
   }
 
   mouseInside = true;
+  if (screen !== 'playing') return; // hover only; no drag state outside a match
   const dx = p.x - dragPrev.x;
   const dy = p.y - dragPrev.y;
   const moved = Math.hypot(p.x - dragStart.x, p.y - dragStart.y);
@@ -812,6 +1002,11 @@ canvas.addEventListener('pointerup', (e) => {
 
   if (e.pointerType === 'touch') {
     for (const g of gestures.up(e.pointerId, p.x, p.y, performance.now())) handleGesture(g);
+    return;
+  }
+
+  if (screen !== 'playing' || game.phase !== 'playing') {
+    dragMode = 'none';
     return;
   }
 
@@ -845,6 +1040,7 @@ canvas.addEventListener(
   'wheel',
   (e) => {
     e.preventDefault();
+    if (screen !== 'playing') return;
     const p = canvasPos(e);
     zoomAt(camera, p.x, p.y, e.deltaY < 0 ? 1.15 : 1 / 1.15);
   },
@@ -855,8 +1051,20 @@ window.addEventListener('keydown', (e) => {
   const k = e.key.toLowerCase();
   keys.add(k);
 
+  if (screen === 'menu') {
+    if (k === 'enter') startGame();
+    return;
+  }
+  if (screen === 'settings') {
+    if (k === 'escape' || k === 'enter') {
+      screen = 'menu';
+      e.preventDefault();
+    }
+    return;
+  }
   if (game.phase !== 'playing') {
-    if (k === 'enter' || k === 'r') resetGame();
+    if (k === 'enter' || k === 'r') startGame();
+    else if (k === 'escape') screen = 'menu';
     return;
   }
   if (k === ' ') {
@@ -873,7 +1081,12 @@ window.addEventListener('keydown', (e) => {
     return;
   }
   if (k === 'escape') {
-    pendingBuild = null;
+    if (pendingBuild) {
+      pendingBuild = null;
+    } else {
+      persist(); // archive into the session slot before leaving the match
+      screen = 'menu';
+    }
     return;
   }
   if (/^[1-9]$/.test(k)) {
@@ -990,17 +1203,8 @@ function drawPaused(): void {
 
 function drawBanner(): void {
   if (game.phase === 'playing') return;
-  const cy = viewH / 2;
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-  ctx.fillRect(0, cy - 64, viewW, 128);
-  ctx.textAlign = 'center';
-  ctx.font = 'bold 44px ui-monospace, Menlo, Consolas, monospace';
-  ctx.fillStyle = game.phase === 'won' ? '#7dff7d' : '#ff6b5e';
-  ctx.fillText(game.phase === 'won' ? 'VICTORY' : 'DEFEAT', viewW / 2, cy - 4);
-  ctx.font = '15px ui-monospace, Menlo, Consolas, monospace';
-  ctx.fillStyle = '#cfe8c9';
-  ctx.fillText('按 Enter 重开', viewW / 2, cy + 32);
-  ctx.textAlign = 'left';
+  const hover = gameoverHit(gameoverLayout(viewW, viewH), mouse.x, mouse.y);
+  drawGameOver(ctx, viewW, viewH, game.phase, hover);
 }
 
 function productionItems(): ProductionItem[] {
@@ -1025,9 +1229,50 @@ function productionItems(): ProductionItem[] {
 let last = performance.now();
 let rafId = 0;
 let loopRunning = false;
+let prevPhase = game.phase;
+
+/** Dimmed live map behind the shell screens. */
+function drawShellBackdrop(): void {
+  drawTerrain(ctx, camera, mapCanvas, viewW, viewH);
+  ctx.fillStyle = 'rgba(6, 10, 6, 0.72)';
+  ctx.fillRect(0, 0, viewW, viewH);
+}
+
 function frame(now: number): void {
   const dt = Math.min((now - last) / 1000, 0.05);
   last = now;
+
+  // Drain pending pan/pinch and check for long-press timeouts. Taps are
+  // routed to whatever screen is up; world gestures only reach 'playing'.
+  for (const g of gestures.tick(now)) handleGesture(g);
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#0b0e0a';
+  ctx.fillRect(0, 0, viewW, viewH);
+
+  if (screen !== 'playing') {
+    clampToMap(camera, map, viewW, viewH);
+    canvas.style.cursor = 'default';
+    drawShellBackdrop();
+    if (screen === 'menu') {
+      const info = continueInfo();
+      drawMenu(ctx, viewW, viewH, {
+        difficulty,
+        canContinue: info.canContinue,
+        continueLabel: info.label,
+        hover: menuHit(menuLayout(viewW, viewH), mouse.x, mouse.y),
+      });
+    } else {
+      drawSettings(ctx, viewW, viewH, {
+        mute: settings.mute,
+        grid: settings.grid,
+        hover: settingsHit(settingsLayout(viewW, viewH), mouse.x, mouse.y),
+      });
+    }
+    rafId = requestAnimationFrame(frame);
+    return;
+  }
+
   const gameDt = paused ? 0 : dt * SPEEDS[speedIdx]!;
 
   applyKeyPan(dt);
@@ -1037,9 +1282,6 @@ function frame(now: number): void {
     if (vel.x !== 0 || vel.y !== 0) applyEdgePan(camera, vel, dt);
   }
   clampToMap(camera, map, viewW, viewH);
-
-  // Drain pending pan/pinch and check for long-press timeouts.
-  for (const g of gestures.tick(now)) handleGesture(g);
 
   if (gameDt > 0 && game.phase === 'playing') {
     const prev = snapshotCombat();
@@ -1054,14 +1296,14 @@ function frame(now: number): void {
       refreshFog();
     }
   }
+  if (game.phase !== prevPhase) {
+    if (game.phase !== 'playing') sfx.play(game.phase === 'won' ? 'fanfare' : 'defeat');
+    prevPhase = game.phase;
+  }
   for (const m of msgs) m.ttl -= dt;
   while (msgs.length > 0 && msgs[0]!.ttl <= 0) msgs.shift();
 
   canvas.style.cursor = keys.has('a') ? 'crosshair' : 'default';
-
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.fillStyle = '#0b0e0a';
-  ctx.fillRect(0, 0, viewW, viewH);
 
   const seenEnemyBuildings = game.enemyBuildings.filter((b) => {
     const d = BUILDING_DEFS[b.kind];
@@ -1070,6 +1312,7 @@ function frame(now: number): void {
   const visibleEnemies = filterVisibleEnemies(fog, game.enemyUnits);
 
   drawTerrain(ctx, camera, mapCanvas, viewW, viewH);
+  if (settings.grid) drawTerrain(ctx, camera, gridCanvas, viewW, viewH);
   drawBuildings(ctx, camera, seenEnemyBuildings);
   drawBuildings(ctx, camera, game.buildings);
   drawEffects(ctx, camera, effects);

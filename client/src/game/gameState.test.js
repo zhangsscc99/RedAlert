@@ -430,7 +430,7 @@ var AI_TANK_COST = 50;
 var AI_INFANTRY_PER_WAVE = 6;
 var AI_ARMY_PER_WAVE = 15;
 var ATTACK_JITTER_TILES = 6;
-function createAIState(seed) {
+function createAIState(seed, incomeScale = 1) {
   return {
     phase: "gather",
     credits: 0,
@@ -438,6 +438,7 @@ function createAIState(seed) {
     wave: 0,
     timer: 0,
     seed,
+    incomeScale,
     rng: mulberry32(seed)
   };
 }
@@ -446,7 +447,7 @@ function stepAI(s, dt) {
   s.timer += dt;
   while (s.timer >= AI_TICK) {
     s.timer -= AI_TICK;
-    s.credits += AI_INCOME_PER_TICK;
+    s.credits += AI_INCOME_PER_TICK * s.incomeScale;
     switch (s.phase) {
       case "gather":
         if (s.credits >= AI_BUILD_CREDITS) s.phase = "build";
@@ -715,14 +716,15 @@ var COMBAT_STATS = {
 };
 var REFINERY_TRICKLE = 5;
 var ENEMY_REPATH_SECONDS = 1.2;
-function makeGUnit(id, kind, tx, ty, team) {
+function makeGUnit(id, kind, tx, ty, team, strength = 1) {
   const s = UNIT_STATS[kind];
   const c = COMBAT_STATS[kind];
+  const hp = Math.round(s.hp * strength);
   return {
     id,
     kind,
-    hp: s.hp,
-    maxHp: s.hp,
+    hp,
+    maxHp: hp,
     x: tileCenter(tx),
     y: tileCenter(ty),
     angle: -Math.PI / 2,
@@ -731,7 +733,7 @@ function makeGUnit(id, kind, tx, ty, team) {
     selected: false,
     team,
     range: c.range,
-    damage: c.damage,
+    damage: Math.round(c.damage * strength),
     cooldown: 0,
     cooldownMax: c.cooldownMax,
     repathT: 0
@@ -791,7 +793,9 @@ function createGame(seed, opts = {}) {
     credits: opts.credits ?? 5e3,
     infantry: opts.infantry ?? 6,
     enemyInfantry: opts.enemyInfantry ?? 4,
-    enemyBase: opts.enemyBase ?? true
+    enemyBase: opts.enemyBase ?? true,
+    enemyStrength: opts.enemyStrength ?? 1,
+    waveIntervalScale: opts.waveIntervalScale ?? 1
   };
   const map = generateMap(seed);
   const g = {
@@ -805,7 +809,8 @@ function createGame(seed, opts = {}) {
     enemyBuildings: [],
     economy: createEconomy(o.credits),
     queue: createQueue(),
-    ai: createAIState(seed),
+    // A shorter waveIntervalScale banks AI income faster → waves land sooner.
+    ai: createAIState(seed, 1 / Math.max(0.01, o.waveIntervalScale)),
     phase: "playing",
     elapsed: 0,
     nextId: 1,
@@ -828,7 +833,7 @@ function createGame(seed, opts = {}) {
     }
   }
   for (const t of freeTilesNear(map, allBuildings(g), g.enemyAnchor.x, g.enemyAnchor.y, o.enemyInfantry)) {
-    g.enemyUnits.push(makeGUnit(g.nextId++, "infantry", t.x, t.y, "enemy"));
+    g.enemyUnits.push(makeGUnit(g.nextId++, "infantry", t.x, t.y, "enemy", o.enemyStrength));
   }
   g.ai.army = g.enemyUnits.length;
   return g;
@@ -867,7 +872,7 @@ function spawnTrained(g, kind) {
 }
 function spawnEnemy(g, kind) {
   const t = freeTilesNear(g.map, allBuildings(g), g.enemyAnchor.x, g.enemyAnchor.y, 1)[0];
-  if (t) g.enemyUnits.push(makeGUnit(g.nextId++, kind, t.x, t.y, "enemy"));
+  if (t) g.enemyUnits.push(makeGUnit(g.nextId++, kind, t.x, t.y, "enemy", g.opts.enemyStrength));
 }
 function pathTo(g, u, to) {
   const goal = snapToPassable(g.map, worldToTile(to.x), worldToTile(to.y));

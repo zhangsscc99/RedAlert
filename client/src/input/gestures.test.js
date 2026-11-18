@@ -76,7 +76,7 @@ function createGestureRecognizer(opts = {}) {
         prevSpread = f.spread;
         return;
       }
-      if (p.phase === "pending" && dist({ x: p.sx, y: p.sy }, p) >= dragThreshold) {
+      if (p.phase === "pending" && dist({ x: p.sx, y: p.sy }, p) >= Math.max(dragThreshold, lpTolerance)) {
         p.phase = "drag";
       }
     },
@@ -251,6 +251,64 @@ test("cancel drops the pointer without emitting gestures", () => {
   g.cancel(1);
   assert.equal(g.activePointers, 0);
   assert.deepEqual(g.tick(T0 + 600), []);
+});
+test("pinch degrades: single finger never emits pan/pinch", () => {
+  const g = createGestureRecognizer();
+  g.down(1, 100, 100, T0);
+  g.move(1, 180, 120, T0 + 20);
+  assert.deepEqual(
+    g.tick(T0 + 30).filter((x) => x.type === "pinch" || x.type === "pan"),
+    []
+  );
+});
+test("pinch degrade: lifting one finger mid-pinch stops pan/pinch output", () => {
+  const g = createGestureRecognizer();
+  g.down(1, 100, 100, T0);
+  g.down(2, 200, 100, T0 + 10);
+  g.move(2, 260, 100, T0 + 20);
+  assert.ok(g.tick(T0 + 21).length > 0);
+  g.up(2, 260, 100, T0 + 30);
+  g.move(1, 120, 120, T0 + 40);
+  assert.deepEqual(
+    g.tick(T0 + 50).filter((x) => x.type === "pinch" || x.type === "pan"),
+    []
+  );
+});
+test("third finger ignored: its moves/up never leak into the two-finger frame", () => {
+  const g = createGestureRecognizer();
+  g.down(1, 0, 0, T0);
+  g.down(2, 100, 0, T0 + 10);
+  g.down(3, 500, 500, T0 + 20);
+  g.move(3, 900, 900, T0 + 25);
+  const out = g.up(3, 900, 900, T0 + 30);
+  assert.deepEqual(out, []);
+  g.move(2, 110, 0, T0 + 40);
+  const pans = g.tick(T0 + 50).filter((x) => x.type === "pan");
+  assert.equal(pans.length, 1);
+  assert.deepEqual({ dx: pans[0].dx, dy: pans[0].dy }, { dx: 5, dy: 0 });
+});
+test("tap jitter: release just under the drag threshold still taps", () => {
+  const g = createGestureRecognizer();
+  g.down(1, 100, 100, T0);
+  assert.equal(g.up(1, 109, 100, T0 + 80)[0].type, "tap");
+});
+test("tap jitter: release at/over the drag threshold emits nothing", () => {
+  const g = createGestureRecognizer();
+  g.down(1, 100, 100, T0);
+  assert.deepEqual(g.up(1, 110, 100, T0 + 80), []);
+  const g2 = createGestureRecognizer();
+  g2.down(1, 0, 0, T0);
+  g2.move(1, 6, 6, T0 + 30);
+  assert.equal(g2.up(1, 9, 0, T0 + 90)[0].type, "tap");
+});
+test("longpress survives a wobble inside its tolerance (no box-select steal)", () => {
+  const g = createGestureRecognizer();
+  g.down(1, 50, 50, T0);
+  g.move(1, 61, 50, T0 + 100);
+  const out = g.tick(T0 + 520);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].type, "longpress");
+  assert.deepEqual(g.up(1, 61, 50, T0 + 560), []);
 });
 test("custom thresholds are honored", () => {
   const g = createGestureRecognizer({ dragThresholdPx: 20, longPressMs: 200 });
