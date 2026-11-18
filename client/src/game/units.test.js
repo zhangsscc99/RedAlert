@@ -80,10 +80,16 @@ var Heap = class {
     return top;
   }
 };
+function terrainPassable(map) {
+  return (x, y) => isPassable(map, x, y);
+}
 function findPath(map, sx, sy, gx, gy) {
   if (!inBounds(map, sx, sy) || !inBounds(map, gx, gy)) return null;
   if (sx === gx && sy === gy) return [];
   if (!isPassable(map, gx, gy)) return null;
+  return astar(map, sx, sy, gx, gy, terrainPassable(map));
+}
+function astar(map, sx, sy, gx, gy, passable) {
   const n = map.w * map.h;
   const g = new Float64Array(n).fill(Infinity);
   const f = new Float64Array(n).fill(Infinity);
@@ -105,9 +111,9 @@ function findPath(map, sx, sy, gx, gy) {
     for (const [dx, dy, cost] of DIRS) {
       const nx = cx + dx;
       const ny = cy + dy;
-      if (!isPassable(map, nx, ny)) continue;
+      if (!passable(nx, ny)) continue;
       if (dx !== 0 && dy !== 0) {
-        if (!isPassable(map, cx + dx, cy) || !isPassable(map, cx, cy + dy)) continue;
+        if (!passable(cx + dx, cy) || !passable(cx, cy + dy)) continue;
       }
       const ni = idx(map, nx, ny);
       const ng = g[cur] + cost;
@@ -132,7 +138,10 @@ function reconstruct(map, came, start, goal) {
   return path;
 }
 function snapToPassable(map, x, y, maxRadius = 8) {
-  if (isPassable(map, x, y)) return { x, y };
+  return nearestPassable(map, x, y, terrainPassable(map), maxRadius);
+}
+function nearestPassable(map, x, y, passable, maxRadius = 8) {
+  if (passable(x, y)) return { x, y };
   for (let r = 1; r <= maxRadius; r++) {
     let best = null;
     let bestD = Infinity;
@@ -141,7 +150,7 @@ function snapToPassable(map, x, y, maxRadius = 8) {
         if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
         const nx = x + dx;
         const ny = y + dy;
-        if (!isPassable(map, nx, ny)) continue;
+        if (!passable(nx, ny)) continue;
         const d = dx * dx + dy * dy;
         if (d < bestD) {
           bestD = d;

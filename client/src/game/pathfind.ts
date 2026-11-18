@@ -65,6 +65,13 @@ class Heap {
   }
 }
 
+/** Tile-occupancy predicate shared by the A* core and the snap search. */
+type Passable = (x: number, y: number) => boolean;
+
+function terrainPassable(map: GameMap): Passable {
+  return (x, y) => isPassable(map, x, y);
+}
+
 /**
  * A* from (sx,sy) to (gx,gy) in tile coords.
  * Returns the path as tile waypoints EXCLUDING the start and INCLUDING the
@@ -80,7 +87,18 @@ export function findPath(
   if (!inBounds(map, sx, sy) || !inBounds(map, gx, gy)) return null;
   if (sx === gx && sy === gy) return [];
   if (!isPassable(map, gx, gy)) return null;
+  return astar(map, sx, sy, gx, gy, terrainPassable(map));
+}
 
+/** Shared A* core. Callers supply the occupancy predicate. */
+function astar(
+  map: GameMap,
+  sx: number,
+  sy: number,
+  gx: number,
+  gy: number,
+  passable: Passable,
+): Tile[] | null {
   const n = map.w * map.h;
   const g = new Float64Array(n).fill(Infinity);
   const f = new Float64Array(n).fill(Infinity);
@@ -106,10 +124,10 @@ export function findPath(
     for (const [dx, dy, cost] of DIRS) {
       const nx = cx + dx;
       const ny = cy + dy;
-      if (!isPassable(map, nx, ny)) continue;
+      if (!passable(nx, ny)) continue;
       // No corner cutting: diagonals need both orthogonal neighbors passable.
       if (dx !== 0 && dy !== 0) {
-        if (!isPassable(map, cx + dx, cy) || !isPassable(map, cx, cy + dy)) continue;
+        if (!passable(cx + dx, cy) || !passable(cx, cy + dy)) continue;
       }
       const ni = idx(map, nx, ny);
       const ng = g[cur]! + cost;
@@ -122,6 +140,43 @@ export function findPath(
     }
   }
   return null;
+}
+
+/** Rectangular footprint (in tile coords) that blocks movement, e.g. a building. */
+export interface Blocker {
+  gx: number;
+  gy: number;
+  w: number;
+  h: number;
+}
+
+/**
+ * Like findPath, but every tile covered by a blocker footprint is impassable.
+ * A start or goal inside a blocker snaps to the nearest unblocked passable
+ * tile first (same ring search as snapToPassable). Returns null when either
+ * endpoint has no passable tile within snap range or no route exists.
+ */
+export function findPathAvoiding(
+  map: GameMap,
+  from: Tile,
+  to: Tile,
+  blockers: readonly Blocker[],
+): Tile[] | null {
+  const blocked = new Uint8Array(map.w * map.h);
+  for (const b of blockers) {
+    for (let y = b.gy; y < b.gy + b.h; y++) {
+      for (let x = b.gx; x < b.gx + b.w; x++) {
+        if (inBounds(map, x, y)) blocked[idx(map, x, y)] = 1;
+      }
+    }
+  }
+  const passable: Passable = (x, y) => isPassable(map, x, y) && !blocked[idx(map, x, y)];
+
+  const s = nearestPassable(map, from.x, from.y, passable);
+  const g = nearestPassable(map, to.x, to.y, passable);
+  if (!s || !g) return null;
+  if (s.x === g.x && s.y === g.y) return [];
+  return astar(map, s.x, s.y, g.x, g.y, passable);
 }
 
 function reconstruct(map: GameMap, came: Int32Array, start: number, goal: number): Tile[] {
@@ -140,7 +195,18 @@ function reconstruct(map: GameMap, came: Int32Array, start: number, goal: number
  * maxRadius) for the nearest passable tile. Returns null when none found.
  */
 export function snapToPassable(map: GameMap, x: number, y: number, maxRadius = 8): Tile | null {
-  if (isPassable(map, x, y)) return { x, y };
+  return nearestPassable(map, x, y, terrainPassable(map), maxRadius);
+}
+
+/** Shared ring search; callers supply the occupancy predicate. */
+function nearestPassable(
+  map: GameMap,
+  x: number,
+  y: number,
+  passable: Passable,
+  maxRadius = 8,
+): Tile | null {
+  if (passable(x, y)) return { x, y };
   for (let r = 1; r <= maxRadius; r++) {
     let best: Tile | null = null;
     let bestD = Infinity;
@@ -149,7 +215,7 @@ export function snapToPassable(map: GameMap, x: number, y: number, maxRadius = 8
         if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue; // ring only
         const nx = x + dx;
         const ny = y + dy;
-        if (!isPassable(map, nx, ny)) continue;
+        if (!passable(nx, ny)) continue;
         const d = dx * dx + dy * dy;
         if (d < bestD) {
           bestD = d;
