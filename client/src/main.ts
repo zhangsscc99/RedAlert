@@ -1,42 +1,55 @@
 // Entry point: canvas setup, input handling, game loop.
 
 import {
+  BUILDING_DEFS,
   UNIT_RADIUS,
+  buildAt,
+  canBuildAt,
   clampToMap,
   commandMove,
   createCamera,
-  generateMap,
+  createGame,
   normRect,
   panBy,
+  restart,
   screenToWorld,
   selectUnits,
-  spawnUnits,
+  tickGame,
+  trainUnit,
   unitAt,
   unitsInRect,
-  updateUnits,
   worldToTile,
   zoomAt,
+  type BuildingKind,
   type Point,
+  type UnitKind,
 } from './game/index.ts';
 import { drawTerrain, prerenderMap } from './render/terrain.js';
 import { drawUnits } from './render/units.js';
 import {
+  drawBuildings,
+  drawPlacementPreview,
+  drawUnitsColored,
+} from './render/buildings.js';
+import {
   drawHud,
+  drawMessages,
   drawMinimap,
   drawSelectBox,
   minimapToWorld,
+  pushMessage,
+  type HudMessage,
 } from './render/hud.js';
 
 const MAP_SEED = 1337;
-const UNIT_COUNT = 8;
 const CLICK_DRAG_THRESHOLD = 5; // screen px
 
 const canvas = document.getElementById('game') as HTMLCanvasElement;
 const ctx = canvas.getContext('2d')!;
 
-const map = generateMap(MAP_SEED);
-const units = spawnUnits(map, UNIT_COUNT);
-const mapCanvas = prerenderMap(map);
+let game = createGame(MAP_SEED);
+let map = game.map;
+let mapCanvas = prerenderMap(map);
 
 let viewW = 0;
 let viewH = 0;
@@ -69,11 +82,50 @@ let dragStart: Point = { x: 0, y: 0 }; // screen coords
 let dragPrev: Point = { x: 0, y: 0 };
 let mouse: Point = { x: 0, y: 0 };
 let moveMarker: { x: number; y: number; t: number } | null = null;
+let pendingBuild: BuildingKind | null = null;
+const msgs: HudMessage[] = [];
 const keys = new Set<string>();
 
 function canvasPos(e: PointerEvent | WheelEvent): Point {
   const r = canvas.getBoundingClientRect();
   return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+
+function resetGame(): void {
+  game = restart(game);
+  map = game.map;
+  mapCanvas = prerenderMap(map);
+  pendingBuild = null;
+  msgs.length = 0;
+}
+
+/** Footprint top-left tile so the ghost stays centered under the cursor. */
+function ghostAnchor(p: Point): Point {
+  const w = screenToWorld(camera, p.x, p.y);
+  const d = BUILDING_DEFS[pendingBuild!];
+  return { x: worldToTile(w.x) - (d.w >> 1), y: worldToTile(w.y) - (d.h >> 1) };
+}
+
+function failText(reason: string): string {
+  switch (reason) {
+    case 'funds':
+      return '资金不足';
+    case 'oob':
+      return '超出地图边界';
+    case 'water':
+      return '不能建在水面/矿上';
+    case 'overlap':
+      return '与现有建筑重叠';
+    case 'no-barracks':
+      return '需要已完工的兵营 (B)';
+    default:
+      return '无法执行';
+  }
+}
+
+function tryTrain(kind: UnitKind): void {
+  const r = trainUnit(game, kind);
+  pushMessage(msgs, r.ok ? `${kind} 已入队` : failText(r.ok ? '' : r.reason));
 }
 
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -83,6 +135,30 @@ canvas.addEventListener('pointerdown', (e) => {
   const p = canvasPos(e);
   dragStart = p;
   dragPrev = p;
+
+  // Placement mode: left = build here, right = cancel. Minimap still works.
+  if (pendingBuild) {
+    const mm = e.button === 0 ? minimapToWorld(map, viewW, viewH, p.x, p.y) : null;
+    if (mm) {
+      camera.x = mm.x - viewW / camera.zoom / 2;
+      camera.y = mm.y - viewH / camera.zoom / 2;
+      dragMode = 'minimap';
+      return;
+    }
+    if (e.button === 0) {
+      const g = ghostAnchor(p);
+      const r = buildAt(game, pendingBuild, g.x, g.y);
+      pushMessage(
+        msgs,
+        r.ok ? `${BUILDING_DEFS[pendingBuild].label} 已落地` : failText(r.ok ? '' : r.reason),
+      );
+      if (r.ok) pendingBuild = null;
+    } else if (e.button === 2) {
+      pendingBuild = null;
+    }
+    dragMode = 'none';
+    return;
+  }
 
   if (e.button === 0) {
     dragMode = minimapToWorld(map, viewW, viewH, p.x, p.y) ? 'minimap' : 'maybeSelect';
@@ -123,6 +199,7 @@ canvas.addEventListener('pointermove', (e) => {
 canvas.addEventListener('pointerup', (e) => {
   const p = canvasPos(e);
   const additive = e.shiftKey;
+  const units = game.units;
 
   if (dragMode === 'box') {
     const a = screenToWorld(camera, dragStart.x, dragStart.y);
@@ -154,7 +231,20 @@ canvas.addEventListener(
   { passive: false },
 );
 
-window.addEventListener('keydown', (e) => keys.add(e.key.toLowerCase()));
+window.addEventListener('keydown', (e) => {
+  const k = e.key.toLowerCase();
+  keys.add(k);
+
+  if (game.phase !== 'playing') {
+    if (k === 'enter' || k === 'r') resetGame();
+    return;
+  }
+  if (k === 'b') pendingBuild = 'barracks';
+  else if (k === 'r') pendingBuild = 'refinery';
+  else if (k === 'escape') pendingBuild = null;
+  else if (k === '1') tryTrain('infantry');
+  else if (k === '2') tryTrain('tank');
+});
 window.addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
 window.addEventListener('blur', () => keys.clear());
 
@@ -191,6 +281,38 @@ function drawMoveMarker(now: number): void {
   ctx.stroke();
 }
 
+function drawTimer(): void {
+  const t = Math.floor(game.elapsed);
+  const text = `T+ ${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
+  ctx.font = 'bold 13px ui-monospace, Menlo, Consolas, monospace';
+  const w = ctx.measureText(text).width + 20;
+  const x = viewW - w - 12;
+  ctx.fillStyle = 'rgba(10, 14, 8, 0.72)';
+  ctx.fillRect(x, 10, w, 26);
+  ctx.strokeStyle = 'rgba(93, 255, 93, 0.35)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x + 0.5, 10.5, w - 1, 25);
+  ctx.fillStyle = '#cfe8c9';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, x + 10, 23.5);
+  ctx.textBaseline = 'alphabetic';
+}
+
+function drawBanner(): void {
+  if (game.phase === 'playing') return;
+  const cy = viewH / 2;
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+  ctx.fillRect(0, cy - 64, viewW, 128);
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 44px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillStyle = game.phase === 'won' ? '#7dff7d' : '#ff6b5e';
+  ctx.fillText(game.phase === 'won' ? 'VICTORY' : 'DEFEAT', viewW / 2, cy - 4);
+  ctx.font = '15px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillStyle = '#cfe8c9';
+  ctx.fillText('按 Enter 重开', viewW / 2, cy + 32);
+  ctx.textAlign = 'left';
+}
+
 let last = performance.now();
 function frame(now: number): void {
   const dt = Math.min((now - last) / 1000, 0.05);
@@ -198,23 +320,49 @@ function frame(now: number): void {
 
   applyKeyPan(dt);
   clampToMap(camera, map, viewW, viewH);
-  updateUnits(units, dt);
+  tickGame(game, dt);
+  for (const m of msgs) m.ttl -= dt;
+  while (msgs.length > 0 && msgs[0]!.ttl <= 0) msgs.shift();
 
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = '#0b0e0a';
   ctx.fillRect(0, 0, viewW, viewH);
 
   drawTerrain(ctx, camera, mapCanvas, viewW, viewH);
+  drawBuildings(ctx, camera, game.enemyBuildings);
+  drawBuildings(ctx, camera, game.buildings);
   drawMoveMarker(now);
-  drawUnits(ctx, camera, units);
+  drawUnits(ctx, camera, game.units);
+  drawUnitsColored(ctx, camera, game.enemyUnits, '#e8765a', '#5a2018');
 
+  if (pendingBuild) {
+    const g = ghostAnchor(mouse);
+    const ok =
+      canBuildAt(game, pendingBuild, g.x, g.y) &&
+      game.economy.credits >= BUILDING_DEFS[pendingBuild].cost;
+    drawPlacementPreview(ctx, camera, pendingBuild, g.x, g.y, ok);
+  }
   if (dragMode === 'box') drawSelectBox(ctx, normRect(dragStart, mouse));
 
   const mw = screenToWorld(camera, mouse.x, mouse.y);
   const tx = worldToTile(mw.x);
   const ty = worldToTile(mw.y);
-  drawHud(ctx, camera, units, tx >= 0 && ty >= 0 && tx < map.w && ty < map.h ? { x: tx, y: ty } : null);
-  drawMinimap(ctx, map, camera, units, viewW, viewH);
+  drawHud(
+    ctx,
+    camera,
+    game.units,
+    tx >= 0 && ty >= 0 && tx < map.w && ty < map.h ? { x: tx, y: ty } : null,
+    {
+      credits: Math.floor(game.economy.credits),
+      units: game.units.length,
+      buildings: game.buildings.length,
+    },
+    viewW,
+  );
+  drawTimer();
+  drawMessages(ctx, msgs, viewW, viewH);
+  drawMinimap(ctx, map, camera, [...game.units, ...game.enemyUnits], viewW, viewH);
+  drawBanner();
 
   requestAnimationFrame(frame);
 }
