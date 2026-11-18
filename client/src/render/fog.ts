@@ -1,35 +1,152 @@
-// Fog-of-war overlay: the Fog's per-tile alpha (0 / 0.5 / 1) is baked into a
-// tiny offscreen canvas (1 px per tile), then blitted scaled over the terrain
-// each frame. Linear smoothing gives soft tile edges for free.
+// Fog-of-war overlay: the Fog's per-tile coverage is baked into a small
+// offscreen canvas (SUB px per tile), blurred for soft gradients, then blitted
+// scaled over the terrain each frame. Visibility changes cross-fade between
+// the previous and current bake over FADE_MS so tiles don't pop.
 
-import { TILE_SIZE, fogAlpha, type Camera, type Fog } from '../game/index.ts';
+import { TILE_SIZE, type Camera, type Fog } from '../game/index.ts';
+
+/** Subpixels per tile in the baked layer — headroom for the edge blur. */
+const SUB = 4;
+/** Box-blur radius in subpixels (~0.75 tile) — softens shroud edges. */
+const BLUR_R = 3;
+/** Cross-fade duration when visibility changes. */
+const FADE_MS = 150;
+
+/** Unseen: near-black, fully opaque. */
+const UNSEEN = { r: 4, g: 6, b: 12, a: 255 };
+/** Explored but not currently visible: translucent slate — dims/desaturates. */
+const DIMMED = { r: 52, g: 56, b: 66, a: 122 };
 
 export interface FogLayer {
-  canvas: HTMLCanvasElement;
+  w: number;
+  h: number;
+  /** Canvas blitted this frame. */
+  curr: HTMLCanvasElement;
+  /** Previous bake, kept for the cross-fade. */
+  prev: HTMLCanvasElement;
+  /** True once a second bake exists to fade from. */
+  hasPrev: boolean;
   img: ImageData;
+  fadeStart: number;
+}
+
+function makeCanvas(w: number, h: number): HTMLCanvasElement {
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  return canvas;
 }
 
 export function createFogLayer(fog: Fog): FogLayer {
-  const canvas = document.createElement('canvas');
-  canvas.width = fog.w;
-  canvas.height = fog.h;
-  const img = canvas.getContext('2d')!.createImageData(fog.w, fog.h);
-  return { canvas, img };
+  const w = fog.w * SUB;
+  const h = fog.h * SUB;
+  const curr = makeCanvas(w, h);
+  const prev = makeCanvas(w, h);
+  const img = curr.getContext('2d')!.createImageData(w, h);
+  return { w: fog.w, h: fog.h, curr, prev, hasPrev: false, img, fadeStart: 0 };
 }
 
-/** Rewrite every pixel from fogAlpha: visible → 0, explored → ~128, unseen → 255. */
-export function bakeFog(fog: Fog, layer: FogLayer): void {
-  const d = layer.img.data;
-  for (let y = 0; y < fog.h; y++) {
-    for (let x = 0; x < fog.w; x++) {
-      const i = (y * fog.w + x) * 4;
-      d[i] = 0;
-      d[i + 1] = 0;
-      d[i + 2] = 0;
-      d[i + 3] = Math.round((1 - fogAlpha(fog, x, y)) * 255);
+/** Separable box blur over all 4 channels, edge-clamped. In-place. */
+function boxBlur(d: Uint8ClampedArray, w: number, h: number, r: number): void {
+  const inv = 1 / (2 * r + 1);
+  const tmp = new Float32Array(w * h * 4);
+  // Horizontal pass: d -> tmp
+  for (let y = 0; y < h; y++) {
+    const row = y * w * 4;
+    for (let c = 0; c < 4; c++) {
+      let sum = 0;
+      for (let x = -r; x <= r; x++) {
+        const xi = x < 0 ? 0 : x;
+        sum += d[row + xi * 4 + c]!;
+      }
+      for (let x = 0; x < w; x++) {
+        tmp[row + x * 4 + c] = sum * inv;
+        const xa = x + r + 1 < w ? x + r + 1 : w - 1;
+        const xs = x - r > 0 ? x - r : 0;
+        sum += d[row + xa * 4 + c]! - d[row + xs * 4 + c]!;
+      }
     }
   }
-  layer.canvas.getContext('2d')!.putImageData(layer.img, 0, 0);
+  // Vertical pass: tmp -> d
+  for (let x = 0; x < w; x++) {
+    const col = x * 4;
+    for (let c = 0; c < 4; c++) {
+      let sum = 0;
+      for (let y = -r; y <= r; y++) {
+        const yi = y < 0 ? 0 : y;
+        sum += tmp[yi * w * 4 + col + c]!;
+      }
+      for (let y = 0; y < h; y++) {
+        d[y * w * 4 + col + c] = sum * inv;
+        const ya = y + r + 1 < h ? y + r + 1 : h - 1;
+        const ys = y - r > 0 ? y - r : 0;
+        sum += tmp[ya * w * 4 + col + c]! - tmp[ys * w * 4 + col + c]!;
+      }
+    }
+  }
+}
+
+/**
+ * Rewrite the baked layer from the current fog state and start a cross-fade
+ * from the previous bake. Called only when visibility changes — the offscreen
+ * canvas is cached and reused every other frame.
+ */
+export function bakeFog(fog: Fog, layer: FogLayer): void {
+  const d = layer.img.data;
+  const pw = fog.w * SUB;
+  for (let y = 0; y < fog.h; y++) {
+    for (let x = 0; x < fog.w; x++) {
+      const i = y * fog.w + x;
+      const c = fog.visible[i] === 1 ? null : fog.explored[i] === 1 ? DIMMED : UNSEEN;
+      const a = c === null ? 0 : c.a;
+      const r = c === null ? 0 : c.r;
+      const g = c === null ? 0 : c.g;
+      const b = c === null ? 0 : c.b;
+      for (let sy = 0; sy < SUB; sy++) {
+        let p = ((y * SUB + sy) * pw + x * SUB) * 4;
+        for (let sx = 0; sx < SUB; sx++) {
+          d[p] = r;
+          d[p + 1] = g;
+          d[p + 2] = b;
+          d[p + 3] = a;
+          p += 4;
+        }
+      }
+    }
+  }
+  boxBlur(d, pw, fog.h * SUB, BLUR_R);
+
+  // Swap curr/prev so the outgoing bake stays available for the fade.
+  const old = layer.curr;
+  layer.curr = layer.prev;
+  layer.prev = old;
+  layer.curr.getContext('2d')!.putImageData(layer.img, 0, 0);
+  layer.hasPrev = true;
+  layer.fadeStart = performance.now();
+}
+
+function blit(
+  ctx: CanvasRenderingContext2D,
+  cam: Camera,
+  canvas: HTMLCanvasElement,
+  viewW: number,
+  viewH: number,
+  alpha: number,
+): void {
+  const sw = viewW / cam.zoom;
+  const sh = viewH / cam.zoom;
+  ctx.globalAlpha = alpha;
+  ctx.drawImage(
+    canvas,
+    (cam.x / TILE_SIZE) * SUB,
+    (cam.y / TILE_SIZE) * SUB,
+    (sw / TILE_SIZE) * SUB,
+    (sh / TILE_SIZE) * SUB,
+    0,
+    0,
+    viewW,
+    viewH,
+  );
 }
 
 /** Blit the baked layer over the same world window drawTerrain uses. */
@@ -40,18 +157,11 @@ export function drawFog(
   viewW: number,
   viewH: number,
 ): void {
-  const sw = viewW / cam.zoom;
-  const sh = viewH / cam.zoom;
+  const t = layer.hasPrev
+    ? Math.min(1, (performance.now() - layer.fadeStart) / FADE_MS)
+    : 1;
   ctx.imageSmoothingEnabled = true;
-  ctx.drawImage(
-    layer.canvas,
-    cam.x / TILE_SIZE,
-    cam.y / TILE_SIZE,
-    sw / TILE_SIZE,
-    sh / TILE_SIZE,
-    0,
-    0,
-    viewW,
-    viewH,
-  );
+  if (t < 1) blit(ctx, cam, layer.prev, viewW, viewH, 1 - t);
+  blit(ctx, cam, layer.curr, viewW, viewH, t);
+  ctx.globalAlpha = 1;
 }
