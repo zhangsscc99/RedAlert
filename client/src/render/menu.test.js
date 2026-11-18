@@ -110,32 +110,74 @@ var BTN_H = 52;
 var BTN_GAP = 14;
 var DIFF_H = 34;
 var DIFF_GAP = 8;
+var BTN_H_MIN = 36;
+var BTN_GAP_MIN = 6;
+var DIFF_H_MIN = 28;
+var HINT_FONT = 12;
+var HINT_ZONE = HINT_FONT + 6;
 var inRect = (r, x, y) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
 function colW(viewW) {
   return Math.max(180, Math.min(320, viewW - 64));
 }
+function vstack(viewH, zones) {
+  const nat = { top: 12, gapA: 8, gapB: 14, gapHint: 12, bottom: 6 };
+  const natRows = zones.rows * BTN_H + (zones.rows - 1) * BTN_GAP;
+  const natHeader = zones.header.reduce((a, b) => a + b, 0);
+  const natTotal = nat.top + natHeader + nat.gapA + zones.mid + nat.gapB + natRows + nat.gapHint + HINT_ZONE + nat.bottom;
+  const s = Math.min(1, viewH / natTotal);
+  const bh = Math.max(BTN_H_MIN, Math.round(BTN_H * s));
+  const gap = Math.max(BTN_GAP_MIN, Math.round(BTN_GAP * s));
+  const midH = Math.max(Math.min(DIFF_H_MIN, zones.mid), Math.round(zones.mid * s));
+  const scaled = zones.header.map((h) => h * s);
+  const top = nat.top * s;
+  const gapA = nat.gapA * s;
+  const gapB = nat.gapB * s;
+  const gapHint = Math.max(8, nat.gapHint * s);
+  const rowsH = zones.rows * bh + (zones.rows - 1) * gap;
+  const total = top + natHeader * s + gapA + midH + gapB + rowsH + gapHint + HINT_ZONE + nat.bottom;
+  let y = Math.max(0, (viewH - total) / 2) + top;
+  const baselines = scaled.map((h) => {
+    const b = y + h * 0.8;
+    y += h;
+    return Math.round(b);
+  });
+  y += gapA;
+  const midY = y;
+  y += midH + gapB;
+  const rowsY = y;
+  const hintY = Math.round(Math.min(viewH - nat.bottom - 3, rowsY + rowsH + gapHint + HINT_FONT));
+  return { baselines, midY, rowsY, bh, gap, midH, hintY };
+}
 function menuLayout(viewW, viewH) {
   const bw = colW(viewW);
-  const bh = viewH < 480 ? 44 : BTN_H;
-  const dw = (bw - 2 * DIFF_GAP) / 3;
   const cx = viewW / 2;
-  const top = Math.round(viewH * 0.44);
-  const y0 = top + DIFF_H + 22;
+  const titleFont = viewW < 480 ? 44 : 64;
+  const v = vstack(viewH, {
+    header: [titleFont * 1.05, 22, 16],
+    // title, subtitle, 「难度」 label
+    mid: DIFF_H,
+    rows: 3
+  });
+  const bh = v.bh;
+  const dw = (bw - 2 * DIFF_GAP) / 3;
+  const y0 = v.rowsY;
   const ids = ["start", "continue", "settings"];
   const half = (bw - DIFF_GAP) / 2;
   return {
-    titleY: Math.round(viewH * 0.24),
-    subtitleY: Math.round(viewH * 0.24) + 30,
+    titleY: v.baselines[0],
+    subtitleY: v.baselines[1],
+    diffLabelY: v.baselines[2],
     difficulty: DIFF_ORDER.map((d, i) => ({
       d,
-      rect: { x: cx - bw / 2 + i * (dw + DIFF_GAP), y: top, w: dw, h: DIFF_H }
+      rect: { x: cx - bw / 2 + i * (dw + DIFF_GAP), y: v.midY, w: dw, h: v.midH }
     })),
     campaign: { x: cx - bw / 2 + half + DIFF_GAP, y: y0, w: half, h: bh },
-    replay: { x: cx - bw / 2, y: y0 + 2 * (bh + BTN_GAP), w: half, h: bh },
+    replay: { x: cx - bw / 2, y: y0 + 2 * (bh + v.gap), w: half, h: bh },
     buttons: ids.map((id, i) => ({
       id,
-      rect: id === "start" ? { x: cx - bw / 2, y: y0, w: half, h: bh } : id === "settings" ? { x: cx - bw / 2 + half + DIFF_GAP, y: y0 + i * (bh + BTN_GAP), w: half, h: bh } : { x: cx - bw / 2, y: y0 + i * (bh + BTN_GAP), w: bw, h: bh }
-    }))
+      rect: id === "start" ? { x: cx - bw / 2, y: y0, w: half, h: bh } : id === "settings" ? { x: cx - bw / 2 + half + DIFF_GAP, y: y0 + i * (bh + v.gap), w: half, h: bh } : { x: cx - bw / 2, y: y0 + i * (bh + v.gap), w: bw, h: bh }
+    })),
+    hintY: v.hintY
   };
 }
 function menuHit(l, x, y) {
@@ -151,16 +193,21 @@ function menuHit(l, x, y) {
 }
 function settingsLayout(viewW, viewH) {
   const bw = colW(viewW);
-  const bh = viewH < 480 ? 44 : BTN_H;
   const cx = viewW / 2;
-  const y0 = Math.round(viewH * 0.42);
+  const v = vstack(viewH, {
+    header: [34 * 1.1],
+    // 「设置」 title
+    mid: 0,
+    rows: 3
+  });
   const ids = ["mute", "grid", "back"];
   return {
-    titleY: Math.round(viewH * 0.26),
+    titleY: v.baselines[0],
     rows: ids.map((id, i) => ({
       id,
-      rect: { x: cx - bw / 2, y: y0 + i * (bh + BTN_GAP), w: bw, h: bh }
-    }))
+      rect: { x: cx - bw / 2, y: v.rowsY + i * (v.bh + v.gap), w: bw, h: v.bh }
+    })),
+    hintY: v.hintY
   };
 }
 function settingsHit(l, x, y) {
@@ -242,6 +289,13 @@ for (const [w, h] of VIEWPORTS) {
     });
     assert.equal(settingsHit(l, 2, 2), null);
   });
+  test(`settings ${w}x${h}: all rows stay inside the viewport`, () => {
+    const l = settingsLayout(w, h);
+    for (const row of l.rows) {
+      assert.ok(row.rect.x >= 0 && row.rect.x + row.rect.w <= w);
+      assert.ok(row.rect.y >= 0 && row.rect.y + row.rect.h <= h);
+    }
+  });
   test(`gameover ${w}x${h}: retry/menu buttons hit correctly`, () => {
     const l = gameoverLayout(w, h);
     const retry = l.buttons.find((b) => b.id === "retry");
@@ -253,5 +307,53 @@ for (const [w, h] of VIEWPORTS) {
       assert.ok(b.rect.x >= 0 && b.rect.x + b.rect.w <= w);
       assert.ok(b.rect.y >= 0 && b.rect.y + b.rect.h <= h);
     }
+  });
+}
+var FIT_VIEWPORTS = [
+  [380, 320],
+  [780, 380],
+  [1024, 768],
+  [1440, 900]
+];
+var overlap = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+for (const [w, h] of FIT_VIEWPORTS) {
+  test(`menu ${w}x${h}: every rect fits the viewport and none overlap`, () => {
+    const l = menuLayout(w, h);
+    const rects = [
+      ...l.buttons.map((b) => b.rect),
+      ...l.difficulty.map((d) => d.rect),
+      l.campaign,
+      l.replay
+    ];
+    for (const r of rects) {
+      assert.ok(r.y >= 0, `rect ${JSON.stringify(r)} above viewport`);
+      assert.ok(r.y + r.h <= h, `rect ${JSON.stringify(r)} below viewport ${h}`);
+      assert.ok(r.x >= 0, `rect ${JSON.stringify(r)} left of viewport`);
+      assert.ok(r.x + r.w <= w, `rect ${JSON.stringify(r)} right of viewport ${w}`);
+    }
+    for (let i = 0; i < rects.length; i++) {
+      for (let j = i + 1; j < rects.length; j++) {
+        assert.ok(!overlap(rects[i], rects[j]), `rects ${i} and ${j} overlap`);
+      }
+    }
+    for (const r of rects) {
+      assert.ok(r.y + r.h <= l.hintY - 12, `rect ${JSON.stringify(r)} crowds hint at ${l.hintY}`);
+    }
+    assert.ok(l.hintY <= h);
+  });
+  test(`settings ${w}x${h}: every row fits, none overlap, hint is clear`, () => {
+    const l = settingsLayout(w, h);
+    const rects = l.rows.map((r) => r.rect);
+    for (const r of rects) {
+      assert.ok(r.y >= 0 && r.y + r.h <= h, `row ${JSON.stringify(r)} overflows height ${h}`);
+      assert.ok(r.x >= 0 && r.x + r.w <= w, `row ${JSON.stringify(r)} overflows width ${w}`);
+      assert.ok(r.y + r.h <= l.hintY - 12, `row ${JSON.stringify(r)} crowds hint at ${l.hintY}`);
+    }
+    for (let i = 0; i < rects.length; i++) {
+      for (let j = i + 1; j < rects.length; j++) {
+        assert.ok(!overlap(rects[i], rects[j]), `rows ${i} and ${j} overlap`);
+      }
+    }
+    assert.ok(l.hintY <= h);
   });
 }
