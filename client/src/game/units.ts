@@ -3,6 +3,7 @@
 import { isPassable, TILE_SIZE, tileCenter, worldToTile, type GameMap } from './grid.js';
 import { findPathSmooth, snapToPassable } from './pathfind.js';
 import type { Point } from './selection.js';
+import { speedMultiplier, type Rank } from './veterancy.js';
 
 export type UnitKind = 'infantry' | 'harvester' | 'tank';
 
@@ -39,6 +40,8 @@ export interface Unit {
   speed: number;
   path: Point[]; // world-space waypoints
   selected: boolean;
+  kills?: number; // confirmed kills (veterancy bookkeeping); absent = 0
+  rank?: Rank; // veterancy rank; absent = 'rookie'
 }
 
 function makeUnit(id: number, kind: UnitKind, tx: number, ty: number): Unit {
@@ -54,6 +57,8 @@ function makeUnit(id: number, kind: UnitKind, tx: number, ty: number): Unit {
     speed: stats.speed,
     path: [],
     selected: false,
+    kills: 0,
+    rank: 'rookie',
   };
 }
 
@@ -128,7 +133,8 @@ export function commandMove(units: Unit[], map: GameMap, gx: number, gy: number)
  */
 export function updateUnits(units: Unit[], dt: number): void {
   for (const u of units) {
-    let remaining = u.speed * dt;
+    // Veterans and elites move a touch faster; rankless units are rookies (×1).
+    let remaining = u.speed * speedMultiplier(u.rank ?? 'rookie') * dt;
     while (remaining > 0) {
       const target = u.path[0];
       if (!target) break;

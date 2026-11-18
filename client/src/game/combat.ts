@@ -5,6 +5,13 @@
 import { damageMultiplier, type ArmorType, type WeaponType } from './unitRoles.js';
 import { BUILDING_DEFS, type Building } from './buildings.js';
 import { TILE_SIZE } from './grid.js';
+import {
+  RANK_THRESHOLDS,
+  addKill,
+  armorMultiplier as rankArmorMultiplier,
+  damageMultiplier as rankDamageMultiplier,
+  type Rank,
+} from './veterancy.js';
 
 export interface Combatant {
   id: number;
@@ -21,6 +28,8 @@ export interface Combatant {
   weapon?: WeaponType | null; // used when counters are on; null/absent = no multiplier
   targetId?: number | null; // focus-fire lock; kept until the target dies
   splashRadius?: number; // world px; >0 = hits splash around the target point
+  kills?: number; // confirmed kills (veterancy bookkeeping); absent = 0
+  rank?: Rank; // veterancy rank; absent = 'rookie' (multiplier 1)
 }
 
 export type CombatEvent =
@@ -45,13 +54,32 @@ export function dist(a: Combatant, b: Combatant): number {
 }
 
 /**
- * Damage `a` deals to `t`. With `counters` on and both sides typed, the
- * weapon×armor multiplier from unitRoles' DAMAGE_MATRIX applies; anything
- * missing falls back to the raw damage.
+ * Damage `a` deals to `t`. The attacker's rank scales the outgoing damage and
+ * the defender's rank scales what gets through (rookie = ×1, so rankless
+ * combatants hit exactly as before). With `counters` on and both sides typed,
+ * the weapon×armor multiplier from unitRoles' DAMAGE_MATRIX also applies;
+ * anything missing falls back to the rank-scaled damage.
  */
 export function effectiveDamage(a: Combatant, t: Combatant, counters = false): number {
-  if (!counters || a.weapon == null || t.armor === undefined) return a.damage;
-  return a.damage * damageMultiplier(a.weapon, t.armor);
+  let dmg = a.damage * rankDamageMultiplier(a.rank ?? 'rookie');
+  dmg *= rankArmorMultiplier(t.rank ?? 'rookie');
+  if (counters && a.weapon != null && t.armor !== undefined) {
+    dmg *= damageMultiplier(a.weapon, t.armor);
+  }
+  return dmg;
+}
+
+/**
+ * Credit `killer` with a kill: bump its kill count, re-derive its rank and
+ * write both back. Any rank-up lands in veterancy's promotion queue — poll
+ * drainPromotions() each frame for fanfare/sound cues. A killer with a rank
+ * but no recorded kills is assumed to sit at that rank's threshold.
+ */
+function creditKill(killer: Combatant): void {
+  const rank = killer.rank ?? 'rookie';
+  const r = addKill(rank, killer.kills ?? RANK_THRESHOLDS[rank], killer.id);
+  killer.kills = r.kills;
+  killer.rank = r.rank;
 }
 
 /** True when segment (x1,y1)-(x2,y2) meets or crosses rect [x0,y0]-[x1r,y1r]. */
@@ -202,6 +230,7 @@ export function stepCombat(
     if (applyDamage(target, dmg)) {
       events.push({ type: 'death', id: target.id });
       if (a.targetId === target.id) a.targetId = null;
+      creditKill(a);
     }
 
     const r = a.splashRadius ?? 0;
@@ -213,7 +242,10 @@ export function stepCombat(
         const vd = effectiveDamage(a, v, counters) * (1 - d / r);
         if (!(vd > 0)) continue;
         events.push({ type: 'hit', from: a.id, to: v.id, damage: vd });
-        if (applyDamage(v, vd)) events.push({ type: 'death', id: v.id });
+        if (applyDamage(v, vd)) {
+          events.push({ type: 'death', id: v.id });
+          creditKill(a);
+        }
       }
     }
 

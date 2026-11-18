@@ -24,13 +24,65 @@ function damageMultiplier(weapon, armor) {
   return DAMAGE_MATRIX[weapon]?.[armor] ?? 0;
 }
 
+// src/game/veterancy.ts
+var RANKS = ["rookie", "veteran", "elite"];
+var RANK_THRESHOLDS = {
+  rookie: 0,
+  veteran: 3,
+  elite: 8
+};
+var RANK_DAMAGE = { rookie: 1, veteran: 1.15, elite: 1.3 };
+var RANK_ARMOR = { rookie: 1, veteran: 0.9, elite: 0.8 };
+function damageMultiplier2(rank) {
+  return RANK_DAMAGE[rank];
+}
+function armorMultiplier(rank) {
+  return RANK_ARMOR[rank];
+}
+function rankFromKills(kills) {
+  const k = Math.max(0, Math.floor(kills));
+  if (k >= RANK_THRESHOLDS.elite) return "elite";
+  if (k >= RANK_THRESHOLDS.veteran) return "veteran";
+  return "rookie";
+}
+var promotionQueue = [];
+function drainPromotions() {
+  return promotionQueue.splice(0, promotionQueue.length);
+}
+function addKill(rank, kills, unitId) {
+  const before = kills !== void 0 ? Math.max(0, Math.floor(kills)) : Math.max(0, (RANK_THRESHOLDS[nextRank(rank) ?? rank] ?? 0) - 1);
+  const after = before + 1;
+  const newRank = rankFromKills(after);
+  const promoted = newRank !== rank;
+  if (promoted) {
+    promotionQueue.push(
+      unitId === void 0 ? { from: rank, to: newRank } : { from: rank, to: newRank, unitId }
+    );
+  }
+  return { kills: after, rank: newRank, promoted };
+}
+function nextRank(rank) {
+  const idx = RANKS.indexOf(rank);
+  return idx >= 0 && idx < RANKS.length - 1 ? RANKS[idx + 1] : null;
+}
+
 // src/game/combat.ts
 function dist(a, b) {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
 function effectiveDamage(a, t, counters = false) {
-  if (!counters || a.weapon == null || t.armor === void 0) return a.damage;
-  return a.damage * damageMultiplier(a.weapon, t.armor);
+  let dmg = a.damage * damageMultiplier2(a.rank ?? "rookie");
+  dmg *= armorMultiplier(t.rank ?? "rookie");
+  if (counters && a.weapon != null && t.armor !== void 0) {
+    dmg *= damageMultiplier(a.weapon, t.armor);
+  }
+  return dmg;
+}
+function creditKill(killer) {
+  const rank = killer.rank ?? "rookie";
+  const r = addKill(rank, killer.kills ?? RANK_THRESHOLDS[rank], killer.id);
+  killer.kills = r.kills;
+  killer.rank = r.rank;
 }
 function segIntersectsRect(x1, y1, x2, y2, rx0, ry0, rx1, ry1) {
   let lo = 0;
@@ -127,6 +179,7 @@ function stepCombat(all, dt, opts = {}) {
     if (applyDamage(target, dmg)) {
       events.push({ type: "death", id: target.id });
       if (a.targetId === target.id) a.targetId = null;
+      creditKill(a);
     }
     const r = a.splashRadius ?? 0;
     if (splash && r > 0) {
@@ -137,7 +190,10 @@ function stepCombat(all, dt, opts = {}) {
         const vd = effectiveDamage(a, v, counters) * (1 - d / r);
         if (!(vd > 0)) continue;
         events.push({ type: "hit", from: a.id, to: v.id, damage: vd });
-        if (applyDamage(v, vd)) events.push({ type: "death", id: v.id });
+        if (applyDamage(v, vd)) {
+          events.push({ type: "death", id: v.id });
+          creditKill(a);
+        }
       }
     }
     a.cooldown = a.cooldownMax;
@@ -302,6 +358,58 @@ test("focus fire keeps the lock, then re-picks the nearest threat on death", () 
   assert.deepEqual(stepCombat([c, unreachable, inRange], 0.1, { focusFire: true }), []);
   assert.equal(c.targetId, 30);
   assert.equal(inRange.hp, 100);
+});
+test("veterancy: elite out-damages rookie and shrugs off more hits", () => {
+  const target = () => combatant({ id: 2, x: 30, team: "enemy", hp: 400, maxHp: 400, cooldown: 100 });
+  const rookie = combatant({ id: 1, damage: 10, rank: "rookie", kills: 0 });
+  const elite = combatant({ id: 3, damage: 10, rank: "elite", kills: 8 });
+  assert.ok(Math.abs(effectiveDamage(rookie, target()) - 10) <= 1);
+  assert.ok(Math.abs(effectiveDamage(elite, target()) - 13) <= 1);
+  const t1 = target();
+  const ev = stepCombat([rookie, t1], 0.1);
+  assert.deepEqual(ev, [{ type: "hit", from: 1, to: 2, damage: 10 }]);
+  assert.equal(t1.hp, 390);
+  const rookieTarget = combatant({ id: 4, x: 30, team: "enemy", hp: 400, maxHp: 400, cooldown: 100, rank: "rookie" });
+  const eliteTarget = combatant({ id: 5, x: 30, team: "enemy", hp: 400, maxHp: 400, cooldown: 100, rank: "elite" });
+  assert.ok(Math.abs(effectiveDamage(rookie, rookieTarget) - 10) <= 1);
+  assert.ok(Math.abs(effectiveDamage(rookie, eliteTarget) - 8) <= 1);
+});
+test("veterancy: rankless combatants hit exactly as before and earn kills", () => {
+  drainPromotions();
+  const a = combatant({ id: 1, damage: 50 });
+  const t = combatant({ id: 2, x: 10, team: "enemy", hp: 20 });
+  assert.equal(effectiveDamage(a, t), 50);
+  const events = stepCombat([a, t], 0.1);
+  assert.deepEqual(events, [
+    { type: "hit", from: 1, to: 2, damage: 50 },
+    { type: "death", id: 2 }
+  ]);
+  assert.equal(a.kills, 1);
+  assert.equal(a.rank, "rookie");
+  assert.deepEqual(drainPromotions(), []);
+});
+test("veterancy: crossing a threshold promotes and queues the event", () => {
+  drainPromotions();
+  const a = combatant({ id: 7, damage: 50, kills: 2, rank: "rookie" });
+  const t = combatant({ id: 2, x: 10, team: "enemy", hp: 20 });
+  stepCombat([a, t], 0.1);
+  assert.equal(a.kills, 3);
+  assert.equal(a.rank, "veteran");
+  assert.deepEqual(drainPromotions(), [{ from: "rookie", to: "veteran", unitId: 7 }]);
+  assert.deepEqual(drainPromotions(), []);
+  const t2 = combatant({ id: 3, x: 10, team: "enemy", hp: 400, maxHp: 400, cooldown: 100 });
+  const vet = combatant({ id: 8, damage: 10, kills: 3, rank: "veteran" });
+  assert.ok(Math.abs(effectiveDamage(vet, t2) - 11.5) <= 1);
+});
+test("veterancy: splash kills credit the shooter too", () => {
+  drainPromotions();
+  const a = combatant({ id: 1, x: 0, y: 0, range: 400, damage: 40, splashRadius: 100, kills: 2, rank: "rookie" });
+  const primary = combatant({ id: 2, x: 300, y: 0, team: "enemy", hp: 10, cooldown: 100 });
+  const bystander = combatant({ id: 3, x: 320, y: 0, team: "enemy", hp: 10, cooldown: 100 });
+  stepCombat([a, primary, bystander], 0.1, { splash: true });
+  assert.equal(a.kills, 4);
+  assert.equal(a.rank, "veteran");
+  assert.deepEqual(drainPromotions(), [{ from: "rookie", to: "veteran", unitId: 1 }]);
 });
 test("a building on the fire line blocks the shot", () => {
   const block = { id: 9, kind: "power", gx: 2, gy: 2, hp: 400, maxHp: 400, done: true };

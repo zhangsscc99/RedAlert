@@ -67,6 +67,8 @@ export function rankProgress(kills: number): RankProgress {
 export interface Promotion {
   from: Rank;
   to: Rank;
+  // Id of the promoted unit, present only when the caller supplied one.
+  unitId?: number;
 }
 
 const promotionQueue: Promotion[] = [];
@@ -85,8 +87,9 @@ export interface KillResult {
 
 // Record a kill. `kills` is the unit's current kill count; when omitted we
 // assume the unit is one kill shy of its next rank (the common UI/test case:
-// addKill('rookie') promotes to veteran).
-export function addKill(rank: Rank, kills?: number): KillResult {
+// addKill('rookie') promotes to veteran). `unitId`, when given, is stamped on
+// the queued Promotion so consumers of drainPromotions know who ranked up.
+export function addKill(rank: Rank, kills?: number, unitId?: number): KillResult {
   const before =
     kills !== undefined
       ? Math.max(0, Math.floor(kills))
@@ -95,7 +98,9 @@ export function addKill(rank: Rank, kills?: number): KillResult {
   const newRank = rankFromKills(after);
   const promoted = newRank !== rank;
   if (promoted) {
-    promotionQueue.push({ from: rank, to: newRank });
+    promotionQueue.push(
+      unitId === undefined ? { from: rank, to: newRank } : { from: rank, to: newRank, unitId },
+    );
   }
   return { kills: after, rank: newRank, promoted };
 }

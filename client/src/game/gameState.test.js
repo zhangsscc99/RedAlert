@@ -446,6 +446,49 @@ function segBoxDist(px, py, qx, qy, bx, by) {
   );
 }
 
+// src/game/veterancy.ts
+var RANKS = ["rookie", "veteran", "elite"];
+var RANK_THRESHOLDS = {
+  rookie: 0,
+  veteran: 3,
+  elite: 8
+};
+var RANK_DAMAGE = { rookie: 1, veteran: 1.15, elite: 1.3 };
+var RANK_ARMOR = { rookie: 1, veteran: 0.9, elite: 0.8 };
+var RANK_SPEED = { rookie: 1, veteran: 1.05, elite: 1.1 };
+function damageMultiplier(rank) {
+  return RANK_DAMAGE[rank];
+}
+function armorMultiplier(rank) {
+  return RANK_ARMOR[rank];
+}
+function speedMultiplier(rank) {
+  return RANK_SPEED[rank];
+}
+function rankFromKills(kills) {
+  const k = Math.max(0, Math.floor(kills));
+  if (k >= RANK_THRESHOLDS.elite) return "elite";
+  if (k >= RANK_THRESHOLDS.veteran) return "veteran";
+  return "rookie";
+}
+var promotionQueue = [];
+function addKill(rank, kills, unitId) {
+  const before = kills !== void 0 ? Math.max(0, Math.floor(kills)) : Math.max(0, (RANK_THRESHOLDS[nextRank(rank) ?? rank] ?? 0) - 1);
+  const after = before + 1;
+  const newRank = rankFromKills(after);
+  const promoted = newRank !== rank;
+  if (promoted) {
+    promotionQueue.push(
+      unitId === void 0 ? { from: rank, to: newRank } : { from: rank, to: newRank, unitId }
+    );
+  }
+  return { kills: after, rank: newRank, promoted };
+}
+function nextRank(rank) {
+  const idx2 = RANKS.indexOf(rank);
+  return idx2 >= 0 && idx2 < RANKS.length - 1 ? RANKS[idx2 + 1] : null;
+}
+
 // src/game/units.ts
 var UNIT_STATS = {
   infantry: { hp: 50, speed: 70, cost: 100, buildTime: 4, radius: 9, canHarvest: false },
@@ -456,7 +499,7 @@ var UNIT_RADIUS = UNIT_STATS.infantry.radius;
 var INFANTRY_SPEED = UNIT_STATS.infantry.speed;
 function updateUnits(units, dt) {
   for (const u of units) {
-    let remaining = u.speed * dt;
+    let remaining = u.speed * speedMultiplier(u.rank ?? "rookie") * dt;
     while (remaining > 0) {
       const target = u.path[0];
       if (!target) break;
@@ -571,7 +614,7 @@ var DAMAGE_MATRIX = {
   bullet: { infantry: 1, vehicle: 0.5, building: 0.5 },
   rocket: { infantry: 0.5, vehicle: 2, building: 2.5 }
 };
-function damageMultiplier(weapon, armor) {
+function damageMultiplier2(weapon, armor) {
   return DAMAGE_MATRIX[weapon]?.[armor] ?? 0;
 }
 var ROLE_STATS = {
@@ -630,8 +673,18 @@ function dist(a, b) {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
 function effectiveDamage(a, t, counters = false) {
-  if (!counters || a.weapon == null || t.armor === void 0) return a.damage;
-  return a.damage * damageMultiplier(a.weapon, t.armor);
+  let dmg = a.damage * damageMultiplier(a.rank ?? "rookie");
+  dmg *= armorMultiplier(t.rank ?? "rookie");
+  if (counters && a.weapon != null && t.armor !== void 0) {
+    dmg *= damageMultiplier2(a.weapon, t.armor);
+  }
+  return dmg;
+}
+function creditKill(killer) {
+  const rank = killer.rank ?? "rookie";
+  const r = addKill(rank, killer.kills ?? RANK_THRESHOLDS[rank], killer.id);
+  killer.kills = r.kills;
+  killer.rank = r.rank;
 }
 function segIntersectsRect(x1, y1, x2, y2, rx0, ry0, rx1, ry1) {
   let lo = 0;
@@ -725,6 +778,7 @@ function stepCombat(all, dt, opts = {}) {
     if (applyDamage(target, dmg)) {
       events.push({ type: "death", id: target.id });
       if (a.targetId === target.id) a.targetId = null;
+      creditKill(a);
     }
     const r = a.splashRadius ?? 0;
     if (splash && r > 0) {
@@ -735,7 +789,10 @@ function stepCombat(all, dt, opts = {}) {
         const vd = effectiveDamage(a, v, counters) * (1 - d / r);
         if (!(vd > 0)) continue;
         events.push({ type: "hit", from: a.id, to: v.id, damage: vd });
-        if (applyDamage(v, vd)) events.push({ type: "death", id: v.id });
+        if (applyDamage(v, vd)) {
+          events.push({ type: "death", id: v.id });
+          creditKill(a);
+        }
       }
     }
     a.cooldown = a.cooldownMax;
@@ -944,7 +1001,7 @@ function pickTrainKind(s, intel) {
   const score = (kind) => {
     let sum = 0;
     for (const armor of ARMOR_TYPES) {
-      sum += (counts[armor] ?? 0) * damageMultiplier(AI_WEAPON[kind], armor);
+      sum += (counts[armor] ?? 0) * damageMultiplier2(AI_WEAPON[kind], armor);
     }
     return sum;
   };
@@ -1377,13 +1434,22 @@ function isLowPower(power) {
 }
 
 // src/game/save.ts
-var SAVE_VERSION = 2;
-var cloneUnit = (u) => ({ id: u.id, kind: u.kind, x: u.x, y: u.y, hp: u.hp });
+var SAVE_VERSION = 3;
+var cloneUnit = (u) => {
+  const c = { id: u.id, kind: u.kind, x: u.x, y: u.y, hp: u.hp };
+  if (u.kills !== void 0) c.kills = u.kills;
+  return c;
+};
 var cloneBuilding = (b) => {
   const c = { id: b.id, kind: b.kind, gx: b.gx, gy: b.gy, hp: b.hp };
   if (b.done !== void 0) c.done = b.done;
+  if (b.level !== void 0) c.level = b.level;
+  if (b.repair !== void 0) c.repair = b.repair;
   return c;
 };
+var cloneStats = (s) => ({ ...s });
+var cloneWeather = (w) => ({ ...w });
+var cloneRadar = (r) => ({ ...r });
 function snapshot(input) {
   const s = {
     version: SAVE_VERSION,
@@ -1398,6 +1464,12 @@ function snapshot(input) {
   if (input.ai) s.ai = { ...input.ai };
   if (input.camera) s.camera = { ...input.camera };
   if (input.opts) s.opts = { ...input.opts };
+  if (input.fog) s.fog = { w: input.fog.w, h: input.fog.h, explored: Array.from(input.fog.explored) };
+  if (input.stats) s.stats = cloneStats(input.stats);
+  if (input.wave !== void 0) s.wave = input.wave;
+  if (input.difficulty !== void 0) s.difficulty = input.difficulty;
+  if (input.weather) s.weather = cloneWeather(input.weather);
+  if (input.radar) s.radar = cloneRadar(input.radar);
   return s;
 }
 
