@@ -16,6 +16,7 @@ import { createEconomy, type Economy } from './economy.js';
 import {
   createHarvester,
   updateHarvesters,
+  harvesterStatus,
   HARVEST_CAPACITY,
   ORE_RESERVE,
   STUCK_SECONDS,
@@ -334,4 +335,106 @@ test('a harvester that cannot move re-plans instead of spinning forever', () => 
   } finally {
     UNIT_STATS.harvester.speed = speed;
   }
+});
+
+test('a harvester stuck en route twice switches to another vein', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  setTerrain(map, 12, 8, ORE); // nearer: first claim
+  setTerrain(map, 20, 8, ORE); // farther: fallback after repeated strikes
+  const h = createHarvester(unitAt('harvester', 8, 8));
+  const econ = createEconomy(0);
+
+  updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, 'toOre');
+  assert.deepEqual(h.target, { x: 12, y: 8 });
+
+  const speed = UNIT_STATS.harvester.speed;
+  UNIT_STATS.harvester.speed = 0;
+  try {
+    const perStrike = Math.ceil(STUCK_SECONDS / 0.2);
+    // First watchdog strike re-plans the same vein...
+    for (let i = 0; i < perStrike + 1; i++) updateHarvesters([h], map, [refinery], econ, 0.2);
+    assert.deepEqual(h.target, { x: 12, y: 8 });
+    // ...the second strike gives up on it and takes the fallback vein.
+    for (let i = 0; i < perStrike + 1; i++) updateHarvesters([h], map, [refinery], econ, 0.2);
+    assert.equal(h.state, 'toOre');
+    assert.deepEqual(h.target, { x: 20, y: 8 });
+  } finally {
+    UNIT_STATS.harvester.speed = speed;
+  }
+});
+
+test('a lone stuck harvester with no other vein goes idle rather than spin', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  const h = createHarvester(unitAt('harvester', 8, 8));
+  const econ = createEconomy(0);
+  // Force a toOre leg with a path that cannot complete: target a vein that
+  // is reachable, then freeze speed so the watchdog eventually exhausts.
+  setTerrain(map, 16, 8, ORE);
+  updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, 'toOre');
+
+  // Remove the vein mid-travel: next watchdog strike has nowhere to go.
+  setTerrain(map, 16, 8, GRASS);
+  const speed = UNIT_STATS.harvester.speed;
+  UNIT_STATS.harvester.speed = 0;
+  try {
+    const ticks = 2 * Math.ceil(STUCK_SECONDS / 0.2) + 4;
+    for (let i = 0; i < ticks; i++) updateHarvesters([h], map, [refinery], econ, 0.2);
+    assert.equal(h.state, 'idle');
+    assert.equal(harvesterStatus(h), 'depleted');
+  } finally {
+    UNIT_STATS.harvester.speed = speed;
+  }
+});
+
+test('harvesterStatus maps each phase to a UI label', () => {
+  const h = createHarvester(unitAt('harvester', 5, 5));
+  assert.equal(harvesterStatus(h), 'standby');
+
+  h.state = 'toOre';
+  assert.equal(harvesterStatus(h), 'mining');
+  h.state = 'mining';
+  assert.equal(harvesterStatus(h), 'mining');
+
+  h.state = 'toRefinery';
+  assert.equal(harvesterStatus(h), 'hauling');
+  h.state = 'unloading';
+  assert.equal(harvesterStatus(h), 'unloading');
+
+  h.state = 'idle';
+  h.noOre = true;
+  assert.equal(harvesterStatus(h), 'depleted');
+  h.noOre = false;
+  assert.equal(harvesterStatus(h), 'standby');
+});
+
+test('empty field reports depleted instead of standby', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  const h = createHarvester(unitAt('harvester', 8, 8));
+  const econ = createEconomy(0);
+
+  drive([h], map, [refinery], econ, 5);
+  assert.equal(h.state, 'idle');
+  assert.equal(h.noOre, true);
+  assert.equal(harvesterStatus(h), 'depleted');
+});
+
+test('a harvester waiting behind a claimed vein stays standby, not depleted', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  const h1 = createHarvester(unitAt('harvester', 9, 8));
+  const h2 = createHarvester(unitAt('harvester', 9, 6));
+  h2.unit.id = 2;
+  const econ = createEconomy(0);
+
+  for (let i = 0; i < 3; i++) updateHarvesters([h1, h2], map, [refinery], econ, 0.2);
+
+  assert.equal(h1.state, 'mining');
+  assert.equal(h2.state, 'idle');
+  assert.equal(harvesterStatus(h2), 'standby');
 });

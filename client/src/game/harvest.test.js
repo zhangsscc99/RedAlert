@@ -193,13 +193,34 @@ var UNIT_RADIUS = UNIT_STATS.infantry.radius;
 var INFANTRY_SPEED = UNIT_STATS.infantry.speed;
 
 // src/game/economy.ts
-function createEconomy(start = 5e3) {
-  return { credits: start, earned: 0, spent: 0 };
+function createEconomy(start = 5e3, opts) {
+  const cap = opts?.cap;
+  const e = {
+    credits: cap !== void 0 ? Math.min(start, cap) : start,
+    earned: 0,
+    spent: 0,
+    cap,
+    maintenanceRate: opts?.maintenanceRate,
+    passiveRate: opts?.passiveRate,
+    storageFull: false,
+    broke: false,
+    lostToCap: 0
+  };
+  return e;
 }
 function credit(e, amount) {
-  if (!(amount > 0)) return;
-  e.credits += amount;
-  e.earned += amount;
+  if (!(amount > 0)) return 0;
+  const room = e.cap !== void 0 ? Math.max(0, e.cap - e.credits) : amount;
+  const accepted = Math.min(amount, room);
+  if (accepted > 0) {
+    e.credits += accepted;
+    e.earned += accepted;
+  }
+  if (accepted < amount) {
+    e.storageFull = true;
+    e.lostToCap = (e.lostToCap ?? 0) + (amount - accepted);
+  }
+  return accepted;
 }
 
 // src/game/buildings.ts
@@ -219,8 +240,34 @@ var HARVEST_CAPACITY = 700;
 var ORE_RESERVE = 350;
 var STUCK_SECONDS = 3;
 var STUCK_EPS = 1;
+var MAX_MINERS_PER_TILE = 1;
+var CLAIM_PENALTY = 4;
+var REPLAN_BEFORE_SWITCH = 1;
 function createHarvester(unit) {
-  return { unit, state: "idle", cargo: 0, target: null, stuckT: 0, lastX: unit.x, lastY: unit.y };
+  return {
+    unit,
+    state: "idle",
+    cargo: 0,
+    target: null,
+    noOre: false,
+    replans: 0,
+    stuckT: 0,
+    lastX: unit.x,
+    lastY: unit.y
+  };
+}
+function harvesterStatus(h) {
+  switch (h.state) {
+    case "toOre":
+    case "mining":
+      return "mining";
+    case "toRefinery":
+      return "hauling";
+    case "unloading":
+      return "unloading";
+    default:
+      return h.noOre ? "depleted" : "standby";
+  }
 }
 var reservesByMap = /* @__PURE__ */ new WeakMap();
 function reserveTable(map) {
@@ -292,6 +339,7 @@ function resetWatchdog(h) {
 function toIdle(h) {
   h.state = "idle";
   h.target = null;
+  h.replans = 0;
   h.unit.path = [];
   resetWatchdog(h);
 }
@@ -319,15 +367,25 @@ function standTileFor(map, ore, ux, uy, blocked) {
 function onOreEdge(ux, uy, ore) {
   return Math.max(Math.abs(ux - ore.x), Math.abs(uy - ore.y)) <= 1;
 }
-function sendToOre(h, map, reserves, claims, blockers, blocked) {
+function oreScore(d2, claimants, reserve) {
+  const crowd = 1 + claimants * CLAIM_PENALTY;
+  const richness = 0.25 + reserve / ORE_RESERVE;
+  return d2 * crowd / richness;
+}
+function sendToOre(h, map, reserves, claims, blockers, blocked, exclude) {
   const ux = worldToTile(h.unit.x);
   const uy = worldToTile(h.unit.y);
   const own = h.target && (h.state === "toOre" || h.state === "mining") ? idx(map, h.target.x, h.target.y) : -1;
-  const candidates = oreTiles(map).filter((t) => {
+  const scored = oreTiles(map).map((t) => {
     const i = idx(map, t.x, t.y);
-    return reserves[i] > 0 && (!claims.has(i) || i === own);
-  }).sort((a, b) => (a.x - ux) ** 2 + (a.y - uy) ** 2 - ((b.x - ux) ** 2 + (b.y - uy) ** 2));
-  for (const ore of candidates) {
+    const reserve = reserves[i];
+    const claimants = (claims.get(i) ?? 0) - (i === own ? 1 : 0);
+    const d2 = (t.x - ux) ** 2 + (t.y - uy) ** 2;
+    return { t, i, reserve, claimants, score: oreScore(d2, claimants, reserve) };
+  }).filter((c) => c.reserve > 0 && !(exclude?.has(c.i) ?? false));
+  if (scored.length === 0) h.noOre = true;
+  const candidates = scored.filter((c) => c.claimants < MAX_MINERS_PER_TILE).sort((a, b) => a.score - b.score);
+  for (const { t: ore, i } of candidates) {
     if (onOreEdge(ux, uy, ore)) {
       h.target = { x: ore.x, y: ore.y };
       h.state = "mining";
@@ -338,8 +396,10 @@ function sendToOre(h, map, reserves, claims, blockers, blocked) {
       h.target = { x: ore.x, y: ore.y };
       h.state = "toOre";
     }
-    if (own >= 0) claims.delete(own);
-    claims.add(idx(map, ore.x, ore.y));
+    if (own >= 0) claims.set(own, (claims.get(own) ?? 1) - 1);
+    claims.set(i, (claims.get(i) ?? 0) + 1);
+    if (i !== own) h.replans = 0;
+    h.noOre = false;
     resetWatchdog(h);
     return true;
   }
@@ -391,10 +451,11 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles) {
   const reserves = reserveTable(map);
   const blockers = buildingBlockers(obstacles ?? buildings);
   const blocked = blockedTiles(map, blockers);
-  const claims = /* @__PURE__ */ new Set();
+  const claims = /* @__PURE__ */ new Map();
   for (const h of hs) {
     if (h.unit.kind === "harvester" && (h.state === "toOre" || h.state === "mining") && h.target !== null && isOre(map, h.target.x, h.target.y)) {
-      claims.add(idx(map, h.target.x, h.target.y));
+      const i = idx(map, h.target.x, h.target.y);
+      claims.set(i, (claims.get(i) ?? 0) + 1);
     }
   }
   for (const h of hs) {
@@ -408,7 +469,18 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles) {
       h.lastY = h.unit.y;
       if (stuckT >= STUCK_SECONDS) {
         h.unit.path = [];
-        const ok = h.state === "toOre" ? sendToOre(h, map, reserves, claims, blockers, blocked) : sendToRefinery(h, map, buildings, blockers);
+        let ok;
+        if (h.state === "toOre") {
+          h.replans = (h.replans ?? 0) + 1;
+          const cur = h.target !== null ? idx(map, h.target.x, h.target.y) : -1;
+          ok = false;
+          if (h.replans > REPLAN_BEFORE_SWITCH && cur >= 0) {
+            ok = sendToOre(h, map, reserves, claims, blockers, blocked, /* @__PURE__ */ new Set([cur]));
+          }
+          if (!ok) ok = sendToOre(h, map, reserves, claims, blockers, blocked);
+        } else {
+          ok = sendToRefinery(h, map, buildings, blockers);
+        }
         if (!ok) toIdle(h);
         continue;
       }
@@ -731,4 +803,87 @@ test("a harvester that cannot move re-plans instead of spinning forever", () => 
   } finally {
     UNIT_STATS.harvester.speed = speed;
   }
+});
+test("a harvester stuck en route twice switches to another vein", () => {
+  const map = openMap();
+  const refinery = building("refinery", 2, 2);
+  setTerrain(map, 12, 8, ORE);
+  setTerrain(map, 20, 8, ORE);
+  const h = createHarvester(unitAt("harvester", 8, 8));
+  const econ = createEconomy(0);
+  updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, "toOre");
+  assert.deepEqual(h.target, { x: 12, y: 8 });
+  const speed = UNIT_STATS.harvester.speed;
+  UNIT_STATS.harvester.speed = 0;
+  try {
+    const perStrike = Math.ceil(STUCK_SECONDS / 0.2);
+    for (let i = 0; i < perStrike + 1; i++) updateHarvesters([h], map, [refinery], econ, 0.2);
+    assert.deepEqual(h.target, { x: 12, y: 8 });
+    for (let i = 0; i < perStrike + 1; i++) updateHarvesters([h], map, [refinery], econ, 0.2);
+    assert.equal(h.state, "toOre");
+    assert.deepEqual(h.target, { x: 20, y: 8 });
+  } finally {
+    UNIT_STATS.harvester.speed = speed;
+  }
+});
+test("a lone stuck harvester with no other vein goes idle rather than spin", () => {
+  const map = openMap();
+  const refinery = building("refinery", 2, 2);
+  const h = createHarvester(unitAt("harvester", 8, 8));
+  const econ = createEconomy(0);
+  setTerrain(map, 16, 8, ORE);
+  updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, "toOre");
+  setTerrain(map, 16, 8, GRASS);
+  const speed = UNIT_STATS.harvester.speed;
+  UNIT_STATS.harvester.speed = 0;
+  try {
+    const ticks = 2 * Math.ceil(STUCK_SECONDS / 0.2) + 4;
+    for (let i = 0; i < ticks; i++) updateHarvesters([h], map, [refinery], econ, 0.2);
+    assert.equal(h.state, "idle");
+    assert.equal(harvesterStatus(h), "depleted");
+  } finally {
+    UNIT_STATS.harvester.speed = speed;
+  }
+});
+test("harvesterStatus maps each phase to a UI label", () => {
+  const h = createHarvester(unitAt("harvester", 5, 5));
+  assert.equal(harvesterStatus(h), "standby");
+  h.state = "toOre";
+  assert.equal(harvesterStatus(h), "mining");
+  h.state = "mining";
+  assert.equal(harvesterStatus(h), "mining");
+  h.state = "toRefinery";
+  assert.equal(harvesterStatus(h), "hauling");
+  h.state = "unloading";
+  assert.equal(harvesterStatus(h), "unloading");
+  h.state = "idle";
+  h.noOre = true;
+  assert.equal(harvesterStatus(h), "depleted");
+  h.noOre = false;
+  assert.equal(harvesterStatus(h), "standby");
+});
+test("empty field reports depleted instead of standby", () => {
+  const map = openMap();
+  const refinery = building("refinery", 2, 2);
+  const h = createHarvester(unitAt("harvester", 8, 8));
+  const econ = createEconomy(0);
+  drive([h], map, [refinery], econ, 5);
+  assert.equal(h.state, "idle");
+  assert.equal(h.noOre, true);
+  assert.equal(harvesterStatus(h), "depleted");
+});
+test("a harvester waiting behind a claimed vein stays standby, not depleted", () => {
+  const map = openMap();
+  const refinery = building("refinery", 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  const h1 = createHarvester(unitAt("harvester", 9, 8));
+  const h2 = createHarvester(unitAt("harvester", 9, 6));
+  h2.unit.id = 2;
+  const econ = createEconomy(0);
+  for (let i = 0; i < 3; i++) updateHarvesters([h1, h2], map, [refinery], econ, 0.2);
+  assert.equal(h1.state, "mining");
+  assert.equal(h2.state, "idle");
+  assert.equal(harvesterStatus(h2), "standby");
 });

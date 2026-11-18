@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import {
   createEconomy,
   canAfford,
+  afford,
   spend,
   credit,
+  incomeTick,
   createQueue,
   enqueue,
   cancel,
@@ -158,4 +160,92 @@ test('spent/earned/credits stay consistent across spend, credit and refund', () 
   assert.equal(e.earned, 500); // 200 收入 + 300 退款
   assert.equal(e.spent, 450); // 150 + 300 均记为支出
   assert.equal(e.credits, 500 + 500 - 450); // = 起始 + earned - spent
+});
+
+test('credit respects cap: overflow is dropped and storageFull is raised', () => {
+  const e = createEconomy(900, { cap: 1000 });
+  const accepted = credit(e, 500);
+  assert.equal(accepted, 100);
+  assert.equal(e.credits, 1000);
+  assert.equal(e.earned, 100); // dropped income never reaches the ledger
+  assert.equal(e.storageFull, true);
+  assert.equal(e.lostToCap, 400);
+
+  // Further income while full is entirely rejected.
+  assert.equal(credit(e, 50), 0);
+  assert.equal(e.credits, 1000);
+  assert.equal(e.lostToCap, 450);
+});
+
+test('storageFull clears once spending frees room', () => {
+  const e = createEconomy(1000, { cap: 1000 });
+  credit(e, 200);
+  assert.equal(e.storageFull, true);
+  assert.equal(spend(e, 300), true);
+  assert.equal(e.storageFull, false);
+  // Room again: income flows normally.
+  assert.equal(credit(e, 100), 100);
+  assert.equal(e.credits, 800);
+});
+
+test('createEconomy clamps starting credits to the cap', () => {
+  const e = createEconomy(9999, { cap: 1000 });
+  assert.equal(e.credits, 1000);
+});
+
+test('incomeTick charges maintenance per building per second', () => {
+  const e = createEconomy(1000, { maintenanceRate: 5 });
+  incomeTick(e, 1, 4); // 5 * 4 * 1 = 20
+  assert.equal(e.credits, 980);
+  assert.equal(e.broke, false);
+
+  incomeTick(e, 0.5, 4); // 5 * 4 * 0.5 = 10
+  assert.equal(e.credits, 970);
+});
+
+test('incomeTick can push credits negative and flags broke, without hard damage', () => {
+  const e = createEconomy(10, { maintenanceRate: 10 });
+  incomeTick(e, 1, 3); // -30
+  assert.equal(e.credits, -20);
+  assert.equal(e.broke, true);
+
+  // 只标记：仍能继续 tick 与收款
+  incomeTick(e, 1, 0);
+  assert.equal(e.credits, -20);
+  credit(e, 100);
+  incomeTick(e, 1, 0);
+  assert.equal(e.broke, false);
+});
+
+test('broke boundary: exactly zero credits is not broke', () => {
+  const e = createEconomy(20, { maintenanceRate: 10 });
+  incomeTick(e, 1, 2); // exactly -20 → 0
+  assert.equal(e.credits, 0);
+  assert.equal(e.broke, false);
+  incomeTick(e, 0.1, 2); // -2 → negative
+  assert.equal(e.credits, -2);
+  assert.equal(e.broke, true);
+});
+
+test('incomeTick ignores non-positive dt and defaults to zero buildings', () => {
+  const e = createEconomy(100, { maintenanceRate: 5, passiveRate: 10 });
+  incomeTick(e, 0, 10);
+  incomeTick(e, -1, 10);
+  assert.equal(e.credits, 100);
+  incomeTick(e, 1); // no buildingCount → no upkeep, passive +10
+  assert.equal(e.credits, 110);
+});
+
+test('passive income respects the cap as well', () => {
+  const e = createEconomy(95, { cap: 100, passiveRate: 50 });
+  incomeTick(e, 1);
+  assert.equal(e.credits, 100);
+  assert.equal(e.storageFull, true);
+});
+
+test('afford mirrors canAfford', () => {
+  const e = createEconomy(100);
+  assert.equal(afford(e, 100), true);
+  assert.equal(afford(e, 101), false);
+  assert.equal(afford(e, -1), false);
 });
