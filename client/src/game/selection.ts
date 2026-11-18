@@ -40,7 +40,8 @@ export function unitAt(units: readonly Unit[], p: Point, radius: number): Unit |
 }
 
 export function unitsInRect(units: readonly Unit[], r: Rect): Unit[] {
-  return units.filter((u) => pointInRect(u, r));
+  // 按 id 升序排序，保证框选结果顺序稳定（与输入顺序无关）。
+  return units.filter((u) => pointInRect(u, r)).sort((a, b) => a.id - b.id);
 }
 
 /**
@@ -57,4 +58,37 @@ export function selectUnits(
   if (picked === null) return;
   const list = Array.isArray(picked) ? picked : [picked];
   for (const u of list) u.selected = true;
+}
+
+/**
+ * 同类判定：当前 Unit 尚无 `kind` 字段，用稳定字段（speed）判同类。
+ * 后续若加了 kind/type 字段，优先在这里改。
+ */
+function kindOf(u: Unit): string | number {
+  const k = (u as { kind?: string | number }).kind;
+  return k !== undefined ? k : u.speed;
+}
+
+/**
+ * 双击选同类：清除现有选中，选中所有与 sample 同类的单位，返回选中数。
+ */
+export function selectSameKind(units: Unit[], sample: Unit): number {
+  const kind = kindOf(sample);
+  let n = 0;
+  for (const u of units) {
+    u.selected = kindOf(u) === kind;
+    if (u.selected) n++;
+  }
+  return n;
+}
+
+/** Ctrl+A 全选：选中所有单位，返回选中数。 */
+export function selectAll(units: Unit[]): number {
+  for (const u of units) u.selected = true;
+  return units.length;
+}
+
+/** 切换单个单位的选中状态。 */
+export function toggleSelect(u: Unit): void {
+  u.selected = !u.selected;
 }
