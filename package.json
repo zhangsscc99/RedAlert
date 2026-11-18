@@ -1,0 +1,15 @@
+{
+  "name": "redalert",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "build": "npm run build -w redalert-client",
+    "typecheck": "npm run typecheck -w redalert-client",
+    "test": "bash scripts/build-tests.sh && node --test client/src/game/",
+    "deploy": "bash scripts/ci-deploy.sh"
+  }
+}

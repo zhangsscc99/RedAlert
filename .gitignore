@@ -1,0 +1,7 @@
+node_modules/
+dist/
+test-build/
+data/
+*.log
+server/dist.bak-*/
+.DS_Store
