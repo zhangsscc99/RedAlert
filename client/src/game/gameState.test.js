@@ -102,6 +102,10 @@ function idx(map, x, y) {
 function inBounds(map, x, y) {
   return x >= 0 && y >= 0 && x < map.w && y < map.h;
 }
+function tileAt(map, x, y) {
+  if (!inBounds(map, x, y)) return WATER;
+  return map.tiles[idx(map, x, y)] ?? WATER;
+}
 function isPassable(map, x, y) {
   return inBounds(map, x, y) && map.tiles[idx(map, x, y)] === GRASS;
 }
@@ -934,12 +938,18 @@ var ROLE_STATS = {
 function dist(a, b) {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
-function effectiveDamage(a, t, counters = false) {
+function effectiveDamage(a, t, counters = false, cover) {
   let dmg = a.damage * damageMultiplier(a.rank ?? "rookie");
   dmg *= armorMultiplier(t.rank ?? "rookie");
   if (counters && a.weapon != null && t.armor !== void 0) {
     dmg *= damageMultiplier2(a.weapon, t.armor);
   }
+  if (a.antiInfantry !== void 0 && t.armor === "infantry") dmg *= a.antiInfantry;
+  if (a.antiArmor !== void 0 && (t.armor === "vehicle" || t.armor === "building")) {
+    dmg *= a.antiArmor;
+  }
+  const cov = cover ?? t.cover;
+  if (cov !== void 0) dmg *= TERRAIN_COVER[cov];
   return dmg;
 }
 function creditKill(killer) {
@@ -1008,11 +1018,49 @@ function applySuppression(t, amount) {
   return t.suppression;
 }
 function suppressionModifiers(c) {
+  if (suppressionTier(c) === "none") return { accuracy: 1, speed: 1 };
   const s = Math.min(SUPPRESSION_MAX, Math.max(0, c.suppression ?? 0));
   return {
     accuracy: 1 - s * (1 - SUPPRESSION_MIN_ACCURACY),
     speed: 1 - s * (1 - SUPPRESSION_MIN_SPEED)
   };
+}
+var SUPPRESSION_MILD_THRESHOLD = 30;
+var SUPPRESSION_SEVERE_THRESHOLD = 70;
+function suppressionLevel(c) {
+  const s = Math.min(SUPPRESSION_MAX, Math.max(0, c.suppression ?? 0));
+  return Math.round(s * 100);
+}
+function suppressionTier(c) {
+  const l = suppressionLevel(c);
+  if (l > SUPPRESSION_SEVERE_THRESHOLD) return "severe";
+  if (l >= SUPPRESSION_MILD_THRESHOLD) return "mild";
+  return "none";
+}
+var TERRAIN_COVER = {
+  open: 1,
+  woods: 0.8,
+  rock: 0.7,
+  urban: 0.6,
+  water: 1.25
+};
+function tileCover(t) {
+  return t === WATER ? "water" : "open";
+}
+function coverAt(map, wx, wy) {
+  return tileCover(tileAt(map, worldToTile(wx), worldToTile(wy)));
+}
+function splashFalloff(d, radius) {
+  if (radius <= 0 || d >= radius) return 0;
+  return 1 - d / radius;
+}
+var STANCE_PROFILES = {
+  aggressive: { acquireFactor: 1, pursues: true, returnsFire: true },
+  defensive: { acquireFactor: 0.75, pursues: false, returnsFire: true },
+  hold: { acquireFactor: 0.5, pursues: false, returnsFire: true }
+};
+function stanceProfile(c) {
+  return STANCE_PROFILES[c.stance ?? "aggressive"];
 }
 function applyDamage(t, dmg) {
   t.hp = Math.max(0, t.hp - dmg);
@@ -1023,17 +1071,27 @@ function stepCombat(all, dt, opts = {}) {
   const splash = opts.splash === true;
   const focusFire = opts.focusFire === true;
   const suppression = opts.suppression === true;
+  const stances = opts.stances === true;
   const occluders = opts.occluders;
+  const map = opts.map;
   const events = [];
   for (const c of all) c.cooldown -= dt;
   for (const a of all) {
     if (a.hp <= 0 || a.cooldown > 0) continue;
+    const stance = stanceProfile(a);
+    const acquireR = stances ? a.range * stance.acquireFactor : a.range;
     let target = null;
-    if (focusFire && a.targetId != null) {
+    if ((focusFire || stances) && a.targetId != null) {
       const locked = all.find((c) => c.id === a.targetId);
-      if (locked !== void 0 && locked !== a && locked.team !== a.team && locked.hp > 0 && dist(a, locked) <= a.range) {
-        if (occluders !== void 0 && losBlocked(a, locked, occluders)) continue;
-        target = locked;
+      if (locked !== void 0 && locked !== a && locked.team !== a.team && locked.hp > 0) {
+        if (dist(a, locked) <= a.range) {
+          if (occluders !== void 0 && losBlocked(a, locked, occluders)) continue;
+          target = locked;
+        } else if (stances && stance.pursues) {
+          continue;
+        } else {
+          a.targetId = null;
+        }
       } else {
         a.targetId = null;
       }
@@ -1043,15 +1101,23 @@ function stepCombat(all, dt, opts = {}) {
       for (const t of all) {
         if (t === a || t.team === a.team || t.hp <= 0) continue;
         const d = dist(a, t);
-        if (d > a.range) continue;
+        if (d > acquireR) continue;
         if (occluders !== void 0 && losBlocked(a, t, occluders)) continue;
         if (d < nearest || d === nearest && target !== null && t.id < target.id) {
           nearest = d;
           target = t;
         }
       }
+      if (!target && stances && stance.returnsFire && a.lastAttackerId != null) {
+        const atk = all.find((c) => c.id === a.lastAttackerId);
+        if (atk !== void 0 && atk !== a && atk.team !== a.team && atk.hp > 0 && dist(a, atk) <= a.range && (occluders === void 0 || !losBlocked(a, atk, occluders))) {
+          target = atk;
+        } else {
+          a.lastAttackerId = void 0;
+        }
+      }
       if (!target) continue;
-      if (focusFire) a.targetId = target.id;
+      if (focusFire || stances) a.targetId = target.id;
     }
     if (suppression) {
       a.accDebt = (a.accDebt ?? 0) + (1 - suppressionModifiers(a).accuracy);
@@ -1061,7 +1127,12 @@ function stepCombat(all, dt, opts = {}) {
         continue;
       }
     }
-    const dmg = effectiveDamage(a, target, counters);
+    const dmg = effectiveDamage(
+      a,
+      target,
+      counters,
+      map !== void 0 ? coverAt(map, target.x, target.y) : void 0
+    );
     events.push({ type: "hit", from: a.id, to: target.id, damage: dmg });
     if (applyDamage(target, dmg)) {
       events.push({ type: "death", id: target.id });
@@ -1072,13 +1143,20 @@ function stepCombat(all, dt, opts = {}) {
       applySuppression(target, dmg / Math.max(1, target.maxHp) * SUPPRESSION_GAIN);
       target.underFire = true;
     }
+    if (stances && target.team !== a.team) target.lastAttackerId = a.id;
     const r = a.splashRadius ?? 0;
     if (splash && r > 0) {
       for (const v of all) {
         if (v === target || v.hp <= 0) continue;
         const d = Math.hypot(v.x - target.x, v.y - target.y);
-        if (d >= r) continue;
-        const vd = effectiveDamage(a, v, counters) * (1 - d / r);
+        const falloff = splashFalloff(d, r);
+        if (falloff <= 0) continue;
+        const vd = effectiveDamage(
+          a,
+          v,
+          counters,
+          map !== void 0 ? coverAt(map, v.x, v.y) : void 0
+        ) * falloff;
         if (!(vd > 0)) continue;
         events.push({ type: "hit", from: a.id, to: v.id, damage: vd });
         if (applyDamage(v, vd)) {
@@ -1089,6 +1167,7 @@ function stepCombat(all, dt, opts = {}) {
           applySuppression(v, vd / Math.max(1, v.maxHp) * SUPPRESSION_GAIN);
           v.underFire = true;
         }
+        if (stances && v.team !== a.team) v.lastAttackerId = a.id;
       }
     }
     a.cooldown = a.cooldownMax;
