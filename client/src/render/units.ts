@@ -2,14 +2,22 @@
 // pulsing selection ring and damage-aware health bars.
 
 import {
+  TILE_SIZE,
   UNIT_RADIUS,
   UNIT_STATS,
   worldToScreen,
   type Camera,
   type Unit,
 } from '../game/index.ts';
+import { tileShadeTier } from './textures.ts';
 
 const SELECT_RING = '#5dff5d';
+
+/** Optional combat timestamps a sim may attach to a unit; absent = feature off. */
+interface UnitFx {
+  lastHitAt?: number;
+  deadAt?: number;
+}
 
 const SPRITE = 64; // body sprite canvas px — ~30px disc + anti-alias bleed
 const sprites = new Map<string, HTMLCanvasElement>();
@@ -103,21 +111,66 @@ interface UnitTrack {
   moving: boolean;
   hp: number;
   hitAt: number; // timestamp of last hp drop, for the white damage flash
+  dustAcc: number; // distance since last dust puff, world px
 }
 
 const track = new Map<number, UnitTrack>();
 
 const HIT_FLASH_MS = 150;
+const WRECK_FADE_MS = 4000; // wrecks linger then fade out
+const DUST_SPACING = 16; // world px between kicked-up puffs
+const DUST_TTL_MS = 550;
+const MAX_PUFFS = 180;
+
+interface Puff {
+  x: number;
+  y: number;
+  born: number;
+  sand: boolean;
+}
+
+const puffs: Puff[] = [];
+
+/**
+ * Same 4-tile-block hash the terrain patch pass uses (terrain.ts) so kicked
+ * dust picks up the sandy tint on warm blocks and a mossier tone elsewhere.
+ */
+function isSandyAt(wx: number, wy: number): boolean {
+  const bx = Math.floor(wx / (TILE_SIZE * 4));
+  const by = Math.floor(wy / (TILE_SIZE * 4));
+  return tileShadeTier(bx + 512, by + 1024) > 0;
+}
+
+function spawnPuff(u: Unit, now: number): void {
+  if (puffs.length >= MAX_PUFFS) puffs.shift();
+  const back = u.angle + Math.PI;
+  const jitter = (u.id * 2654435761 % 97) / 97 - 0.5;
+  puffs.push({
+    x: u.x + Math.cos(back) * 7 + Math.cos(u.angle + Math.PI / 2) * jitter * 6,
+    y: u.y + Math.sin(back) * 7 + Math.sin(u.angle + Math.PI / 2) * jitter * 6,
+    born: now,
+    sand: isSandyAt(u.x, u.y),
+  });
+}
 
 function trackUnit(u: Unit, now: number): UnitTrack {
   let t = track.get(u.id);
   if (!t) {
-    t = { x: u.x, y: u.y, dist: 0, moving: false, hp: u.hp, hitAt: -Infinity };
+    t = { x: u.x, y: u.y, dist: 0, moving: false, hp: u.hp, hitAt: -Infinity, dustAcc: 0 };
     track.set(u.id, t);
   }
   const step = Math.hypot(u.x - t.x, u.y - t.y);
   t.moving = step > 0.01;
   t.dist += step;
+  if (t.moving) {
+    t.dustAcc += step;
+    if (t.dustAcc >= DUST_SPACING) {
+      t.dustAcc %= DUST_SPACING;
+      spawnPuff(u, now);
+    }
+  } else {
+    t.dustAcc = DUST_SPACING; // first step after idling puffs right away
+  }
   t.x = u.x;
   t.y = u.y;
   if (u.hp < t.hp) t.hitAt = now;
@@ -333,6 +386,29 @@ function hpColor(pct: number): string {
   return `rgb(${r},${g},40)`;
 }
 
+/** Fading wreck: scorch smear + dark body outline, gone after WRECK_FADE_MS. */
+function drawWreck(
+  ctx: CanvasRenderingContext2D,
+  sx: number,
+  sy: number,
+  r: number,
+  alpha: number,
+): void {
+  ctx.globalAlpha = alpha;
+  ctx.beginPath();
+  ctx.ellipse(sx, sy + r * 0.15, r * 1.25, r * 0.9, 0, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(12,10,8,0.55)';
+  ctx.fill();
+  ctx.beginPath();
+  ctx.ellipse(sx, sy, r * 0.8, r * 0.55, 0.4, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(30,26,20,0.8)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(8,6,4,0.9)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
 export function drawUnits(
   ctx: CanvasRenderingContext2D,
   cam: Camera,
@@ -342,16 +418,56 @@ export function drawUnits(
   const pulse = Math.sin((now / PULSE_PERIOD) * Math.PI * 2);
   const seen = new Set<number>();
 
+  // Expire dust once per frame; oldest-first array so a scan-out is cheap.
+  while (puffs.length > 0 && now - puffs[0]!.born > DUST_TTL_MS) puffs.shift();
+  for (const p of puffs) {
+    const age = (now - p.born) / DUST_TTL_MS;
+    if (age < 0 || age >= 1) continue;
+    const s = worldToScreen(cam, p.x, p.y);
+    const pr = (1.5 + age * 2.5) * cam.zoom;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y - age * 3 * cam.zoom, pr, 0, Math.PI * 2);
+    ctx.fillStyle = p.sand
+      ? `rgba(214,196,150,${0.45 * (1 - age)})`
+      : `rgba(120,128,92,${0.4 * (1 - age)})`;
+    ctx.fill();
+  }
+
   for (const u of units) {
     seen.add(u.id);
-    const t = trackUnit(u, now);
+    const fx = u as Unit & UnitFx;
     const s = worldToScreen(cam, u.x, u.y);
     const r = radiusOf(u, cam.zoom);
     const style = styleOf(u);
 
+    // Wreck pass: only when the sim exposes deadAt; fades then skips.
+    if (fx.deadAt !== undefined) {
+      const age = now - fx.deadAt;
+      if (age >= 0 && age < WRECK_FADE_MS) {
+        drawWreck(ctx, s.x, s.y, r, 1 - age / WRECK_FADE_MS);
+      }
+      continue;
+    }
+
+    const t = trackUnit(u, now);
+
+    // Ground shadow: soft ellipse anchored at the feet, drawn before bob.
+    ctx.beginPath();
+    ctx.ellipse(s.x, s.y + r * 0.55, r * 0.95, r * 0.45, 0, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0,0,0,0.28)';
+    ctx.fill();
+
+    // Critical-hp jitter: sub-30% units tremble ±1px.
+    const jitter =
+      u.hp / u.maxHp < 0.3 ? Math.sin(now * 0.06 + u.id * 7.3) : 0;
+    const jx = Math.round(jitter);
+    const jy = Math.round(Math.cos(now * 0.055 + u.id * 3.1) * (jitter !== 0 ? 1 : 0));
+    const sx = s.x + jx;
+    const sy = s.y + jy;
+
     if (u.selected) {
       ctx.beginPath();
-      ctx.arc(s.x, s.y, r + 4 + pulse * 2, 0, Math.PI * 2);
+      ctx.arc(sx, sy, r + 4 + pulse * 2, 0, Math.PI * 2);
       ctx.strokeStyle = SELECT_RING;
       ctx.globalAlpha = 0.6 + 0.35 * pulse;
       ctx.lineWidth = 2;
@@ -364,17 +480,18 @@ export function drawUnits(
       !style.vehicle && t.moving ? Math.sin(t.dist * 0.55) * r * 0.08 : 0;
 
     ctx.save();
-    ctx.translate(s.x, s.y + bob);
+    ctx.translate(sx, sy + bob);
     ctx.rotate(u.angle);
     if (style.vehicle) drawVehicle(ctx, u, style, r, cam.zoom, t);
     else drawFootman(ctx, u, style, r);
     ctx.restore();
 
-    // Hit flash: brief white overlay right after taking damage.
-    const sinceHit = now - t.hitAt;
+    // Hit flash: prefer the sim's lastHitAt stamp when present, else the
+    // tracked hp-drop time; brief white overlay right after taking damage.
+    const sinceHit = now - (fx.lastHitAt ?? t.hitAt);
     if (sinceHit >= 0 && sinceHit < HIT_FLASH_MS) {
       ctx.beginPath();
-      ctx.arc(s.x, s.y + bob, r, 0, Math.PI * 2);
+      ctx.arc(sx, sy + bob, r, 0, Math.PI * 2);
       ctx.fillStyle = `rgba(255,255,255,${0.7 * (1 - sinceHit / HIT_FLASH_MS)})`;
       ctx.fill();
     }
@@ -383,8 +500,8 @@ export function drawUnits(
     if (u.hp < u.maxHp) {
       const pct = u.hp / u.maxHp;
       const w = r * 2;
-      const bx = s.x - r;
-      const by = s.y - r - 7;
+      const bx = sx - r;
+      const by = sy - r - 7;
       ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
       ctx.fillRect(bx - 0.5, by - 0.5, w + 1, 4);
       ctx.fillStyle = hpColor(pct);
