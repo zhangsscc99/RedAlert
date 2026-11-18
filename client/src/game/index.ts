@@ -6,4 +6,8 @@ export * from './pathfind.js';
 export * from './units.js';
 export * from './selection.js';
 export * from './camera.js';
+export * from './buildings.js';
+export * from './fog.js';
+export * from './effects.js';
+export * from './commands.js';
 export * from './gameState.js';
