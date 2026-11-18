@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 // src/game/grid.ts
 var TILE_SIZE = 32;
 var GRASS = 0;
+var WATER = 1;
 function idx(map, x, y) {
   return y * map.w + x;
 }
@@ -154,34 +155,56 @@ function snapToPassable(map, x, y, maxRadius = 8) {
 }
 
 // src/game/units.ts
-var INFANTRY_SPEED = 70;
-function spawnUnits(map, count = 8) {
+var UNIT_STATS = {
+  infantry: { hp: 50, speed: 70, cost: 100, buildTime: 4, radius: 9, canHarvest: false },
+  tank: { hp: 400, speed: 55, cost: 800, buildTime: 12, radius: 11, canHarvest: false },
+  harvester: { hp: 300, speed: 35, cost: 1400, buildTime: 20, radius: 12, canHarvest: true }
+};
+var UNIT_RADIUS = UNIT_STATS.infantry.radius;
+var INFANTRY_SPEED = UNIT_STATS.infantry.speed;
+function makeUnit(id, kind, tx, ty) {
+  const stats = UNIT_STATS[kind];
+  return {
+    id,
+    kind,
+    hp: stats.hp,
+    maxHp: stats.hp,
+    x: tileCenter(tx),
+    y: tileCenter(ty),
+    angle: -Math.PI / 2,
+    speed: stats.speed,
+    path: [],
+    selected: false
+  };
+}
+function spawnSpots(map, limit) {
   const spots = [];
   const cx = map.w >> 1;
   const cy = map.h >> 1;
-  for (let r = 0; r < map.w && spots.length < count * 3; r++) {
-    for (let dy = -r; dy <= r && spots.length < count * 3; dy++) {
+  for (let r = 0; r < map.w && spots.length < limit; r++) {
+    for (let dy = -r; dy <= r && spots.length < limit; dy++) {
       for (let dx = -r; dx <= r; dx++) {
         if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
         if (isPassable(map, cx + dx, cy + dy)) spots.push({ x: cx + dx, y: cy + dy });
       }
     }
   }
+  return spots;
+}
+function spawnUnits(map, count = 8, kind = "infantry") {
+  const spots = spawnSpots(map, count * 3);
   const units = [];
   const step = Math.max(1, Math.floor(spots.length / count));
   for (let i = 0; i < count && i * step < spots.length; i++) {
     const t = spots[i * step];
-    units.push({
-      id: i + 1,
-      x: tileCenter(t.x),
-      y: tileCenter(t.y),
-      angle: -Math.PI / 2,
-      speed: INFANTRY_SPEED,
-      path: [],
-      selected: false
-    });
+    units.push(makeUnit(i + 1, kind, t.x, t.y));
   }
   return units;
+}
+function spawnUnit(map, kind, id) {
+  const spot = spawnSpots(map, 1)[0];
+  if (!spot) return null;
+  return makeUnit(id, kind, spot.x, spot.y);
 }
 function commandMove(units, map, gx, gy) {
   const goal = snapToPassable(map, gx, gy);
@@ -279,4 +302,63 @@ test("units move at configured speed and face their heading", () => {
   updateUnits([u], 0.5);
   assert.ok(Math.abs(u.x - x0 - INFANTRY_SPEED * 0.5) < 1e-6);
   assert.ok(Math.abs(u.angle) < 1e-6 || Math.abs(u.angle - Math.PI * 2) < 1e-6);
+});
+test("UNIT_STATS: all three kinds have sane, ordered stats", () => {
+  for (const kind of ["infantry", "tank", "harvester"]) {
+    const s = UNIT_STATS[kind];
+    assert.ok(s.hp > 0);
+    assert.ok(s.speed > 0);
+    assert.ok(s.cost > 0);
+    assert.ok(s.buildTime > 0);
+    assert.ok(s.radius > 0);
+  }
+  assert.ok(UNIT_STATS.infantry.cost < UNIT_STATS.tank.cost);
+  assert.ok(UNIT_STATS.tank.cost < UNIT_STATS.harvester.cost);
+  assert.ok(UNIT_STATS.infantry.speed > UNIT_STATS.tank.speed);
+  assert.ok(UNIT_STATS.tank.speed > UNIT_STATS.harvester.speed);
+  assert.ok(UNIT_STATS.tank.hp > UNIT_STATS.infantry.hp);
+  assert.ok(UNIT_STATS.harvester.hp > UNIT_STATS.infantry.hp);
+});
+test("UNIT_STATS: only the harvester can harvest", () => {
+  assert.equal(UNIT_STATS.harvester.canHarvest, true);
+  assert.equal(UNIT_STATS.infantry.canHarvest, false);
+  assert.equal(UNIT_STATS.tank.canHarvest, false);
+});
+test("spawnUnit creates a harvester with stats-derived fields on a passable tile", () => {
+  const m = openMap();
+  const u = spawnUnit(m, "harvester", 42);
+  assert.ok(u);
+  assert.equal(u.id, 42);
+  assert.equal(u.kind, "harvester");
+  assert.equal(u.hp, UNIT_STATS.harvester.hp);
+  assert.equal(u.maxHp, UNIT_STATS.harvester.hp);
+  assert.equal(u.speed, UNIT_STATS.harvester.speed);
+  assert.ok(isPassable(m, worldToTile(u.x), worldToTile(u.y)));
+  assert.equal(u.path.length, 0);
+  assert.equal(u.selected, false);
+});
+test("spawnUnit returns null when no passable tile exists", () => {
+  const m = { w: 8, h: 8, seed: 0, tiles: new Uint8Array(64).fill(WATER) };
+  assert.equal(spawnUnit(m, "infantry", 1), null);
+});
+test("spawnUnits defaults to 8 infantry with full hp", () => {
+  const m = openMap();
+  const units = spawnUnits(m);
+  assert.equal(units.length, 8);
+  for (const u of units) {
+    assert.equal(u.kind, "infantry");
+    assert.equal(u.hp, UNIT_STATS.infantry.hp);
+    assert.equal(u.maxHp, UNIT_STATS.infantry.hp);
+    assert.equal(u.speed, INFANTRY_SPEED);
+  }
+});
+test("spawnUnits with a kind produces only that kind", () => {
+  const m = openMap();
+  const units = spawnUnits(m, 3, "tank");
+  assert.equal(units.length, 3);
+  for (const u of units) {
+    assert.equal(u.kind, "tank");
+    assert.equal(u.hp, UNIT_STATS.tank.hp);
+    assert.ok(isPassable(m, worldToTile(u.x), worldToTile(u.y)));
+  }
 });

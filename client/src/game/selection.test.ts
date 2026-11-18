@@ -4,7 +4,7 @@ import { normRect, pointInRect, unitAt, unitsInRect, selectUnits } from './selec
 import type { Unit } from './units.js';
 
 function mkUnit(id: number, x: number, y: number): Unit {
-  return { id, x, y, angle: 0, speed: 70, path: [], selected: false };
+  return { id, kind: 'infantry', hp: 50, maxHp: 50, x, y, angle: 0, speed: 70, path: [], selected: false };
 }
 
 test('normRect normalizes any corner order', () => {

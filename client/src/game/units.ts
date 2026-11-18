@@ -4,11 +4,35 @@ import { isPassable, tileCenter, worldToTile, type GameMap } from './grid.js';
 import { findPath, snapToPassable } from './pathfind.js';
 import type { Point } from './selection.js';
 
-export const UNIT_RADIUS = 9;
-export const INFANTRY_SPEED = 70; // px/sec
+export type UnitKind = 'infantry' | 'harvester' | 'tank';
+
+export interface UnitStats {
+  hp: number;
+  speed: number; // px/sec
+  cost: number;
+  buildTime: number; // seconds
+  radius: number; // world px
+  canHarvest: boolean;
+}
+
+/**
+ * 单位属性表：步兵便宜且快，矿车慢且可采矿，坦克贵且血厚。
+ * 造价递增 infantry < tank < harvester。
+ */
+export const UNIT_STATS: Record<UnitKind, UnitStats> = {
+  infantry: { hp: 50, speed: 70, cost: 100, buildTime: 4, radius: 9, canHarvest: false },
+  tank: { hp: 400, speed: 55, cost: 800, buildTime: 12, radius: 11, canHarvest: false },
+  harvester: { hp: 300, speed: 35, cost: 1400, buildTime: 20, radius: 12, canHarvest: true },
+};
+
+export const UNIT_RADIUS = UNIT_STATS.infantry.radius;
+export const INFANTRY_SPEED = UNIT_STATS.infantry.speed; // px/sec
 
 export interface Unit {
   id: number;
+  kind: UnitKind;
+  hp: number;
+  maxHp: number;
   x: number; // world px
   y: number;
   angle: number; // facing, radians
@@ -17,36 +41,63 @@ export interface Unit {
   selected: boolean;
 }
 
+function makeUnit(id: number, kind: UnitKind, tx: number, ty: number): Unit {
+  const stats = UNIT_STATS[kind];
+  return {
+    id,
+    kind,
+    hp: stats.hp,
+    maxHp: stats.hp,
+    x: tileCenter(tx),
+    y: tileCenter(ty),
+    angle: -Math.PI / 2,
+    speed: stats.speed,
+    path: [],
+    selected: false,
+  };
+}
+
 /**
- * Spawn `count` infantry on passable tiles, spiraling out from the map center.
+ * Collect passable tiles spiraling out from the map center (up to `limit`).
  */
-export function spawnUnits(map: GameMap, count = 8): Unit[] {
+function spawnSpots(map: GameMap, limit: number): { x: number; y: number }[] {
   const spots: { x: number; y: number }[] = [];
   const cx = map.w >> 1;
   const cy = map.h >> 1;
-  for (let r = 0; r < map.w && spots.length < count * 3; r++) {
-    for (let dy = -r; dy <= r && spots.length < count * 3; dy++) {
+  for (let r = 0; r < map.w && spots.length < limit; r++) {
+    for (let dy = -r; dy <= r && spots.length < limit; dy++) {
       for (let dx = -r; dx <= r; dx++) {
         if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
         if (isPassable(map, cx + dx, cy + dy)) spots.push({ x: cx + dx, y: cy + dy });
       }
     }
   }
+  return spots;
+}
+
+/**
+ * Spawn `count` units of `kind` (default infantry) on passable tiles,
+ * spiraling out from the map center.
+ */
+export function spawnUnits(map: GameMap, count = 8, kind: UnitKind = 'infantry'): Unit[] {
+  const spots = spawnSpots(map, count * 3);
   const units: Unit[] = [];
   const step = Math.max(1, Math.floor(spots.length / count));
   for (let i = 0; i < count && i * step < spots.length; i++) {
     const t = spots[i * step]!;
-    units.push({
-      id: i + 1,
-      x: tileCenter(t.x),
-      y: tileCenter(t.y),
-      angle: -Math.PI / 2,
-      speed: INFANTRY_SPEED,
-      path: [],
-      selected: false,
-    });
+    units.push(makeUnit(i + 1, kind, t.x, t.y));
   }
   return units;
+}
+
+/**
+ * Spawn a single unit of `kind` on the first passable tile found spiraling
+ * out from the map center. Returns null when no passable tile exists.
+ */
+export function spawnUnit(map: GameMap, kind: UnitKind, id: number): Unit | null {
+  const spot = spawnSpots(map, 1)[0];
+  if (!spot) return null;
+  return makeUnit(id, kind, spot.x, spot.y);
 }
 
 /**
