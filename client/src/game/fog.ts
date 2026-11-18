@@ -13,6 +13,8 @@ export const SIGHT_RADIUS: Record<UnitKind | BuildingKind, number> = {
   barracks: 8,
   refinery: 8,
   power: 8,
+  turret: 8,
+  wall: 8,
 };
 
 export interface Fog {

@@ -8,6 +8,8 @@ import {
   canPlace,
   place,
   buildingAt,
+  isDefensive,
+  blocksMovement,
   type Building,
 } from './buildings.js';
 
@@ -93,6 +95,58 @@ test('footprintTiles returns w*h unique in-rect tiles per kind', () => {
       assert.ok(t.y >= b.gy && t.y < b.gy + def.h);
     }
   }
+});
+
+test('turret and wall place on clear grass', () => {
+  const m = openMap();
+  assert.deepEqual(canPlace(m, [], 'turret', 4, 4), { ok: true });
+  assert.deepEqual(canPlace(m, [], 'wall', 0, 0), { ok: true });
+});
+
+test('turret and wall reject water and overlap like any building', () => {
+  const m = openMap(16, 16);
+  m.tiles[5 * m.w + 5] = WATER;
+  assert.equal(canPlace(m, [], 'turret', 4, 4).reason, 'water'); // 2x2 covers (5,5)
+  assert.equal(canPlace(m, [], 'wall', 5, 5).reason, 'water'); // the wet tile itself
+  assert.equal(canPlace(m, [], 'turret', 6, 6).ok, true);
+  assert.equal(canPlace(m, [], 'wall', 4, 5).ok, true);
+
+  const bs: Building[] = [];
+  place(bs, 'turret', 8, 8, 1); // covers x 8..9, y 8..9
+  assert.equal(canPlace(m, bs, 'wall', 9, 9).reason, 'overlap');
+  assert.equal(canPlace(m, bs, 'turret', 9, 8).reason, 'overlap');
+  assert.equal(canPlace(m, bs, 'wall', 10, 9).ok, true); // edge-touching is fine
+  assert.equal(canPlace(m, bs, 'wall', 7, 8).ok, true);
+});
+
+test('defensive footprints: wall covers 1 tile, turret covers 4', () => {
+  const bs: Building[] = [];
+  const wall = place(bs, 'wall', 3, 3, 1);
+  const turret = place(bs, 'turret', 6, 6, 2);
+  assert.deepEqual(footprintTiles(wall), [{ x: 3, y: 3 }]);
+  assert.equal(footprintTiles(turret).length, 4);
+  assert.deepEqual(footprintTiles(turret), [
+    { x: 6, y: 6 },
+    { x: 7, y: 6 },
+    { x: 6, y: 7 },
+    { x: 7, y: 7 },
+  ]);
+});
+
+test('blocksMovement: walls block, production buildings do not', () => {
+  assert.equal(blocksMovement('wall'), true);
+  assert.equal(blocksMovement('hq'), false);
+  assert.equal(blocksMovement('barracks'), false);
+  assert.equal(blocksMovement('refinery'), false);
+});
+
+test('isDefensive flags turret and wall only', () => {
+  assert.equal(isDefensive('turret'), true);
+  assert.equal(isDefensive('wall'), true);
+  assert.equal(isDefensive('hq'), false);
+  assert.equal(isDefensive('barracks'), false);
+  assert.equal(isDefensive('refinery'), false);
+  assert.equal(isDefensive('power'), false);
 });
 
 test('place appends a not-yet-done building at full hp', () => {

@@ -13,10 +13,12 @@ var INFANTRY_SPEED = UNIT_STATS.infantry.speed;
 
 // src/game/buildings.ts
 var BUILDING_DEFS = {
-  hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2e3, label: "HQ" },
-  barracks: { w: 3, h: 2, cost: 500, buildTime: 15, hp: 800, label: "Barracks" },
-  refinery: { w: 4, h: 3, cost: 2e3, buildTime: 25, hp: 1200, label: "Refinery" },
-  power: { w: 2, h: 2, cost: 300, buildTime: 8, hp: 400, label: "Power Plant" }
+  hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2e3, label: "HQ", buildable: false },
+  barracks: { w: 3, h: 2, cost: 500, buildTime: 15, hp: 800, label: "Barracks", powerUse: 40, buildable: true },
+  refinery: { w: 4, h: 3, cost: 2e3, buildTime: 25, hp: 1200, label: "Refinery", powerUse: 50, buildable: true },
+  power: { w: 2, h: 2, cost: 300, buildTime: 8, hp: 400, label: "Power Plant", buildable: true },
+  turret: { w: 2, h: 2, cost: 700, buildTime: 12, hp: 700, label: "Turret", range: 150, damage: 30, powerUse: 30, buildable: true },
+  wall: { w: 1, h: 1, cost: 100, buildTime: 4, hp: 500, label: "Wall", blocksPath: true, buildable: true }
 };
 
 // src/game/balance.ts
@@ -29,7 +31,9 @@ var BUILDING_BALANCE = {
   hq: { w: 4, h: 3, hp: 2e3, cost: 2500, buildTime: 40 },
   barracks: { w: 3, h: 2, hp: 800, cost: 500, buildTime: 15 },
   refinery: { w: 4, h: 3, hp: 1200, cost: 2e3, buildTime: 25 },
-  power: { w: 2, h: 2, hp: 400, cost: 300, buildTime: 8 }
+  power: { w: 2, h: 2, hp: 400, cost: 300, buildTime: 8 },
+  turret: { w: 2, h: 2, hp: 700, cost: 700, buildTime: 12 },
+  wall: { w: 1, h: 1, hp: 500, cost: 100, buildTime: 4 }
 };
 var WAVE_BALANCE = {
   interval: 30,
