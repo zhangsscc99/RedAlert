@@ -16,6 +16,9 @@ function spend(e, amount) {
   return true;
 }
 
+// src/game/grid.ts
+var TILE_SIZE = 32;
+
 // src/game/buildings.ts
 var BUILDING_DEFS = {
   hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2e3, label: "HQ", buildable: false },
@@ -25,6 +28,7 @@ var BUILDING_DEFS = {
   turret: { w: 2, h: 2, cost: 700, buildTime: 12, hp: 700, label: "Turret", range: 150, damage: 30, powerUse: 30, buildable: true },
   wall: { w: 1, h: 1, cost: 100, buildTime: 4, hp: 500, label: "Wall", blocksPath: true, buildable: true }
 };
+var RADAR_SCAN = { radius: 12 * TILE_SIZE, period: 5 };
 
 // src/game/upgrades.ts
 var BASE_LEVEL = 1;

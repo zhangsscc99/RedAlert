@@ -2,6 +2,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
+// src/game/grid.ts
+var TILE_SIZE = 32;
+
 // src/game/units.ts
 var UNIT_STATS = {
   infantry: { hp: 50, speed: 70, cost: 100, buildTime: 4, radius: 9, canHarvest: false },
@@ -10,6 +13,9 @@ var UNIT_STATS = {
 };
 var UNIT_RADIUS = UNIT_STATS.infantry.radius;
 var INFANTRY_SPEED = UNIT_STATS.infantry.speed;
+
+// src/game/buildings.ts
+var RADAR_SCAN = { radius: 12 * TILE_SIZE, period: 5 };
 
 // src/game/balance.ts
 var BALANCE = {

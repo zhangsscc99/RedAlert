@@ -478,48 +478,6 @@ function updateUnits(units, dt) {
   }
 }
 
-// src/game/buildings.ts
-var BUILDING_DEFS = {
-  hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2e3, label: "HQ", buildable: false },
-  barracks: { w: 3, h: 2, cost: 500, buildTime: 15, hp: 800, label: "Barracks", powerUse: 40, buildable: true },
-  refinery: { w: 4, h: 3, cost: 2e3, buildTime: 25, hp: 1200, label: "Refinery", powerUse: 50, buildable: true },
-  power: { w: 2, h: 2, cost: 300, buildTime: 8, hp: 400, label: "Power Plant", buildable: true },
-  turret: { w: 2, h: 2, cost: 700, buildTime: 12, hp: 700, label: "Turret", range: 150, damage: 30, powerUse: 30, buildable: true },
-  wall: { w: 1, h: 1, cost: 100, buildTime: 4, hp: 500, label: "Wall", blocksPath: true, buildable: true }
-};
-function canPlace(map, buildings, kind, gx, gy) {
-  const def = BUILDING_DEFS[kind];
-  for (let dy = 0; dy < def.h; dy++) {
-    for (let dx = 0; dx < def.w; dx++) {
-      const x = gx + dx;
-      const y = gy + dy;
-      if (!inBounds(map, x, y)) return { ok: false, reason: "oob" };
-      if (!isPassable(map, x, y)) return { ok: false, reason: "water" };
-    }
-  }
-  for (const b of buildings) {
-    const d = BUILDING_DEFS[b.kind];
-    if (gx < b.gx + d.w && gx + def.w > b.gx && gy < b.gy + d.h && gy + def.h > b.gy) {
-      return { ok: false, reason: "overlap" };
-    }
-  }
-  return { ok: true };
-}
-function place(buildings, kind, gx, gy, nextId) {
-  const def = BUILDING_DEFS[kind];
-  const b = {
-    id: nextId,
-    kind,
-    gx,
-    gy,
-    hp: def.hp,
-    maxHp: def.hp,
-    done: false
-  };
-  buildings.push(b);
-  return b;
-}
-
 // src/game/economy.ts
 function createEconomy(start = 5e3) {
   return { credits: start, earned: 0, spent: 0 };
@@ -564,6 +522,49 @@ function tickQueue(q, dt) {
   }
   return done;
 }
+
+// src/game/buildings.ts
+var BUILDING_DEFS = {
+  hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2e3, label: "HQ", buildable: false },
+  barracks: { w: 3, h: 2, cost: 500, buildTime: 15, hp: 800, label: "Barracks", powerUse: 40, buildable: true },
+  refinery: { w: 4, h: 3, cost: 2e3, buildTime: 25, hp: 1200, label: "Refinery", powerUse: 50, buildable: true },
+  power: { w: 2, h: 2, cost: 300, buildTime: 8, hp: 400, label: "Power Plant", buildable: true },
+  turret: { w: 2, h: 2, cost: 700, buildTime: 12, hp: 700, label: "Turret", range: 150, damage: 30, powerUse: 30, buildable: true },
+  wall: { w: 1, h: 1, cost: 100, buildTime: 4, hp: 500, label: "Wall", blocksPath: true, buildable: true }
+};
+function canPlace(map, buildings, kind, gx, gy) {
+  const def = BUILDING_DEFS[kind];
+  for (let dy = 0; dy < def.h; dy++) {
+    for (let dx = 0; dx < def.w; dx++) {
+      const x = gx + dx;
+      const y = gy + dy;
+      if (!inBounds(map, x, y)) return { ok: false, reason: "oob" };
+      if (!isPassable(map, x, y)) return { ok: false, reason: "water" };
+    }
+  }
+  for (const b of buildings) {
+    const d = BUILDING_DEFS[b.kind];
+    if (gx < b.gx + d.w && gx + def.w > b.gx && gy < b.gy + d.h && gy + def.h > b.gy) {
+      return { ok: false, reason: "overlap" };
+    }
+  }
+  return { ok: true };
+}
+function place(buildings, kind, gx, gy, nextId) {
+  const def = BUILDING_DEFS[kind];
+  const b = {
+    id: nextId,
+    kind,
+    gx,
+    gy,
+    hp: def.hp,
+    maxHp: def.hp,
+    done: false
+  };
+  buildings.push(b);
+  return b;
+}
+var RADAR_SCAN = { radius: 12 * TILE_SIZE, period: 5 };
 
 // src/game/unitRoles.ts
 var ARMOR_TYPES = ["infantry", "vehicle", "building"];
@@ -1377,13 +1378,22 @@ function isLowPower(power) {
 }
 
 // src/game/save.ts
-var SAVE_VERSION = 2;
-var cloneUnit = (u) => ({ id: u.id, kind: u.kind, x: u.x, y: u.y, hp: u.hp });
+var SAVE_VERSION = 3;
+var cloneUnit = (u) => {
+  const c = { id: u.id, kind: u.kind, x: u.x, y: u.y, hp: u.hp };
+  if (u.kills !== void 0) c.kills = u.kills;
+  return c;
+};
 var cloneBuilding = (b) => {
   const c = { id: b.id, kind: b.kind, gx: b.gx, gy: b.gy, hp: b.hp };
   if (b.done !== void 0) c.done = b.done;
+  if (b.level !== void 0) c.level = b.level;
+  if (b.repair !== void 0) c.repair = b.repair;
   return c;
 };
+var cloneStats = (s) => ({ ...s });
+var cloneWeather = (w) => ({ ...w });
+var cloneRadar = (r) => ({ ...r });
 function snapshot(input) {
   const s = {
     version: SAVE_VERSION,
@@ -1398,6 +1408,12 @@ function snapshot(input) {
   if (input.ai) s.ai = { ...input.ai };
   if (input.camera) s.camera = { ...input.camera };
   if (input.opts) s.opts = { ...input.opts };
+  if (input.fog) s.fog = { w: input.fog.w, h: input.fog.h, explored: Array.from(input.fog.explored) };
+  if (input.stats) s.stats = cloneStats(input.stats);
+  if (input.wave !== void 0) s.wave = input.wave;
+  if (input.difficulty !== void 0) s.difficulty = input.difficulty;
+  if (input.weather) s.weather = cloneWeather(input.weather);
+  if (input.radar) s.radar = cloneRadar(input.radar);
   return s;
 }
 
