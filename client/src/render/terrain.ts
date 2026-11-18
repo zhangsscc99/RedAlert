@@ -32,7 +32,31 @@ const overlays = new WeakMap<HTMLCanvasElement, TerrainOverlay>();
 /** Read-only time source for the animated overlays; drawTerrain stays pure. */
 const TIME = Object.freeze({ now: (): number => performance.now() / 1000 });
 
-export function prerenderMap(map: GameMap): HTMLCanvasElement {
+export type Season = 'spring' | 'summer' | 'autumn' | 'winter';
+
+const SEASONS: readonly Season[] = ['spring', 'summer', 'autumn', 'winter'];
+
+/** Uniform far-view tint per season, composited over the finished map. */
+const SEASON_TINT: Record<Season, string> = {
+  spring: 'rgba(130,205,120,0.16)', // fresh bright green
+  summer: 'rgba(95,150,55,0.12)', // deep saturated green
+  autumn: 'rgba(215,150,60,0.18)', // amber wash
+  winter: 'rgba(185,205,225,0.22)', // pale cold blue-grey
+};
+
+export interface PrerenderOptions {
+  /** Season palette; defaults to a season derived from the map seed. */
+  season?: Season;
+  /**
+   * Remaining ore fraction (0..1) for a tile, if the game tracks reserves.
+   * Omitted → fixed per-tile crystal layout driven by vein density.
+   */
+  oreReserve?: (x: number, y: number) => number | undefined;
+  /** Building footprints in tile coords, for foundation shadow + dirt skirt. */
+  foundations?: { x: number; y: number; w: number; h: number }[];
+}
+
+export function prerenderMap(map: GameMap, opts: PrerenderOptions = {}): HTMLCanvasElement {
   const canvas = document.createElement('canvas');
   canvas.width = map.w * TILE_SIZE;
   canvas.height = map.h * TILE_SIZE;
@@ -87,6 +111,17 @@ export function prerenderMap(map: GameMap): HTMLCanvasElement {
           }
         }
         drawOreTile(ctx, x, y, density);
+        // Reserve visualization: when the game reports a remaining fraction,
+        // depleted cells sink back toward bare cracked earth; rich ones keep
+        // full crystal brightness. No data → the density-based look above.
+        const reserve = opts.oreReserve?.(x, y);
+        if (reserve !== undefined) {
+          const r = Math.max(0, Math.min(1, reserve));
+          if (r < 0.66) {
+            ctx.fillStyle = `rgba(52,42,24,${((0.66 - r) * 0.75).toFixed(3)})`;
+            ctx.fillRect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+          }
+        }
         // One twinkle point per crystal, deterministic per tile.
         const n = 1 + Math.min(2, Math.floor(density / 3));
         for (let i = 0; i < n; i++) {
@@ -211,6 +246,72 @@ export function prerenderMap(map: GameMap): HTMLCanvasElement {
     }
   }
 
+  // Road shoulders: wherever a path tile meets plain land, crumble the edge —
+  // a soft dark line along the seam plus gravel speckles on the road side —
+  // so paths read as worn tracks instead of stamped rectangles.
+  for (const idx of pathTiles) {
+    const x = idx % map.w;
+    const y = Math.floor(idx / map.w);
+    const px = x * TILE_SIZE;
+    const py = y * TILE_SIZE;
+    for (let d = 0; d < 4; d++) {
+      const nx = x + SHORE_DX[d]!;
+      const ny = y + SHORE_DY[d]!;
+      if (nx < 0 || ny < 0 || nx >= map.w || ny >= map.h) continue;
+      const nIdx = ny * map.w + nx;
+      if (map.tiles[nIdx] === WATER || pathTiles.has(nIdx)) continue;
+      // Faded seam shadow on the road side of the edge.
+      const horiz = d >= 2;
+      const gx0 = horiz ? px : d === 0 ? px + TILE_SIZE - 4 : px;
+      const gy0 = horiz ? (d === 2 ? py + TILE_SIZE - 4 : py) : py;
+      const gx1 = horiz ? px : d === 0 ? px + TILE_SIZE : px + 4;
+      const gy1 = horiz ? (d === 2 ? py + TILE_SIZE : py + 4) : py + TILE_SIZE;
+      const grad = ctx.createLinearGradient(
+        horiz ? px : d === 0 ? px + TILE_SIZE : px,
+        horiz ? (d === 2 ? py + TILE_SIZE : py) : py,
+        horiz ? px : d === 0 ? px + TILE_SIZE - 5 : px + 5,
+        horiz ? (d === 2 ? py + TILE_SIZE - 5 : py + 5) : py,
+      );
+      grad.addColorStop(0, 'rgba(30,22,12,0.28)');
+      grad.addColorStop(1, 'rgba(30,22,12,0)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+      // Gravel: a few gritty specks kicked onto the shoulder edge.
+      for (let i = 0; i < 6; i++) {
+        const t = rand01(x * 4 + d, y, 350 + i) * (TILE_SIZE - 2);
+        const off = 1 + rand01(x, y * 4 + d, 360 + i) * 4;
+        ctx.fillStyle =
+          rand01(x, y, 370 + i) < 0.5 ? 'rgba(150,132,100,0.5)' : 'rgba(44,34,20,0.45)';
+        if (horiz) {
+          const ey = d === 2 ? py + TILE_SIZE - off : py + off;
+          ctx.fillRect(px + t, ey, 2, 1.5);
+        } else {
+          const ex = d === 0 ? px + TILE_SIZE - off : px + off;
+          ctx.fillRect(ex, py + t, 1.5, 2);
+        }
+      }
+    }
+  }
+
+  // Building foundations (when callers can report footprints): a soft contact
+  // shadow offset down-right plus a churned dirt skirt, so structures sit in
+  // the terrain rather than floating on grass.
+  for (const f of opts.foundations ?? []) {
+    const bx = f.x * TILE_SIZE;
+    const by = f.y * TILE_SIZE;
+    const bw = f.w * TILE_SIZE;
+    const bh = f.h * TILE_SIZE;
+    ctx.fillStyle = 'rgba(0,0,0,0.22)';
+    ctx.beginPath();
+    ctx.ellipse(bx + bw / 2 + 3, by + bh - 2, bw / 2 + 4, 6, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(88,70,44,0.30)';
+    for (let i = 0; i < bw; i += 5) {
+      ctx.fillRect(bx + i, by + bh - 3 - rand01(f.x + i, f.y, 380) * 3, 4, 4);
+      ctx.fillRect(bx + i, by - 1 + rand01(f.x + i, f.y, 381) * 2, 4, 3);
+    }
+  }
+
   // Land-side shoreline: a shadowed rim plus a thin foam line on the land
   // tile wherever it borders water (all four directions), so the coast
   // reads as a small cliff/beach edge rather than a flat seam.
@@ -225,17 +326,22 @@ export function prerenderMap(map: GameMap): HTMLCanvasElement {
         if (nx < 0 || ny < 0 || nx >= map.w || ny >= map.h) continue;
         if (map.tiles[ny * map.w + nx] !== WATER) continue;
         const horiz = d >= 2; // edge runs horizontally
-        // Shadow band fading inland.
-        ctx.fillStyle = 'rgba(10,22,34,0.30)';
-        if (d === 0) ctx.fillRect(px + TILE_SIZE - 3, py, 3, TILE_SIZE);
-        else if (d === 1) ctx.fillRect(px, py, 3, TILE_SIZE);
-        else if (d === 2) ctx.fillRect(px, py + TILE_SIZE - 3, TILE_SIZE, 3);
-        else ctx.fillRect(px, py, TILE_SIZE, 3);
-        ctx.fillStyle = 'rgba(10,22,34,0.14)';
-        if (d === 0) ctx.fillRect(px + TILE_SIZE - 6, py, 3, TILE_SIZE);
-        else if (d === 1) ctx.fillRect(px + 3, py, 3, TILE_SIZE);
-        else if (d === 2) ctx.fillRect(px, py + TILE_SIZE - 6, TILE_SIZE, 3);
-        else ctx.fillRect(px, py + 3, TILE_SIZE, 3);
+        // Shadow: one 8px gradient fading inland — softer than stepped bands.
+        const SOFT = 8;
+        const grad = ctx.createLinearGradient(
+          d === 0 ? px + TILE_SIZE : d === 1 ? px : px,
+          d === 2 ? py + TILE_SIZE : d === 3 ? py : py,
+          d === 0 ? px + TILE_SIZE - SOFT : d === 1 ? px + SOFT : px,
+          d === 2 ? py + TILE_SIZE - SOFT : d === 3 ? py + SOFT : py,
+        );
+        grad.addColorStop(0, 'rgba(10,22,34,0.30)');
+        grad.addColorStop(0.5, 'rgba(10,22,34,0.13)');
+        grad.addColorStop(1, 'rgba(10,22,34,0)');
+        ctx.fillStyle = grad;
+        if (d === 0) ctx.fillRect(px + TILE_SIZE - SOFT, py, SOFT, TILE_SIZE);
+        else if (d === 1) ctx.fillRect(px, py, SOFT, TILE_SIZE);
+        else if (d === 2) ctx.fillRect(px, py + TILE_SIZE - SOFT, TILE_SIZE, SOFT);
+        else ctx.fillRect(px, py, TILE_SIZE, SOFT);
         // Broken foam line right at the waterline.
         const h1 = Math.abs(Math.imul(x * 31 + y * 17 + d * 7, 2654435761)) >>> 0;
         ctx.fillStyle = 'rgba(235,248,250,0.55)';
@@ -313,6 +419,34 @@ export function prerenderMap(map: GameMap): HTMLCanvasElement {
         ctx.fillStyle = 'rgba(46,34,20,0.5)';
         ctx.fillRect(cx - 1, cy - 1, 2, 2);
       }
+    }
+  }
+
+  // Seasonal grade: one uniform tint composited over the whole map so the
+  // far view reads as a single coherent season. Defaults to the map seed so
+  // a given map always looks the same; callers may override via opts.season.
+  const season = opts.season ?? SEASONS[Math.abs(map.seed | 0) % SEASONS.length]!;
+  ctx.globalCompositeOperation = 'overlay';
+  ctx.fillStyle = SEASON_TINT[season];
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.globalCompositeOperation = 'source-over';
+  if (season === 'winter') {
+    // Frost: a faint desaturating veil + brighter dusting on land edges.
+    ctx.fillStyle = 'rgba(228,236,244,0.10)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  } else if (season === 'autumn') {
+    // Dry leaves: sparse warm flecks on grass only.
+    for (let i = 0; i < map.w * map.h * 0.02; i++) {
+      const x = Math.floor(rand01(i, 0, 500) * map.w);
+      const y = Math.floor(rand01(i, 1, 501) * map.h);
+      if (map.tiles[y * map.w + x] !== 0) continue;
+      ctx.fillStyle = 'rgba(196,120,40,0.35)';
+      ctx.fillRect(
+        x * TILE_SIZE + rand01(i, 2, 502) * TILE_SIZE,
+        y * TILE_SIZE + rand01(i, 3, 503) * TILE_SIZE,
+        2,
+        2,
+      );
     }
   }
 
