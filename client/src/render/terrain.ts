@@ -9,6 +9,7 @@ import {
   drawShoreEdge,
   drawWaterTile,
   makeGrassTexture,
+  tileShadeTier,
 } from './textures.ts';
 
 export function prerenderMap(map: GameMap): HTMLCanvasElement {
@@ -57,6 +58,18 @@ export function prerenderMap(map: GameMap): HTMLCanvasElement {
         if (nx < 0 || ny < 0 || nx >= map.w || ny >= map.h) continue;
         if (map.tiles[ny * map.w + nx] !== WATER) drawShoreEdge(ctx, x, y, d);
       }
+    }
+  }
+
+  // Deterministic brightness tiers on land tiles (grass + ore) so the ground
+  // reads as varied terrain instead of a uniform fill.
+  for (let y = 0; y < map.h; y++) {
+    for (let x = 0; x < map.w; x++) {
+      if (map.tiles[y * map.w + x] === WATER) continue;
+      const tier = tileShadeTier(x, y);
+      if (tier === 0) continue;
+      ctx.fillStyle = tier < 0 ? 'rgba(0,0,0,0.05)' : 'rgba(214,238,164,0.05)';
+      ctx.fillRect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE);
     }
   }
 

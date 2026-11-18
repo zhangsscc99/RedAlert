@@ -11,6 +11,7 @@ import {
   type GBuilding,
   type Unit,
 } from '../game/index.ts';
+import { drawUnitBody } from './units.js';
 
 const PLAYER_BODY = '#3f5a37';
 const PLAYER_EDGE = '#7fae6a';
@@ -24,17 +25,35 @@ export function drawBuildings(
   cam: Camera,
   buildings: readonly GBuilding[],
 ): void {
+  // Drop shadows: one shared shadow state for the whole batch — no
+  // per-building allocation, shadowBlur set once per frame.
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.4)';
+  ctx.shadowBlur = 6;
+  ctx.shadowOffsetY = 3;
+  for (const b of buildings) {
+    const d = BUILDING_DEFS[b.kind];
+    const s = worldToScreen(cam, b.gx * TILE_SIZE, b.gy * TILE_SIZE);
+    ctx.fillStyle = b.team === 'enemy' ? ENEMY_BODY : PLAYER_BODY;
+    ctx.fillRect(s.x, s.y, d.w * TILE_SIZE * cam.zoom, d.h * TILE_SIZE * cam.zoom);
+  }
+  ctx.restore();
+
   for (const b of buildings) {
     const d = BUILDING_DEFS[b.kind];
     const s = worldToScreen(cam, b.gx * TILE_SIZE, b.gy * TILE_SIZE);
     const w = d.w * TILE_SIZE * cam.zoom;
     const h = d.h * TILE_SIZE * cam.zoom;
 
-    ctx.fillStyle = b.team === 'enemy' ? ENEMY_BODY : PLAYER_BODY;
-    ctx.fillRect(s.x, s.y, w, h);
     ctx.strokeStyle = b.team === 'enemy' ? ENEMY_EDGE : PLAYER_EDGE;
     ctx.lineWidth = 2;
     ctx.strokeRect(s.x + 1, s.y + 1, w - 2, h - 2);
+
+    // Top-light strip + bottom shade — cheap bevel so the slab reads 3-D.
+    ctx.fillStyle = 'rgba(255,255,255,0.10)';
+    ctx.fillRect(s.x + 2, s.y + 2, w - 4, Math.max(2, 3 * cam.zoom));
+    ctx.fillStyle = 'rgba(0,0,0,0.14)';
+    ctx.fillRect(s.x + 2, s.y + h - 2 - Math.max(2, 3 * cam.zoom), w - 4, Math.max(2, 3 * cam.zoom));
 
     ctx.fillStyle = LABEL;
     ctx.font = `${Math.max(9, Math.round(11 * cam.zoom))}px ui-monospace, Menlo, Consolas, monospace`;
@@ -95,13 +114,7 @@ export function drawUnitsColored(
     const s = worldToScreen(cam, u.x, u.y);
     const r = UNIT_STATS[u.kind].radius * cam.zoom;
 
-    ctx.beginPath();
-    ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
-    ctx.fillStyle = fill;
-    ctx.fill();
-    ctx.strokeStyle = stroke;
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
+    drawUnitBody(ctx, s.x, s.y, r, fill, stroke);
 
     ctx.beginPath();
     ctx.moveTo(s.x, s.y);

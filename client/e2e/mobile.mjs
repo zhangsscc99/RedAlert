@@ -25,7 +25,11 @@ async function shot(page, label) {
   console.log(`  shot ${p}`);
 }
 
-const browser = await chromium.launch();
+// --disable-software-rasterizer: this WSL box's SwiftShader GL raster wedges
+// on any canvas fill; CPU raster is the only working path here.
+const browser = await chromium.launch({
+  args: ['--disable-gpu', '--disable-software-rasterizer', '--no-sandbox'],
+});
 // iPhone 13 geometry on chromium: 390×844 @3x, touch + mobile UA.
 const context = await browser.newContext({
   viewport: { width: 390, height: 844 },
@@ -55,7 +59,10 @@ check('viewport has no page scroll (W)', scroll.sw <= scroll.iw + 1);
 check('touch mode detected', await page.evaluate(() => window.__raDebug.isTouch));
 await shot(page, 'loaded');
 
-// --- 2. first-run touch guide ---------------------------------------------
+// --- 2. enter the match, then the first-run touch guide ---------------------
+await page.keyboard.press('Enter'); // 开始战役 — the menu's keydown shortcut
+await page.waitForTimeout(300);
+check('entered playing screen', (await page.evaluate(() => window.__raDebug.screen)) === 'playing');
 const guide0 = await page.evaluate(() => window.__raDebug.guideStep);
 check('touch guide shown on first run', guide0 >= 0);
 await shot(page, 'guide');
@@ -157,15 +164,18 @@ check(`pinch changes zoom (${zoom0.toFixed(2)} → ${zoom1.toFixed(2)})`, zoom1 
 check('zoom clamped ≤ 2.5', zoom1 <= 2.5);
 await shot(page, 'pinch');
 
-// --- 7. long-press menu (bonus surface check) --------------------------------
+// --- 7. long-press command strip ---------------------------------------------
 await page.evaluate(() => window.__raDebug.units.forEach((u) => (u.selected = false)));
-await page.touchscreen.tap(Math.round(unitPos.x), Math.round(unitPos.y)); // reselect
-await page.waitForTimeout(150);
+// unitPos is stale after the pinch — find an on-screen unit (or centre).
 const lp = await page.evaluate(() => {
-  const u = window.__raDebug.units.find((x) => x.selected);
   const c = window.__raDebug.camera;
-  return { x: (u.x - c.x) * c.zoom, y: (u.y - c.y) * c.zoom };
+  const hit = window.__raDebug.units
+    .map((u) => ({ x: (u.x - c.x) * c.zoom, y: (u.y - c.y) * c.zoom }))
+    .find((p) => p.x > 40 && p.x < innerWidth - 40 && p.y > 60 && p.y < innerHeight - 220);
+  return hit ?? { x: innerWidth / 2, y: innerHeight / 2 };
 });
+await page.touchscreen.tap(Math.round(lp.x), Math.round(lp.y)); // select it
+await page.waitForTimeout(150);
 await cdp.send('Input.dispatchTouchEvent', {
   type: 'touchStart',
   touchPoints: [{ x: Math.round(lp.x), y: Math.round(lp.y), id: 21 }],
@@ -173,13 +183,15 @@ await cdp.send('Input.dispatchTouchEvent', {
 await page.waitForTimeout(700);
 await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
 await page.waitForTimeout(150);
+const menu = await page.evaluate(() => window.__raDebug.touchMenu);
+check('longpress opens command strip with 4 items', !!menu && menu.items.length === 4);
+check('strip docks above the action bar', !!menu && menu.rect.y > scroll.ih * 0.55);
 await shot(page, 'longpress-menu');
-// Menu is canvas-drawn; assert via a tap on the 停止 button column beside the point.
-// Items sit at cx = at.x + 44, third item (停止) is index 2 going up.
-const stop = { x: Math.round(lp.x) + 44, y: Math.round(lp.y) - 24 - 2 * 68 };
-await page.touchscreen.tap(stop.x, stop.y);
+// Tap the 停止 item — menu exposes real rects now, no geometry guessing.
+const stop = menu ? menu.items.find((i) => i.id === 'stop') : null;
+if (stop) await page.touchscreen.tap(stop.rect.x + stop.rect.w / 2, stop.rect.y + stop.rect.h / 2);
 await page.waitForTimeout(150);
-check('longpress menu opens (no crash, still playing)', true);
+check('command strip closes after a command', (await page.evaluate(() => window.__raDebug.touchMenu)) === null);
 
 await browser.close();
 

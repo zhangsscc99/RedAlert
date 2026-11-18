@@ -1,9 +1,9 @@
 // HUD: left resource panel, selection card, production queue, messages, minimap.
 
 import {
-  GRASS,
   TILE_SIZE,
   isExplored,
+  minimapViewRect,
   type Camera,
   type Fog,
   type GameMap,
@@ -62,9 +62,11 @@ export interface HudLayout {
   resource: Rect;
   /** Production-queue strip (w=0 when empty). */
   prodPanel: Rect;
+  /** Top-centre entry-hint strip (w=0 on desktop). */
+  hint: Rect;
 }
 
-const MOBILE_MINIMAP_LAND = 104;
+const MOBILE_MINIMAP_LAND = 120;
 const MOBILE_MINIMAP_PORT = 96;
 const SAFE_PAD_TOUCH = 16;
 const ACTION_BTN_H = 48; // ≥44 CSS px
@@ -117,6 +119,7 @@ export function computeHudLayout(
       msgBox: { x: 12, y: 0, w: 0, h: msgBottom },
       resource: { x: 10, y: 10, w: 148, h: 12 + 5 * 30 },
       prodPanel,
+      hint: { x: 0, y: 0, w: 0, h: 0 },
     };
   }
 
@@ -175,8 +178,8 @@ export function computeHudLayout(
   const minimap: Rect | null = o.minimapCollapsed
     ? null
     : {
-        x: viewW - mmSize - 10,
-        y: actionBar.y - 8 - mmSize,
+        x: viewW - mmSize - 12,
+        y: actionBar.y - 12 - mmSize,
         w: mmSize,
         h: mmSize,
       };
@@ -205,6 +208,12 @@ export function computeHudLayout(
     h: 34,
   };
   const resH = 12 + 5 * 36;
+  const resource: Rect = { x: 10, y: 10, w: 170, h: resH };
+  // Entry hint: centred at the top. On narrow portrait screens it would
+  // overlap the resource panel, so it slides just below it instead.
+  const hintW = Math.min(viewW - 24, 400);
+  const hint: Rect = { x: (viewW - hintW) / 2, y: 12, w: hintW, h: 40 };
+  if (hint.x < resource.x + resource.w + 8) hint.y = resource.y + resource.h + 8;
   return {
     mode,
     viewW,
@@ -218,8 +227,9 @@ export function computeHudLayout(
     buildBarOpen,
     selCard,
     msgBox: { x: 10, y: 10 + resH + 10, w: Math.min(viewW - 20, 420), h: 120 },
-    resource: { x: 10, y: 10, w: 170, h: resH },
+    resource,
     prodPanel,
+    hint,
   };
 }
 
@@ -655,6 +665,12 @@ export function drawSelectBox(ctx: CanvasRenderingContext2D, r: Rect): void {
   ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
 }
 
+// Terrain colours indexed by tile id (GRASS/WATER/ORE). Fogged cells reuse a
+// darkened palette so the whole map stays legible under fog instead of the
+// minimap reading as a black slab with one bright speck.
+const MM_TILE: readonly string[] = ['#3e7f30', '#1a4882', '#8a6d1e'];
+const MM_TILE_DIM: readonly string[] = ['#1a2b14', '#0e2038', '#38290f'];
+
 export function drawMinimap(
   ctx: CanvasRenderingContext2D,
   map: GameMap,
@@ -666,28 +682,21 @@ export function drawMinimap(
 ): void {
   const r = layout.minimap;
   if (!r) return;
-  const viewW = layout.viewW;
-  const viewH = layout.viewH;
   const sx = r.w / (map.w * TILE_SIZE);
   const sy = r.h / (map.h * TILE_SIZE);
 
-  ctx.fillStyle = '#06101f';
-  ctx.fillRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4);
+  // Translucent float — the battlefield shows through the frame.
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(r.x, r.y, r.w, r.h);
 
+  const tileW = TILE_SIZE * sx;
+  const tileH = TILE_SIZE * sy;
   for (let ty = 0; ty < map.h; ty++) {
     for (let tx = 0; tx < map.w; tx++) {
-      ctx.fillStyle =
-        fog && !isExplored(fog, tx, ty)
-          ? '#0b0e0a'
-          : map.tiles[ty * map.w + tx] === GRASS
-            ? '#3e7f30'
-            : '#1a4882';
-      ctx.fillRect(
-        r.x + tx * TILE_SIZE * sx,
-        r.y + ty * TILE_SIZE * sy,
-        Math.ceil(TILE_SIZE * sx),
-        Math.ceil(TILE_SIZE * sy),
-      );
+      const t = map.tiles[ty * map.w + tx] ?? 0;
+      const seen = !fog || isExplored(fog, tx, ty);
+      ctx.fillStyle = (seen ? MM_TILE : MM_TILE_DIM)[t] ?? MM_TILE[0]!;
+      ctx.fillRect(r.x + tx * tileW, r.y + ty * tileH, Math.ceil(tileW), Math.ceil(tileH));
     }
   }
 
@@ -700,18 +709,22 @@ export function drawMinimap(
     ctx.fillRect(r.x + u.x * sx - 1.5, r.y + u.y * sy - 1.5, 3, 3);
   }
 
-  // Camera viewport rectangle.
-  ctx.strokeStyle = 'rgba(255,255,255,0.85)';
-  ctx.lineWidth = 1;
-  ctx.strokeRect(
-    r.x + cam.x * sx,
-    r.y + cam.y * sy,
-    (viewW / cam.zoom) * sx,
-    (viewH / cam.zoom) * sy,
-  );
+  // View frame: exact camera region, clipped to the map and pixel-snapped
+  // so all four edges render at a uniform 1px.
+  const v = minimapViewRect(cam, map, r);
+  if (v.w > 0 && v.h > 0) {
+    const x0 = Math.round(v.x) + 0.5;
+    const y0 = Math.round(v.y) + 0.5;
+    const x1 = Math.round(v.x + v.w) - 0.5;
+    const y1 = Math.round(v.y + v.h) - 0.5;
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+  }
 
-  ctx.strokeStyle = 'rgba(255,255,255,0.4)';
-  ctx.strokeRect(r.x - 2.5, r.y - 2.5, r.w + 5, r.h + 5);
+  ctx.strokeStyle = PANEL_BORDER;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
 }
 
 // ----------------------------------------------------------- build bar ----
@@ -781,6 +794,7 @@ export function drawBuildBar(
   ctx: CanvasRenderingContext2D,
   layout: HudLayout,
   items: readonly BuildBarItem[],
+  pressedIdx = -1,
 ): void {
   if (items.length === 0 || !layout.buildBarOpen) return;
   const btn = barBtnSize(layout);
@@ -791,14 +805,23 @@ export function drawBuildBar(
     const x = r.x + BAR_PAD + i * (btn.w + BAR_GAP);
     const y = r.y + BAR_PAD;
     const dim = !it.enabled;
+    const pressed = i === pressedIdx;
 
-    ctx.fillStyle = it.active
-      ? 'rgba(93, 255, 93, 0.14)'
-      : dim
-        ? 'rgba(255,255,255,0.03)'
-        : 'rgba(255,255,255,0.07)';
+    ctx.save();
+    if (pressed) {
+      ctx.translate(x + btn.w / 2, y + btn.h / 2);
+      ctx.scale(0.96, 0.96);
+      ctx.translate(-(x + btn.w / 2), -(y + btn.h / 2));
+    }
+    ctx.fillStyle = pressed
+      ? 'rgba(93,255,93,0.2)'
+      : it.active
+        ? 'rgba(93, 255, 93, 0.14)'
+        : dim
+          ? 'rgba(255,255,255,0.03)'
+          : 'rgba(255,255,255,0.07)';
     ctx.fillRect(x, y, btn.w, btn.h);
-    ctx.strokeStyle = it.active ? ACCENT : 'rgba(255,255,255,0.18)';
+    ctx.strokeStyle = it.active || pressed ? ACCENT : 'rgba(255,255,255,0.18)';
     ctx.lineWidth = 1;
     ctx.strokeRect(x + 0.5, y + 0.5, btn.w - 1, btn.h - 1);
 
@@ -829,6 +852,7 @@ export function drawBuildBar(
     ctx.fillStyle = BAD;
     if (!it.enabled && it.reason)
       ctx.fillText(it.reason, x + 6, y + (layout.mode === 'desktop' ? 46 : 51));
+    ctx.restore();
   });
 }
 
@@ -854,7 +878,15 @@ export function minimapToWorld(
 export function drawActionBar(
   ctx: CanvasRenderingContext2D,
   layout: HudLayout,
-  state: { buildOpen: boolean; minimapOn: boolean; fullscreenOn: boolean },
+  state: {
+    buildOpen: boolean;
+    minimapOn: boolean;
+    fullscreenOn: boolean;
+    /** Command strip is up → the row yields so the two don't fight. */
+    menuOpen?: boolean;
+    /** Finger currently held on a button (0.96 press-in + highlight). */
+    pressed?: ActionId | null;
+  },
 ): void {
   const bar = layout.actionBar;
   if (!bar) return;
@@ -868,22 +900,36 @@ export function drawActionBar(
   ctx.lineTo(bar.x + bar.w, bar.y + 0.5);
   ctx.stroke();
 
+  if (state.menuOpen) return;
+
   for (const b of layout.actionButtons) {
     const r = b.rect;
     const on =
       (b.id === 'build' && state.buildOpen) ||
       (b.id === 'map' && state.minimapOn) ||
       (b.id === 'fullscreen' && state.fullscreenOn);
-    ctx.fillStyle = on ? 'rgba(93,255,93,0.14)' : 'rgba(255,255,255,0.06)';
+    const pressed = state.pressed === b.id;
+    ctx.save();
+    if (pressed) {
+      ctx.translate(r.x + r.w / 2, r.y + r.h / 2);
+      ctx.scale(0.96, 0.96);
+      ctx.translate(-(r.x + r.w / 2), -(r.y + r.h / 2));
+    }
+    ctx.fillStyle = pressed
+      ? 'rgba(93,255,93,0.2)'
+      : on
+        ? 'rgba(93,255,93,0.14)'
+        : 'rgba(255,255,255,0.06)';
     ctx.fillRect(r.x, r.y, r.w, r.h);
-    ctx.strokeStyle = on ? ACCENT : 'rgba(255,255,255,0.18)';
+    ctx.strokeStyle = on || pressed ? ACCENT : 'rgba(255,255,255,0.18)';
     ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
 
     ctx.font = `bold ${layout.font}px ui-monospace, Menlo, Consolas, monospace`;
-    ctx.fillStyle = on ? ACCENT : TEXT_MAIN;
+    ctx.fillStyle = on || pressed ? ACCENT : TEXT_MAIN;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(b.label, r.x + r.w / 2, r.y + r.h / 2 + 1);
+    ctx.restore();
     ctx.textAlign = 'left';
     ctx.textBaseline = 'alphabetic';
   }
@@ -895,22 +941,28 @@ export type MenuCmd = 'move' | 'attack' | 'stop' | 'guard';
 
 export interface TouchMenuItem {
   id: MenuCmd;
-  cx: number;
-  cy: number;
-  r: number;
+  rect: Rect;
   label: string;
 }
 
 export interface TouchMenu {
   /** Screen point the menu opened at (world anchor for move/attack). */
   at: { x: number; y: number };
+  /** The strip rect the buttons dock in — doubles as the dismiss boundary. */
+  rect: Rect;
   items: TouchMenuItem[];
 }
 
-const MENU_R = 30; // radius → 60px diameter buttons (≥56)
-const MENU_STEP = 68;
+const MENU_BTN = 56; // ≥56×56 CSS px command buttons
+const MENU_GAP = 10;
+const MENU_PAD = 10;
+const MENU_MAX_H_FRAC = 0.22; // strip may cover at most 22% of view height
 
-/** Column of circular buttons at the touch point; flips side near an edge. */
+/**
+ * Horizontal command strip docked above the action bar — long-press opens
+ * it instead of a radial column, so the battlefield stays visible. Button
+ * height shrinks on very short viewports to honour the 22% cap.
+ */
 export function touchMenuLayout(
   at: { x: number; y: number },
   layout: HudLayout,
@@ -921,45 +973,80 @@ export function touchMenuLayout(
     { id: 'stop', label: '停止' },
     { id: 'guard', label: '守卫' },
   ];
-  const cx = Math.max(MENU_R + 8, Math.min(layout.viewW - MENU_R - 8, at.x + MENU_R + 14));
-  const up = at.y - MENU_STEP * defs.length - MENU_R > 8;
+  const btn = Math.min(
+    MENU_BTN,
+    Math.max(44, Math.floor(layout.viewH * MENU_MAX_H_FRAC) - MENU_PAD * 2),
+  );
+  const w = Math.min(
+    layout.viewW - 16,
+    MENU_PAD * 2 + defs.length * btn + (defs.length - 1) * MENU_GAP,
+  );
+  const h = MENU_PAD * 2 + btn;
+  const dock = layout.actionBar ? layout.actionBar.y : layout.viewH - layout.safePad;
+  const rect: Rect = {
+    x: Math.max(8, Math.min(layout.viewW - w - 8, (layout.viewW - w) / 2)),
+    y: dock - 8 - h,
+    w,
+    h,
+  };
+  // Keep the strip clear of the corner minimap when they share a band.
+  const mm = layout.minimap;
+  if (mm && rect.y < mm.y + mm.h && rect.y + rect.h > mm.y && rect.x + rect.w > mm.x - 8) {
+    rect.x = Math.max(8, Math.min(rect.x, mm.x - 8 - rect.w));
+  }
   const items = defs.map((d, i) => ({
     ...d,
-    cx,
-    cy: up ? at.y - 24 - i * MENU_STEP : at.y + 24 + i * MENU_STEP,
-    r: MENU_R,
+    rect: {
+      x: rect.x + MENU_PAD + i * (btn + MENU_GAP),
+      y: rect.y + MENU_PAD,
+      w: btn,
+      h: btn,
+    },
   }));
-  return { at, items };
+  return { at, rect, items };
 }
 
 export function touchMenuHit(menu: TouchMenu, px: number, py: number): MenuCmd | null {
   for (const it of menu.items) {
-    if (Math.hypot(px - it.cx, py - it.cy) <= it.r) return it.id;
+    const r = it.rect;
+    if (px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h) return it.id;
   }
   return null;
 }
 
-export function drawTouchMenu(ctx: CanvasRenderingContext2D, menu: TouchMenu): void {
+export function drawTouchMenu(
+  ctx: CanvasRenderingContext2D,
+  menu: TouchMenu,
+  pressed: MenuCmd | null = null,
+): void {
   // Anchor dot where the long-press happened.
   ctx.fillStyle = 'rgba(93,255,93,0.5)';
   ctx.beginPath();
   ctx.arc(menu.at.x, menu.at.y, 5, 0, Math.PI * 2);
   ctx.fill();
 
+  panel(ctx, menu.rect.x, menu.rect.y, menu.rect.w, menu.rect.h);
   for (const it of menu.items) {
-    ctx.fillStyle = 'rgba(10,14,8,0.88)';
-    ctx.beginPath();
-    ctx.arc(it.cx, it.cy, it.r, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = PANEL_BORDER;
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
+    const r = it.rect;
+    const on = pressed === it.id;
+    ctx.save();
+    if (on) {
+      ctx.translate(r.x + r.w / 2, r.y + r.h / 2);
+      ctx.scale(0.96, 0.96);
+      ctx.translate(-(r.x + r.w / 2), -(r.y + r.h / 2));
+    }
+    ctx.fillStyle = on ? 'rgba(93,255,93,0.2)' : 'rgba(255,255,255,0.07)';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeStyle = on ? ACCENT : PANEL_BORDER;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
 
     ctx.font = 'bold 14px ui-monospace, Menlo, Consolas, monospace';
-    ctx.fillStyle = TEXT_MAIN;
+    ctx.fillStyle = on ? ACCENT : TEXT_MAIN;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(it.label, it.cx, it.cy + 1);
+    ctx.fillText(it.label, r.x + r.w / 2, r.y + r.h / 2 + 1);
+    ctx.restore();
     ctx.textAlign = 'left';
     ctx.textBaseline = 'alphabetic';
   }
@@ -1028,10 +1115,17 @@ export function drawTouchGuide(
   const g = touchGuideLayout(viewW, viewH, step);
   const def = TOUCH_GUIDE_STEPS[step] ?? TOUCH_GUIDE_STEPS[0]!;
 
-  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillStyle = 'rgba(0,0,0,0.62)';
   ctx.fillRect(0, 0, viewW, viewH);
 
-  panel(ctx, g.card.x, g.card.y, g.card.w, g.card.h);
+  // Opaque card — the translucent panel() would let HQ labels and units
+  // bleed through the text area.
+  ctx.fillStyle = '#0d110b';
+  ctx.fillRect(g.card.x, g.card.y, g.card.w, g.card.h);
+  ctx.strokeStyle = PANEL_BORDER;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(g.card.x + 0.5, g.card.y + 0.5, g.card.w - 1, g.card.h - 1);
+
   ctx.font = 'bold 18px ui-monospace, Menlo, Consolas, monospace';
   ctx.fillStyle = ACCENT;
   ctx.textBaseline = 'alphabetic';
@@ -1062,4 +1156,27 @@ export function drawTouchGuide(
   ctx.font = '12px ui-monospace, Menlo, Consolas, monospace';
   ctx.fillStyle = TEXT_DIM;
   ctx.fillText(`${step + 1}/${TOUCH_GUIDE_STEPS.length}`, g.card.x + g.card.w - 52, g.card.y + 20);
+}
+
+// ------------------------------------------------------------- touch hint ----
+
+/** 进场提示条：顶部居中一条半透明提示，alpha 控制整体淡出（0 = 不画）。 */
+export function drawTouchHint(
+  ctx: CanvasRenderingContext2D,
+  layout: HudLayout,
+  text: string,
+  alpha: number,
+): void {
+  const r = layout.hint;
+  if (r.w <= 0 || alpha <= 0) return;
+  ctx.globalAlpha = Math.min(1, Math.max(0, alpha));
+  panel(ctx, r.x, r.y, r.w, r.h);
+  ctx.font = `bold ${Math.max(14, layout.font)}px ui-monospace, Menlo, Consolas, monospace`;
+  ctx.fillStyle = TEXT_MAIN;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, r.x + r.w / 2, r.y + r.h / 2 + 1);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.globalAlpha = 1;
 }
