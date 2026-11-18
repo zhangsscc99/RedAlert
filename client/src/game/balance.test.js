@@ -50,8 +50,35 @@ var BALANCE_TABLE = {
   buildings: BUILDING_BALANCE,
   waves: WAVE_BALANCE
 };
-function validateBalance() {
+var DIFFICULTY = {
+  easy: { label: "Easy", startCredits: 7e3, waveIntervalScale: 1.35, enemyStrengthScale: 0.8, enemyStartInfantry: 2 },
+  normal: { label: "Normal", startCredits: 5e3, waveIntervalScale: 1, enemyStrengthScale: 1, enemyStartInfantry: 4 },
+  hard: { label: "Hard", startCredits: 3500, waveIntervalScale: 0.75, enemyStrengthScale: 1.25, enemyStartInfantry: 6 }
+};
+var DIFFICULTY_ORDER = ["easy", "normal", "hard"];
+var ASCENDING_FIELDS = ["enemyStrengthScale", "enemyStartInfantry"];
+var DESCENDING_FIELDS = ["startCredits", "waveIntervalScale"];
+function validateBalance(difficulty = "normal") {
   const errors = [];
+  const tier = DIFFICULTY[difficulty];
+  for (const f of ["startCredits", "waveIntervalScale", "enemyStrengthScale", "enemyStartInfantry"]) {
+    const v = tier[f];
+    if (!Number.isFinite(v) || v < 0) errors.push(`difficulty.${difficulty}.${f}: ${v}`);
+  }
+  for (const f of ASCENDING_FIELDS) {
+    for (let i = 1; i < DIFFICULTY_ORDER.length; i++) {
+      const prev = DIFFICULTY[DIFFICULTY_ORDER[i - 1]][f];
+      const cur = DIFFICULTY[DIFFICULTY_ORDER[i]][f];
+      if (cur < prev) errors.push(`difficulty.${f}: ${DIFFICULTY_ORDER[i - 1]}=${prev} > ${DIFFICULTY_ORDER[i]}=${cur}`);
+    }
+  }
+  for (const f of DESCENDING_FIELDS) {
+    for (let i = 1; i < DIFFICULTY_ORDER.length; i++) {
+      const prev = DIFFICULTY[DIFFICULTY_ORDER[i - 1]][f];
+      const cur = DIFFICULTY[DIFFICULTY_ORDER[i]][f];
+      if (cur > prev) errors.push(`difficulty.${f}: ${DIFFICULTY_ORDER[i - 1]}=${prev} < ${DIFFICULTY_ORDER[i]}=${cur}`);
+    }
+  }
   for (const kind of Object.keys(UNIT_STATS)) {
     const a = UNIT_STATS[kind];
     const b = BALANCE[kind];
@@ -68,9 +95,9 @@ function validateBalance() {
   }
   return errors;
 }
-function waveSize(n) {
+function waveSize(n, difficulty = "normal") {
   const k = Math.max(0, Math.floor(n));
-  return Math.min(WAVE_BALANCE.max, WAVE_BALANCE.size + WAVE_BALANCE.growth * k);
+  return Math.min(WAVE_BALANCE.max, DIFFICULTY[difficulty].enemyStartInfantry + WAVE_BALANCE.growth * k);
 }
 
 // src/game/balance.test.ts
@@ -100,6 +127,58 @@ test("waveSize is capped at WAVE_BALANCE.max", () => {
 test("waveSize handles negative and fractional input without crashing", () => {
   assert.equal(waveSize(-5), WAVE_BALANCE.size);
   assert.equal(waveSize(1.9), WAVE_BALANCE.size + WAVE_BALANCE.growth);
+});
+test("waveSize orders easy <= normal <= hard at every wave", () => {
+  for (let n = 0; n <= 50; n++) {
+    const e = waveSize(n, "easy");
+    const m = waveSize(n, "normal");
+    const h = waveSize(n, "hard");
+    assert.ok(e <= m && m <= h, `wave ${n}: ${e} <= ${m} <= ${h}`);
+  }
+});
+test("waveSize normal matches the pre-difficulty tuning exactly", () => {
+  for (let n = 0; n <= 50; n++) {
+    assert.equal(waveSize(n, "normal"), waveSize(n));
+    assert.equal(waveSize(n), Math.min(WAVE_BALANCE.max, WAVE_BALANCE.size + WAVE_BALANCE.growth * n));
+  }
+});
+test("waveSize is monotonic non-decreasing within each difficulty", () => {
+  for (const d of ["easy", "normal", "hard"]) {
+    let prev = waveSize(0, d);
+    for (let n = 1; n <= 50; n++) {
+      const cur = waveSize(n, d);
+      assert.ok(cur >= prev, `${d} wave ${n} shrank: ${prev} -> ${cur}`);
+      prev = cur;
+    }
+  }
+});
+test("every difficulty tier has a label and positive startCredits", () => {
+  for (const d of ["easy", "normal", "hard"]) {
+    assert.ok(DIFFICULTY[d].label.length > 0, `${d} has no label`);
+    assert.ok(DIFFICULTY[d].startCredits > 0, `${d} startCredits <= 0`);
+  }
+});
+test("validateBalance flags negative or non-finite difficulty values", () => {
+  const saved = DIFFICULTY.hard.startCredits;
+  try {
+    DIFFICULTY.hard.startCredits = -1;
+    assert.ok(validateBalance("hard").some((e) => e.includes("difficulty.hard.startCredits")));
+    DIFFICULTY.hard.startCredits = Number.NaN;
+    assert.ok(validateBalance("hard").some((e) => e.includes("difficulty.hard.startCredits")));
+  } finally {
+    DIFFICULTY.hard.startCredits = saved;
+  }
+  assert.deepEqual(validateBalance("hard"), []);
+});
+test("validateBalance flags non-monotonic difficulty ordering", () => {
+  const saved = DIFFICULTY.easy.enemyStartInfantry;
+  try {
+    DIFFICULTY.easy.enemyStartInfantry = 99;
+    assert.ok(validateBalance().some((e) => e.includes("difficulty.enemyStartInfantry")));
+  } finally {
+    DIFFICULTY.easy.enemyStartInfantry = saved;
+  }
+  assert.deepEqual(validateBalance(), []);
 });
 test("tank costs more than infantry", () => {
   assert.ok(BALANCE.tank.cost > BALANCE.infantry.cost);
