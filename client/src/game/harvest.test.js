@@ -195,6 +195,7 @@ var INFANTRY_SPEED = UNIT_STATS.infantry.speed;
 // src/game/economy.ts
 var ORE_GRADE_POOR = 1;
 var ORE_GRADE_RICH = 2;
+var ORE_REGEN_RATE = 6;
 var NEAR_CAP_FRACTION = 0.9;
 function createEconomy(start = 5e3, opts) {
   const cap = opts?.cap;
@@ -210,16 +211,28 @@ function createEconomy(start = 5e3, opts) {
     nearCap: false,
     nearCapFraction: opts?.nearCapFraction,
     lowFundsAt: opts?.lowFundsAt,
+    lowFundsWarnFraction: opts?.lowFundsWarnFraction,
+    lowFundsCritFraction: opts?.lowFundsCritFraction,
     lostToCap: 0,
     alertLog: {}
   };
   refreshFlags(e);
   return e;
 }
+function canAfford(e, amount) {
+  return amount >= 0 && e.credits >= amount;
+}
 function refreshFlags(e) {
   e.broke = e.credits < 0;
   if (e.cap === void 0 || e.credits < e.cap) e.storageFull = false;
   e.nearCap = e.cap !== void 0 && e.credits >= e.cap * (e.nearCapFraction ?? NEAR_CAP_FRACTION);
+}
+function spend(e, amount) {
+  if (!canAfford(e, amount)) return false;
+  e.credits -= amount;
+  e.spent += amount;
+  refreshFlags(e);
+  return true;
 }
 function credit(e, amount, grade = ORE_GRADE_POOR) {
   const scaled = amount * (grade > 0 ? grade : 0);
@@ -237,6 +250,21 @@ function credit(e, amount, grade = ORE_GRADE_POOR) {
   refreshFlags(e);
   return accepted;
 }
+function oreRegenTick(reserves, dt, opts) {
+  const rate = opts?.rate ?? ORE_REGEN_RATE;
+  if (!(dt > 0) || !(rate > 0)) return 0;
+  const cap = opts?.cap ?? Infinity;
+  const skip = opts?.skip;
+  let gained = 0;
+  for (let i = 0; i < reserves.length; i++) {
+    const r = reserves[i];
+    if (!(r > 0) || r >= cap || skip?.has(i) === true) continue;
+    const next = Math.min(cap, r + rate * dt);
+    reserves[i] = next;
+    gained += next - r;
+  }
+  return gained;
+}
 
 // src/game/buildings.ts
 var BUILDING_DEFS = {
@@ -247,13 +275,49 @@ var BUILDING_DEFS = {
   turret: { w: 2, h: 2, cost: 700, buildTime: 12, hp: 700, label: "Turret", range: 150, damage: 30, powerUse: 30, buildable: true },
   wall: { w: 1, h: 1, cost: 100, buildTime: 4, hp: 500, label: "Wall", blocksPath: true, buildable: true }
 };
+function isAdjacentTo(b, gx, gy) {
+  const def = BUILDING_DEFS[b.kind];
+  return gx >= b.gx - 1 && gx <= b.gx + def.w && gy >= b.gy - 1 && gy <= b.gy + def.h;
+}
 var RADAR_SCAN = { radius: 12 * TILE_SIZE, period: 5 };
+var DEPOT_REPAIR = { rate: 20, costPerHp: 0.5 };
+function tickDepotRepair(depot, vehicles, dt, e, opts = {}) {
+  const result = { healed: [], spent: 0, paused: false };
+  const rate = opts.rate ?? DEPOT_REPAIR.rate;
+  const costPerHp = opts.costPerHp ?? DEPOT_REPAIR.costPerHp;
+  if (!(dt > 0) || !depot.done || !(rate > 0) || !(costPerHp >= 0)) return result;
+  for (const v of vehicles) {
+    if (v.hp <= 0 || v.hp >= v.maxHp) continue;
+    if (!isAdjacentTo(depot, worldToTile(v.x), worldToTile(v.y))) continue;
+    if (e.credits <= 0) {
+      result.paused = true;
+      break;
+    }
+    let heal = Math.min(rate * dt, v.maxHp - v.hp);
+    let cost = heal * costPerHp;
+    if (cost > e.credits) {
+      heal = e.credits / costPerHp;
+      cost = e.credits;
+      result.paused = true;
+    }
+    if (!(heal > 0) || !spend(e, cost)) {
+      result.paused = true;
+      break;
+    }
+    v.hp += heal;
+    result.spent += cost;
+    result.healed.push({ id: v.id, hp: v.hp });
+    if (result.paused) break;
+  }
+  return result;
+}
 
 // src/game/harvest.ts
 var HARVEST_RATE = 140;
 var HARVEST_CAPACITY = 700;
 var ORE_RESERVE = 350;
 var STUCK_SECONDS = 3;
+var REPAIR_BELOW = 0.5;
 var STUCK_EPS = 1;
 var MAX_MINERS_PER_TILE = 1;
 var CLAIM_PENALTY = 4;
@@ -280,6 +344,9 @@ function harvesterStatus(h) {
       return "hauling";
     case "unloading":
       return "unloading";
+    case "toRepair":
+    case "repairing":
+      return "repairing";
     default:
       return h.noOre ? "depleted" : "standby";
   }
@@ -289,7 +356,7 @@ var gradesByMap = /* @__PURE__ */ new WeakMap();
 function setOreGrade(map, x, y, grade) {
   let g = gradesByMap.get(map);
   if (!g) {
-    g = new Float64Array(map.w * map.h).fill(ORE_GRADE_POOR);
+    g = new Float64Array(map.w * map.h);
     gradesByMap.set(map, g);
   }
   g[idx(map, x, y)] = grade;
@@ -306,6 +373,9 @@ function reserveTable(map) {
     reservesByMap.set(map, r);
   }
   return r;
+}
+function oreReserveAt(map, x, y) {
+  return isOre(map, x, y) ? reserveTable(map)[idx(map, x, y)] ?? 0 : 0;
 }
 function stepAlong(u, dt) {
   let remaining = UNIT_STATS.harvester.speed * dt;
@@ -371,6 +441,9 @@ function resetWatchdog(h) {
   h.stuckT = 0;
   h.lastX = h.unit.x;
   h.lastY = h.unit.y;
+}
+function needsRepair(h) {
+  return h.unit.hp > 0 && h.unit.maxHp > 0 && h.unit.hp < h.unit.maxHp * REPAIR_BELOW;
 }
 function toIdle(h) {
   h.state = "idle";
@@ -459,7 +532,7 @@ function dropoffBuilding(buildings, ux, uy) {
   }
   return best;
 }
-function sendToRefinery(h, map, buildings, blockers) {
+function sendToRefinery(h, map, buildings, blockers, forRepair = false) {
   const ux = worldToTile(h.unit.x);
   const uy = worldToTile(h.unit.y);
   const b = dropoffBuilding(buildings, ux, uy);
@@ -474,14 +547,18 @@ function sendToRefinery(h, map, buildings, blockers) {
   h.unit.path = path.map((t) => ({ x: tileCenter(t.x), y: tileCenter(t.y) }));
   const last = path[path.length - 1];
   h.target = last ? { x: last.x, y: last.y } : goal;
-  h.state = path.length === 0 ? "unloading" : "toRefinery";
+  if (path.length === 0) {
+    h.state = forRepair && h.cargo <= 0 ? "repairing" : "unloading";
+  } else {
+    h.state = forRepair ? "toRepair" : "toRefinery";
+  }
   resetWatchdog(h);
   return true;
 }
 function hasDropoff(buildings) {
   return buildings.some((b) => b.done && (b.kind === "refinery" || b.kind === "hq"));
 }
-function updateHarvesters(hs, map, buildings, economy, dt, obstacles) {
+function updateHarvesters(hs, map, buildings, economy, dt, obstacles, regen) {
   const depleted = [];
   if (dt <= 0) return depleted;
   const reserves = reserveTable(map);
@@ -494,9 +571,22 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles) {
       claims.set(i, (claims.get(i) ?? 0) + 1);
     }
   }
+  if (regen !== false) {
+    oreRegenTick(reserves, dt, {
+      rate: regen?.rate ?? ORE_REGEN_RATE,
+      cap: regen?.cap ?? ORE_RESERVE,
+      skip: new Set(claims.keys())
+    });
+  }
   for (const h of hs) {
     if (h.unit.kind !== "harvester") continue;
-    if (h.state === "toOre" || h.state === "toRefinery") {
+    if (needsRepair(h) && (h.state === "idle" || h.state === "toOre" || h.state === "mining")) {
+      const claimed = h.target !== null && h.state !== "idle" && isOre(map, h.target.x, h.target.y) ? idx(map, h.target.x, h.target.y) : -1;
+      if (sendToRefinery(h, map, buildings, blockers, true) && claimed >= 0) {
+        claims.set(claimed, (claims.get(claimed) ?? 1) - 1);
+      }
+    }
+    if (h.state === "toOre" || h.state === "toRefinery" || h.state === "toRepair") {
       const dx = h.unit.x - (h.lastX ?? h.unit.x);
       const dy = h.unit.y - (h.lastY ?? h.unit.y);
       const stuckT = dx * dx + dy * dy < STUCK_EPS * STUCK_EPS ? (h.stuckT ?? 0) + dt : 0;
@@ -517,8 +607,10 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles) {
           }
           if (!ok) ok = sendToOre(h, map, reserves, claims, avoid, avoidBlocked);
           if (!ok) ok = sendToOre(h, map, reserves, claims, blockers, blocked);
-        } else {
+        } else if (h.state === "toRefinery") {
           ok = sendToRefinery(h, map, buildings, avoid) || sendToRefinery(h, map, buildings, blockers);
+        } else {
+          ok = sendToRefinery(h, map, buildings, avoid, true) || sendToRefinery(h, map, buildings, blockers, true);
         }
         if (!ok) toIdle(h);
         continue;
@@ -588,6 +680,32 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles) {
         h.cargo = 0;
         h.target = null;
         h.state = "idle";
+        break;
+      }
+      case "toRepair": {
+        stepAlong(h.unit, dt);
+        if (h.unit.path.length === 0) {
+          h.state = h.cargo > 0 ? "unloading" : "repairing";
+        }
+        break;
+      }
+      case "repairing": {
+        const ux = worldToTile(h.unit.x);
+        const uy = worldToTile(h.unit.y);
+        const depot = dropoffBuilding(buildings, ux, uy);
+        if (!depot) {
+          toIdle(h);
+          break;
+        }
+        if (!isAdjacentTo(depot, ux, uy)) {
+          if (!sendToRefinery(h, map, buildings, blockers, true)) toIdle(h);
+          break;
+        }
+        tickDepotRepair(depot, [h.unit], dt, economy);
+        if (h.unit.hp >= h.unit.maxHp) {
+          h.noOre = false;
+          toIdle(h);
+        }
         break;
       }
     }
@@ -1041,4 +1159,126 @@ test("each harvester claims the vein nearest to it", () => {
   drive([h1, h2], map, [refinery], econ, 3);
   assert.deepEqual(h1.target, { x: 10, y: 8 });
   assert.deepEqual(h2.target, { x: 16, y: 8 });
+});
+test("a damaged harvester breaks off mining, welds at the depot, then resumes", () => {
+  const map = openMap();
+  const refinery = building("refinery", 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  const h = createHarvester(unitAt("harvester", 8, 8));
+  const econ = createEconomy(5e3);
+  for (let i = 0; i < 50 && h.state !== "mining"; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2);
+  }
+  assert.equal(h.state, "mining");
+  h.unit.hp = Math.floor(h.unit.maxHp * REPAIR_BELOW) - 1;
+  updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, "toRepair");
+  let sawRepairing = false;
+  for (let i = 0; i < 600 && h.state !== "idle"; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2);
+    if (h.state === "repairing") sawRepairing = true;
+  }
+  assert.ok(sawRepairing, "spent time welding at the depot");
+  assert.equal(h.unit.hp, h.unit.maxHp);
+  assert.equal(h.state, "idle");
+  assert.ok(econ.credits < 5e3, "welding billed the economy");
+  updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.ok(h.state === "toOre" || h.state === "mining");
+});
+test("a damaged harvester with a full hold still unloads before welding", () => {
+  const map = openMap();
+  const refinery = building("refinery", 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  const h = createHarvester(unitAt("harvester", 8, 8));
+  h.cargo = HARVEST_CAPACITY;
+  h.unit.hp = Math.floor(h.unit.maxHp * REPAIR_BELOW) - 1;
+  const econ = createEconomy(0);
+  updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, "toRepair");
+  for (let i = 0; i < 200 && h.cargo > 0; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2);
+  }
+  assert.equal(h.cargo, 0);
+  assert.equal(econ.earned, HARVEST_CAPACITY);
+});
+test("a hauling leg is never interrupted by battle damage", () => {
+  const map = openMap();
+  const refinery = building("refinery", 2, 2);
+  const h = createHarvester(unitAt("harvester", 15, 8));
+  h.cargo = 300;
+  const econ = createEconomy(0);
+  updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, "toRefinery");
+  h.unit.hp = Math.floor(h.unit.maxHp * REPAIR_BELOW) - 1;
+  for (let i = 0; i < 200 && h.state === "toRefinery"; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2);
+  }
+  const post = harvesterStatus(h);
+  assert.ok(post === "unloading" || post === "standby");
+  for (let i = 0; i < 10 && harvesterStatus(h) !== "repairing"; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2);
+  }
+  assert.equal(harvesterStatus(h), "repairing");
+});
+test("welding pauses on an empty wallet but the harvester waits at the depot", () => {
+  const map = openMap();
+  const refinery = building("refinery", 2, 2);
+  const h = createHarvester(unitAt("harvester", 8, 8));
+  h.unit.hp = Math.floor(h.unit.maxHp * 0.2);
+  const econ = createEconomy(0);
+  for (let i = 0; i < 200 && h.state !== "repairing"; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2);
+  }
+  assert.equal(h.state, "repairing");
+  for (let i = 0; i < 20; i++) updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, "repairing");
+  assert.equal(h.unit.hp, Math.floor(h.unit.maxHp * 0.2));
+});
+test("a damaged harvester with no dropoff falls back instead of wedging", () => {
+  const map = openMap();
+  setTerrain(map, 10, 8, ORE);
+  const h = createHarvester(unitAt("harvester", 9, 8));
+  h.unit.hp = 10;
+  const econ = createEconomy(0);
+  drive([h], map, [], econ, 50);
+  assert.equal(h.state, "idle");
+});
+test("harvesterStatus reports the repair legs", () => {
+  const h = createHarvester(unitAt("harvester", 5, 5));
+  h.state = "toRepair";
+  assert.equal(harvesterStatus(h), "repairing");
+  h.state = "repairing";
+  assert.equal(harvesterStatus(h), "repairing");
+});
+test("an abandoned live vein slowly refills toward ORE_RESERVE", () => {
+  const map = openMap();
+  const refinery = building("refinery", 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  const h = createHarvester(unitAt("harvester", 8, 8));
+  const econ = createEconomy(0);
+  for (let i = 0; i < 50 && h.state !== "mining"; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2);
+  }
+  for (let i = 0; i < 5; i++) updateHarvesters([h], map, [refinery], econ, 0.2);
+  const drained = oreReserveAt(map, 10, 8);
+  assert.ok(drained > 0 && drained < ORE_RESERVE, `partially drained: ${drained}`);
+  h.unit.hp = 10;
+  updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, "toRepair");
+  for (let i = 0; i < 50; i++) updateHarvesters([h], map, [refinery], econ, 0.2);
+  const regrown = oreReserveAt(map, 10, 8);
+  assert.ok(regrown > drained, `regen refilled ${drained} \u2192 ${regrown}`);
+  assert.ok(regrown <= ORE_RESERVE);
+});
+test("a depleted vein never regrows", () => {
+  const map = openMap();
+  const refinery = building("refinery", 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  const h = createHarvester(unitAt("harvester", 8, 8));
+  const econ = createEconomy(0);
+  const depleted = drive([h], map, [refinery], econ, 400);
+  assert.deepEqual(depleted, [{ x: 10, y: 8 }]);
+  assert.equal(oreReserveAt(map, 10, 8), 0);
+  drive([h], map, [refinery], econ, 200);
+  assert.equal(oreReserveAt(map, 10, 8), 0);
 });

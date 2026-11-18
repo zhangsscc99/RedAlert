@@ -35,6 +35,8 @@ function createEconomy(start = 5e3, opts) {
     nearCap: false,
     nearCapFraction: opts?.nearCapFraction,
     lowFundsAt: opts?.lowFundsAt,
+    lowFundsWarnFraction: opts?.lowFundsWarnFraction,
+    lowFundsCritFraction: opts?.lowFundsCritFraction,
     lostToCap: 0,
     alertLog: {}
   };

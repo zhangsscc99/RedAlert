@@ -5,14 +5,26 @@
 export const ORE_GRADE_POOR = 1;
 /** 富矿收入梯度：同等矿量入账翻倍。 */
 export const ORE_GRADE_RICH = 2;
+/** 贫矿折半品位：储量见底的矿脉按半价入账。 */
+export const ORE_GRADE_LEAN = 0.5;
+/** 储量占比 ≥ 该值的矿脉按富矿品位结算。 */
+export const RICH_VEIN_AT = 0.6;
+/** 储量占比 ≤ 该值的矿脉按贫矿品位结算。 */
+export const LEAN_VEIN_AT = 0.25;
+/** 矿脉再生速率：每格每秒回填的储量（credits）。 */
+export const ORE_REGEN_RATE = 6;
 /** 接近上限阈值：credits ≥ cap × 该比例视为 nearCap。 */
 export const NEAR_CAP_FRACTION = 0.9;
 /** 低资金告警阈值：credits 低于此值时 pollAlerts 报 low-funds。 */
 export const LOW_FUNDS_AT = 500;
+/** 低资金警告线：有 cap 时 credits < cap × 该比例发 low-funds。 */
+export const LOW_FUNDS_WARN_FRACTION = 0.2;
+/** 低资金告急线：有 cap 时 credits < cap × 该比例发 low-funds-critical。 */
+export const LOW_FUNDS_CRIT_FRACTION = 0.1;
 /** 同类告警的最小重发间隔（秒），防止每 tick 刷屏。 */
 export const ALERT_COOLDOWN = 30;
 
-export type EconomyAlert = 'low-funds' | 'near-cap' | 'storage-full';
+export type EconomyAlert = 'low-funds' | 'low-funds-critical' | 'near-cap' | 'storage-full';
 
 export interface Economy {
   credits: number;
@@ -34,6 +46,10 @@ export interface Economy {
   nearCapFraction?: number;
   /** 自定义低资金告警阈值，缺省 LOW_FUNDS_AT。 */
   lowFundsAt?: number;
+  /** 自定义低资金警告比例（占 cap），缺省 LOW_FUNDS_WARN_FRACTION。 */
+  lowFundsWarnFraction?: number;
+  /** 自定义低资金告急比例（占 cap），缺省 LOW_FUNDS_CRIT_FRACTION。 */
+  lowFundsCritFraction?: number;
   /** 因 cap 被丢弃的累计资金，便于统计/测试。 */
   lostToCap?: number;
   /** 各类告警最近一次发出的时刻，供 pollAlerts 节流。 */
@@ -46,6 +62,8 @@ export interface EconomyOptions {
   passiveRate?: number;
   nearCapFraction?: number;
   lowFundsAt?: number;
+  lowFundsWarnFraction?: number;
+  lowFundsCritFraction?: number;
 }
 
 export function createEconomy(start = 5000, opts?: EconomyOptions): Economy {
@@ -62,6 +80,8 @@ export function createEconomy(start = 5000, opts?: EconomyOptions): Economy {
     nearCap: false,
     nearCapFraction: opts?.nearCapFraction,
     lowFundsAt: opts?.lowFundsAt,
+    lowFundsWarnFraction: opts?.lowFundsWarnFraction,
+    lowFundsCritFraction: opts?.lowFundsCritFraction,
     lostToCap: 0,
     alertLog: {},
   };
@@ -134,6 +154,11 @@ export function incomeTick(e: Economy, dt: number, buildingCount = 0): void {
  * 汇总当前应发出的告警，供 UI/日志层展示。同一类告警在 ALERT_COOLDOWN
  * 秒内最多发一次（`now` 用秒，调用方传游戏内时钟或 Date.now()/1000），
  * 条件持续存在也只是低频重发，不会每 tick 刷屏。返回本次应发出的告警。
+ *
+ * 低资金分两级：设了 cap 时按 cap 百分比划线 —— 低于警告线
+ * （lowFundsWarnFraction）发 low-funds，跌破告急线（lowFundsCritFraction）
+ * 升级为 low-funds-critical 并压掉普通警告；没设 cap 退回 lowFundsAt
+ * 绝对阈值的老行为（broke 同样算 low-funds）。
  */
 export function pollAlerts(e: Economy, now: number): EconomyAlert[] {
   const log = (e.alertLog ??= {});
@@ -146,10 +171,62 @@ export function pollAlerts(e: Economy, now: number): EconomyAlert[] {
       out.push(kind);
     }
   };
-  fire('low-funds', e.broke === true || e.credits < (e.lowFundsAt ?? LOW_FUNDS_AT));
+  if (e.cap !== undefined) {
+    const warnAt = e.cap * (e.lowFundsWarnFraction ?? LOW_FUNDS_WARN_FRACTION);
+    const critAt = e.cap * (e.lowFundsCritFraction ?? LOW_FUNDS_CRIT_FRACTION);
+    const critical = e.credits < critAt;
+    fire('low-funds-critical', critical);
+    fire('low-funds', !critical && e.credits < warnAt);
+  } else {
+    fire('low-funds', e.broke === true || e.credits < (e.lowFundsAt ?? LOW_FUNDS_AT));
+  }
   fire('near-cap', e.nearCap === true);
   fire('storage-full', e.storageFull === true);
   return out;
+}
+
+/**
+ * 富矿/贫矿收入梯度：按矿脉剩余储量占满储 `full` 的比例给结算
+ * multiplier —— 满储段（≥ RICH_VEIN_AT）按 ORE_GRADE_RICH 双倍，见底层
+ * （≤ LEAN_VEIN_AT）按 ORE_GRADE_LEAN 折半，中间基准价。枯竭矿脉
+ * （reserve ≤ 0）返回基准价；它本来也无可采储量。
+ */
+export function gradeForReserve(reserve: number, full: number): number {
+  if (!(reserve > 0) || !(full > 0)) return ORE_GRADE_POOR;
+  const f = reserve / full;
+  if (f >= RICH_VEIN_AT) return ORE_GRADE_RICH;
+  if (f <= LEAN_VEIN_AT) return ORE_GRADE_LEAN;
+  return ORE_GRADE_POOR;
+}
+
+export interface OreRegenOptions {
+  /** 每格每秒回填量，缺省 ORE_REGEN_RATE；<= 0 时关闭再生。 */
+  rate?: number;
+  /** 回填上限，缺省不封顶。 */
+  cap?: number;
+  /** 本 tick 跳过的格下标（如正被矿车认领的矿脉）。 */
+  skip?: ReadonlySet<number>;
+}
+
+/**
+ * 矿脉再生节奏：每 tick 按 rate × dt 缓慢回填 `reserves` 中尚有储量的
+ * 矿脉，封顶 cap。储量为 0 的枯竭矿脉不再回填（由调用方决定何时把矿格
+ * 写回普通地形）。返回本 tick 的回填总量。纯逻辑，dt 由调用方传入。
+ */
+export function oreRegenTick(reserves: Float64Array, dt: number, opts?: OreRegenOptions): number {
+  const rate = opts?.rate ?? ORE_REGEN_RATE;
+  if (!(dt > 0) || !(rate > 0)) return 0;
+  const cap = opts?.cap ?? Infinity;
+  const skip = opts?.skip;
+  let gained = 0;
+  for (let i = 0; i < reserves.length; i++) {
+    const r = reserves[i]!;
+    if (!(r > 0) || r >= cap || skip?.has(i) === true) continue;
+    const next = Math.min(cap, r + rate * dt);
+    reserves[i] = next;
+    gained += next - r;
+  }
+  return gained;
 }
 
 export interface QueueItem {

@@ -5,8 +5,14 @@ import assert from "node:assert/strict";
 // src/game/economy.ts
 var ORE_GRADE_POOR = 1;
 var ORE_GRADE_RICH = 2;
+var ORE_GRADE_LEAN = 0.5;
+var RICH_VEIN_AT = 0.6;
+var LEAN_VEIN_AT = 0.25;
+var ORE_REGEN_RATE = 6;
 var NEAR_CAP_FRACTION = 0.9;
 var LOW_FUNDS_AT = 500;
+var LOW_FUNDS_WARN_FRACTION = 0.2;
+var LOW_FUNDS_CRIT_FRACTION = 0.1;
 var ALERT_COOLDOWN = 30;
 function createEconomy(start = 5e3, opts) {
   const cap = opts?.cap;
@@ -22,6 +28,8 @@ function createEconomy(start = 5e3, opts) {
     nearCap: false,
     nearCapFraction: opts?.nearCapFraction,
     lowFundsAt: opts?.lowFundsAt,
+    lowFundsWarnFraction: opts?.lowFundsWarnFraction,
+    lowFundsCritFraction: opts?.lowFundsCritFraction,
     lostToCap: 0,
     alertLog: {}
   };
@@ -80,10 +88,40 @@ function pollAlerts(e, now) {
       out.push(kind);
     }
   };
-  fire("low-funds", e.broke === true || e.credits < (e.lowFundsAt ?? LOW_FUNDS_AT));
+  if (e.cap !== void 0) {
+    const warnAt = e.cap * (e.lowFundsWarnFraction ?? LOW_FUNDS_WARN_FRACTION);
+    const critAt = e.cap * (e.lowFundsCritFraction ?? LOW_FUNDS_CRIT_FRACTION);
+    const critical = e.credits < critAt;
+    fire("low-funds-critical", critical);
+    fire("low-funds", !critical && e.credits < warnAt);
+  } else {
+    fire("low-funds", e.broke === true || e.credits < (e.lowFundsAt ?? LOW_FUNDS_AT));
+  }
   fire("near-cap", e.nearCap === true);
   fire("storage-full", e.storageFull === true);
   return out;
+}
+function gradeForReserve(reserve, full) {
+  if (!(reserve > 0) || !(full > 0)) return ORE_GRADE_POOR;
+  const f = reserve / full;
+  if (f >= RICH_VEIN_AT) return ORE_GRADE_RICH;
+  if (f <= LEAN_VEIN_AT) return ORE_GRADE_LEAN;
+  return ORE_GRADE_POOR;
+}
+function oreRegenTick(reserves, dt, opts) {
+  const rate = opts?.rate ?? ORE_REGEN_RATE;
+  if (!(dt > 0) || !(rate > 0)) return 0;
+  const cap = opts?.cap ?? Infinity;
+  const skip = opts?.skip;
+  let gained = 0;
+  for (let i = 0; i < reserves.length; i++) {
+    const r = reserves[i];
+    if (!(r > 0) || r >= cap || skip?.has(i) === true) continue;
+    const next = Math.min(cap, r + rate * dt);
+    reserves[i] = next;
+    gained += next - r;
+  }
+  return gained;
 }
 function createQueue() {
   return [];
@@ -382,4 +420,64 @@ test("pollAlerts is quiet on a healthy economy", () => {
   const e = createEconomy(5e3);
   assert.deepEqual(pollAlerts(e, 0), []);
   assert.deepEqual(pollAlerts(e, ALERT_COOLDOWN * 2), []);
+});
+test("gradeForReserve maps reserve fraction to the income tier", () => {
+  assert.equal(gradeForReserve(350, 350), ORE_GRADE_RICH);
+  assert.equal(gradeForReserve(210, 350), ORE_GRADE_RICH);
+  assert.equal(gradeForReserve(200, 350), ORE_GRADE_POOR);
+  assert.equal(gradeForReserve(87, 350), ORE_GRADE_LEAN);
+  assert.equal(gradeForReserve(1, 350), ORE_GRADE_LEAN);
+  assert.equal(gradeForReserve(0, 350), ORE_GRADE_POOR);
+  assert.equal(gradeForReserve(100, 0), ORE_GRADE_POOR);
+  assert.equal(gradeForReserve(-5, 350), ORE_GRADE_POOR);
+});
+test("oreRegenTick refills live veins up to the cap but never the depleted", () => {
+  const r = new Float64Array([100, 0, 345]);
+  const gained = oreRegenTick(r, 1, { rate: 10, cap: 350 });
+  assert.equal(r[0], 110);
+  assert.equal(r[1], 0);
+  assert.equal(r[2], 350);
+  assert.ok(Math.abs(gained - 15) < 1e-9);
+});
+test("oreRegenTick honors the skip set and ignores dead ticks", () => {
+  const r = new Float64Array([100, 200]);
+  oreRegenTick(r, 1, { rate: 10, skip: /* @__PURE__ */ new Set([0]) });
+  assert.equal(r[0], 100);
+  assert.equal(r[1], 210);
+  assert.equal(oreRegenTick(r, 0, { rate: 10 }), 0);
+  assert.equal(oreRegenTick(r, -1, { rate: 10 }), 0);
+  assert.equal(oreRegenTick(r, 1, { rate: 0 }), 0);
+  assert.equal(r[0], 100);
+  assert.equal(r[1], 210);
+  const s = new Float64Array([0, 10]);
+  oreRegenTick(s, 1);
+  assert.equal(s[0], 0);
+  assert.ok(s[1] > 10);
+});
+test("pollAlerts escalates low-funds to critical below the crit fraction of cap", () => {
+  const e = createEconomy(150, { cap: 1e3 });
+  assert.deepEqual(pollAlerts(e, 0), ["low-funds"]);
+  spend(e, 60);
+  assert.deepEqual(pollAlerts(e, ALERT_COOLDOWN), ["low-funds-critical"]);
+  credit(e, 100);
+  assert.deepEqual(pollAlerts(e, ALERT_COOLDOWN * 2), ["low-funds"]);
+  credit(e, 300);
+  assert.deepEqual(pollAlerts(e, ALERT_COOLDOWN * 3), []);
+});
+test("low-funds tiers throttle independently inside the cooldown window", () => {
+  const e = createEconomy(50, { cap: 1e3 });
+  assert.deepEqual(pollAlerts(e, 0), ["low-funds-critical"]);
+  assert.deepEqual(pollAlerts(e, 1), []);
+  credit(e, 100);
+  assert.deepEqual(pollAlerts(e, 2), ["low-funds"]);
+});
+test("custom warn/crit fractions override the default low-funds tiers", () => {
+  const e = createEconomy(400, {
+    cap: 1e3,
+    lowFundsWarnFraction: 0.5,
+    lowFundsCritFraction: 0.45
+  });
+  assert.deepEqual(pollAlerts(e, 0), ["low-funds-critical"]);
+  const w = createEconomy(400, { cap: 1e3, lowFundsWarnFraction: 0.5 });
+  assert.deepEqual(pollAlerts(w, 0), ["low-funds"]);
 });
