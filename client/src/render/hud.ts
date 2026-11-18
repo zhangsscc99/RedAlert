@@ -1861,3 +1861,82 @@ export function drawReplayBar(
     ctx.textAlign = 'left';
   }
 }
+
+// ------------------------------------------------------ panel placement ----
+// Pure geometry for overlay panels (e.g. the menu leaderboard) that must
+// never cover interactive rects. Picks the preferred bottom-left anchor
+// first, so desktop keeps the current look; on cramped viewports the panel
+// shrinks/repositions, degrading through the `sizes` list in order.
+
+export interface PanelPlaceSize {
+  mode: 'full' | 'summary';
+  w: number;
+  h: number;
+}
+
+export interface PanelPlacement {
+  mode: 'full' | 'summary';
+  rect: Rect;
+}
+
+/** Rects overlap when inflated by `gap` on every side. */
+export function rectsOverlap(a: Rect, b: Rect, gap = 0): boolean {
+  return (
+    a.x < b.x + b.w + gap &&
+    a.x + a.w + gap > b.x &&
+    a.y < b.y + b.h + gap &&
+    a.y + a.h + gap > b.y
+  );
+}
+
+const PANEL_MARGIN = 12;
+const PANEL_MIN_W = 96;
+
+export function placePanelAvoiding(
+  viewW: number,
+  viewH: number,
+  blocks: readonly Rect[],
+  sizes: readonly PanelPlaceSize[],
+  gap = 8,
+): PanelPlacement | null {
+  for (const s of sizes) {
+    // Candidate bands: bottom anchor first (desktop default), then just
+    // above each block (closest to the bottom first), then below blocks,
+    // then the top edge.
+    const yAnchors = [viewH - PANEL_MARGIN - s.h];
+    for (const b of [...blocks].sort((p, q) => q.y - p.y)) yAnchors.push(b.y - gap - s.h);
+    for (const b of [...blocks].sort((p, q) => p.y + p.h - (q.y + q.h)))
+      yAnchors.push(b.y + b.h + gap);
+    yAnchors.push(PANEL_MARGIN);
+    for (const y of yAnchors) {
+      if (y < PANEL_MARGIN || y + s.h > viewH - PANEL_MARGIN) continue;
+      // Free x-intervals inside this band; blocks are inflated by `gap`.
+      const cuts = blocks
+        .filter((b) => b.y < y + s.h + gap && b.y + b.h + gap > y)
+        .map((b) => [Math.max(0, b.x - gap), Math.min(viewW, b.x + b.w + gap)] as const)
+        .sort((p, q) => p[0] - q[0]);
+      const segs: [number, number][] = [];
+      let cur = 0;
+      for (const [x0, x1] of cuts) {
+        if (x0 > cur) segs.push([cur, x0]);
+        cur = Math.max(cur, x1);
+      }
+      if (cur < viewW) segs.push([cur, viewW]);
+      // Prefer the segment reaching the left margin (keeps the panel
+      // anchored bottom-left like desktop), else the widest segment.
+      segs.sort((a, b) =>
+        a[0] <= PANEL_MARGIN !== b[0] <= PANEL_MARGIN
+          ? a[0] <= PANEL_MARGIN
+            ? -1
+            : 1
+          : b[1] - b[0] - (a[1] - a[0]),
+      );
+      for (const [x0, x1] of segs) {
+        const x = Math.max(PANEL_MARGIN, x0);
+        const w = Math.min(s.w, x1 - x);
+        if (w >= PANEL_MIN_W) return { mode: s.mode, rect: { x, y, w, h: s.h } };
+      }
+    }
+  }
+  return null;
+}

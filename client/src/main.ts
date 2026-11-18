@@ -74,6 +74,7 @@ import {
   type Order,
   type Player as ReplayPlayer,
   type Point,
+  type Rect,
   type PositionedCombatEvent,
   type Replay,
   type ReplayMeta,
@@ -178,6 +179,7 @@ import {
   missionPanelLayout,
   onboardingBarLayout,
   onboardingSkipHit,
+  placePanelAvoiding,
   productionOrderAt,
   pushMessage,
   drawReplayBar,
@@ -2847,14 +2849,33 @@ function frame(now: number): void {
     if (screen === 'menu') {
       if (boardCtx !== 'all') refreshBoard(null); // menu panel: all missions
       const info = continueInfo();
+      const ml = menuLayout(viewW, viewH);
       drawMenu(ctx, viewW, viewH, {
         difficulty,
         canContinue: info.canContinue,
         continueLabel: info.label,
-        hover: menuHit(menuLayout(viewW, viewH), mouse.x, mouse.y),
+        hover: menuHit(ml, mouse.x, mouse.y),
       });
+      // Leaderboard must never cover menu buttons: shrink/reposition, then
+      // degrade to a one-line summary, then drop it entirely.
       const bh = 20 + boardLines.length * 16;
-      drawBoardPanel(12, viewH - 12 - bh, Math.min(340, viewW - 24), boardLines);
+      const menuBlocks: Rect[] = [
+        ...ml.buttons.map((b) => b.rect),
+        ml.campaign,
+        ml.replay,
+        ...ml.difficulty.map((d) => d.rect),
+      ];
+      const place = placePanelAvoiding(viewW, viewH, menuBlocks, [
+        { mode: 'full', w: Math.min(340, viewW - 24), h: bh },
+        { mode: 'summary', w: Math.min(220, viewW - 24), h: 36 },
+      ]);
+      if (place) {
+        const lines =
+          place.mode === 'full'
+            ? boardLines
+            : [boardLines.length > 1 ? `排行榜 ${boardLines[1]}` : '排行榜'];
+        drawBoardPanel(place.rect.x, place.rect.y, place.rect.w, lines);
+      }
     } else if (screen === 'campaign') {
       drawCampaign(ctx, viewW, viewH, campaignModel());
     } else if (screen === 'replay') {
