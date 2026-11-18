@@ -45,6 +45,10 @@ import {
   restoreGame,
   snapshotGame,
   updateOrders,
+  upgradeBuilding,
+  sellBuilding,
+  startRepair,
+  stopRepair,
   worldToTile,
   zoomAt,
   type BuildingKind,
@@ -59,6 +63,35 @@ import {
   type Targetable,
   type UnitKind,
 } from './game/index.ts';
+import {
+  UPGRADE_TABLE,
+  canSell,
+  canUpgrade,
+  sellValue,
+} from './game/upgrades.js';
+import { repairCost } from './game/repair.js';
+import {
+  bestLines,
+  createStats,
+  defaultBest,
+  loadBest,
+  mergeBest,
+  record,
+  reportLines,
+  saveBest,
+  summary,
+  type BestRecord,
+  type Stats,
+} from './game/stats.js';
+import {
+  createOnboarding,
+  goal as obGoal,
+  notify as obNotify,
+  progress as obProgress,
+  skip as obSkip,
+  type Onboarding,
+  type OnboardingEvent,
+} from './game/onboarding.js';
 import { DIFFICULTY, type Difficulty } from './game/balance.js';
 import {
   DEFAULT_BINDINGS,
@@ -104,13 +137,18 @@ import {
   actionButtonAt,
   buildBarHit,
   buildBarRect,
+  buildingOpsHit,
+  buildingOpsLayout,
   computeHudLayout,
   drawActionBar,
+  drawBattleReport,
   drawBuildBar,
+  drawBuildingOps,
   drawHotkeyCard,
   drawHud,
   drawMessages,
   drawMinimap,
+  drawOnboardingBar,
   drawSelectBox,
   drawSelectionCard,
   drawTouchGuide,
@@ -118,6 +156,8 @@ import {
   drawTouchMenu,
   guideHit,
   minimapToWorld,
+  onboardingBarLayout,
+  onboardingSkipHit,
   pushMessage,
   TOUCH_GUIDE_STEPS,
   touchGuideLayout,
@@ -125,6 +165,9 @@ import {
   touchMenuLayout,
   type ActionId,
   type BuildBarItem,
+  type BuildingOpId,
+  type BuildingOpItem,
+  type BuildingOpsModel,
   type HudLayout,
   type HudMessage,
   type MenuCmd,
@@ -286,6 +329,32 @@ let pendingBuild: BuildingKind | null = null;
 const msgs: HudMessage[] = [];
 const keys = new Set<string>();
 
+// ------------------------------------------------ wired modules (F701) ----
+
+/** Currently selected player building (unit selection lives on GUnit). */
+let selectedBuilding: GBuilding | null = null;
+/** Battle stats for the running match; rendered by stats.ts on game over. */
+let stats: Stats = createStats();
+let statsBest: BestRecord = defaultBest();
+/** Pre-rendered 战报 lines for the end screen (report + best block). */
+let reportCard: string[] = [];
+/** Sell refunds credited this tick — excluded from the 采矿 stat. */
+let sellRefunded = 0;
+/** Desktop guide machine (onboarding.ts); null once done/skipped/none. */
+let onboarding: Onboarding | null = null;
+const ONBOARD_KEY = 'ra.onboarded';
+/** Throttle for the "repair paused — no funds" warning. */
+let repairBrokeWarnT = -1e9;
+
+const BUILDING_LABEL: Record<BuildingKind, string> = {
+  hq: '指挥部',
+  barracks: '兵营',
+  refinery: '矿厂',
+  power: '电厂',
+  turret: '炮塔',
+  wall: '围墙',
+};
+
 // ------------------------------------------------------------------ touch --
 
 const gestures = createGestureRecognizer();
@@ -372,7 +441,7 @@ function hudLayout(): HudLayout {
     minimapCollapsed,
     buildBarOpen,
     fullscreen: fullscreenOK,
-    hasSelection: selectedIds().size > 0,
+    hasSelection: selectedIds().size > 0 || selectedBuilding !== null,
     prodCount: prod.length,
   });
 }
@@ -441,6 +510,12 @@ function applyGame(g: GameState): void {
   radarOn = false;
   weather = createWeather(g.seed);
   hotkeyCard = false;
+  selectedBuilding = null;
+  stats = createStats();
+  reportCard = [];
+  sellRefunded = 0;
+  repairBrokeWarnT = -1e9;
+  onboarding = null;
   refreshFog();
 }
 
@@ -457,6 +532,43 @@ function showHint(): void {
   if (isTouch) hintUntil = performance.now() + 3000;
 }
 
+/** First-run desktop guide: absent ra.onboarded → the strip shows. */
+function wantOnboarding(): boolean {
+  if (isTouch) return false; // 触屏走 TOUCH_GUIDE，不画桌面引导条
+  try {
+    return localStorage.getItem(ONBOARD_KEY) === null;
+  } catch {
+    return true; // storage unavailable → still offer the guide
+  }
+}
+
+/** Write ra.onboarded and drop the machine (done or skipped). */
+function finishOnboarding(): void {
+  onboarding = null;
+  try {
+    localStorage.setItem(ONBOARD_KEY, '1');
+  } catch {
+    /* storage may be unavailable */
+  }
+}
+
+/** Feed a game event into the guide machine; seals it once it completes. */
+function obEvent(e: OnboardingEvent): void {
+  if (!onboarding) return;
+  obNotify(onboarding, e);
+  if (onboarding.status !== 'active') finishOnboarding();
+}
+
+/** unitMovedTo event: 'center' = the map's middle third, else 'field'. */
+function obMoveTo(w: Point): void {
+  if (!onboarding) return;
+  const tx = worldToTile(w.x);
+  const ty = worldToTile(w.y);
+  const center =
+    Math.abs(tx - map.w / 2) <= map.w / 6 && Math.abs(ty - map.h / 2) <= map.h / 6;
+  obEvent({ type: 'unitMovedTo', region: center ? 'center' : 'field' });
+}
+
 function startGame(): void {
   const d = DIFFICULTY[difficulty];
   applyGame(
@@ -467,6 +579,7 @@ function startGame(): void {
       waveIntervalScale: d.waveIntervalScale,
     }),
   );
+  onboarding = wantOnboarding() ? createOnboarding() : null;
   recenterCamera();
   activeSlot = 1; // new campaign occupies slot 1
   persist();
@@ -661,6 +774,7 @@ function issueAttackMove(w: Point): void {
   dropOrdersFor(moved);
   for (const id of moved) attackMove.set(id, dest);
   moveMarker = { x: dest.x, y: dest.y, t: performance.now() };
+  obMoveTo(dest);
 }
 
 function issueMove(w: Point): void {
@@ -672,6 +786,7 @@ function issueMove(w: Point): void {
   dropOrdersFor(moved);
   for (const id of moved) attackMove.delete(id);
   moveMarker = { x: w.x, y: w.y, t: performance.now() };
+  obMoveTo(dest);
 }
 
 function stopSelected(): void {
@@ -687,6 +802,143 @@ function guardSelected(): void {
   dropOrdersFor(sel);
   for (const id of sel) attackMove.delete(id);
   for (const u of game.units) orders.push(...guard([u], { x: u.x, y: u.y }));
+}
+
+// --------------------------------------------------------- building ops ----
+
+function upgradeFailText(reason: string): string {
+  switch (reason) {
+    case 'busy':
+      return '升级进行中';
+    case 'not-done':
+      return '建筑未完工';
+    case 'max-level':
+      return '已满级';
+    case 'no-power':
+      return '需要电厂供电';
+    case 'funds':
+      return '资金不足';
+    default:
+      return '无法执行';
+  }
+}
+
+function repairFailText(reason: string): string {
+  switch (reason) {
+    case 'full':
+      return '建筑完好';
+    case 'dead':
+      return '建筑已摧毁';
+    case 'duplicate':
+      return '维修中';
+    case 'funds':
+      return '资金不足';
+    default:
+      return '无法执行';
+  }
+}
+
+/** HUD model for the selected-building card (info + 升级/出售/维修 buttons). */
+function buildingOpsModel(b: GBuilding): BuildingOpsModel {
+  const def = BUILDING_DEFS[b.kind];
+  const job = game.upgradeJobs.find((j) => j.buildingId === b.id);
+  const pw = computePower(game.buildings);
+  const powered = pw.produced > 0 && !isLowPower(pw);
+  const items: BuildingOpItem[] = [];
+
+  if (job) {
+    const pct = Math.floor((job.elapsed / job.time) * 100);
+    items.push({ id: 'upgrade', label: `升级${pct}%`, enabled: false });
+  } else {
+    const chk = canUpgrade(b, b.level, game.economy.credits, powered);
+    if (chk.ok) {
+      const tier = UPGRADE_TABLE[b.kind][b.level === 1 ? 2 : 3];
+      items.push({ id: 'upgrade', label: `升级`, sub: `$${tier.cost}`, enabled: true });
+    } else {
+      items.push({
+        id: 'upgrade',
+        label: '升级',
+        enabled: false,
+        reason: upgradeFailText(chk.reason),
+      });
+    }
+  }
+
+  if (canSell(game.upgradeJobs, b.id).ok) {
+    const prog =
+      b.done || def.buildTime <= 0 ? 1 : Math.max(0, 1 - b.buildLeft / def.buildTime);
+    const ratio = (b.maxHp > 0 ? b.hp / b.maxHp : 0) * prog;
+    items.push({
+      id: 'sell',
+      label: '出售',
+      sub: `+$${sellValue(def, b.level, ratio)}`,
+      enabled: true,
+    });
+  } else {
+    items.push({ id: 'sell', label: '出售', enabled: false, reason: '升级中' });
+  }
+
+  if (b.repairing) {
+    items.push({ id: 'repair', label: '停止维修', enabled: true });
+  } else if (b.hp >= b.maxHp) {
+    items.push({ id: 'repair', label: '维修', enabled: false, reason: '完好' });
+  } else {
+    items.push({
+      id: 'repair',
+      label: '维修',
+      sub: `~$${Math.ceil(repairCost(b.maxHp, b.hp, def.cost))}`,
+      enabled: true,
+    });
+  }
+
+  const status = !b.done
+    ? '建造中'
+    : job
+      ? `升级中 ${Math.floor((job.elapsed / job.time) * 100)}%`
+      : b.repairing
+        ? '维修中'
+        : b.level > 1
+          ? UPGRADE_TABLE[b.kind][b.level].label
+          : undefined;
+  return {
+    title: `${BUILDING_LABEL[b.kind]} #${b.id}  Lv${b.level}`,
+    hp: b.hp,
+    maxHp: b.maxHp,
+    status,
+    items,
+  };
+}
+
+/** Execute one ops-card action on the selected building. */
+function runBuildingOp(op: BuildingOpId): void {
+  const b = selectedBuilding;
+  if (!b || !game.buildings.includes(b)) return;
+  const name = BUILDING_LABEL[b.kind];
+  if (op === 'upgrade') {
+    const r = upgradeBuilding(game, b.id);
+    if (r.ok) {
+      pushMessage(msgs, `${name} 升级中（Lv${r.job.from}→Lv${r.job.to}，${r.job.time}s）`);
+      sfx.play('build');
+    } else {
+      pushMessage(msgs, `无法升级：${upgradeFailText(r.reason)}`);
+    }
+  } else if (op === 'sell') {
+    const r = sellBuilding(game, b.id);
+    if (r.ok) {
+      pushMessage(msgs, `${name} 已出售 +$${r.refund}`);
+      sellRefunded += r.refund;
+      selectedBuilding = null;
+      sfx.play('build');
+    } else {
+      pushMessage(msgs, `无法出售：${r.reason === 'busy' ? '升级进行中' : '无法执行'}`);
+    }
+  } else if (b.repairing) {
+    stopRepair(game, b.id);
+    pushMessage(msgs, `${name} 停止维修`);
+  } else {
+    const r = startRepair(game, b.id);
+    pushMessage(msgs, r.ok ? `${name} 维修中…` : `无法维修：${repairFailText(r.reason)}`);
+  }
 }
 
 // -------------------------------------------------------------- gestures ---
@@ -787,6 +1039,15 @@ function onTap(p: Point): void {
     return;
   }
 
+  // 建筑操作按钮（升级/出售/维修）优先于小地图与世界点击。
+  if (selectedBuilding) {
+    const op = buildingOpsHit(lay, p.x, p.y);
+    if (op) {
+      runBuildingOp(op);
+      return;
+    }
+  }
+
   const mm = minimapToWorld(map, lay, p.x, p.y);
   if (mm) {
     camera.x = mm.x - viewW / camera.zoom / 2;
@@ -803,6 +1064,14 @@ function onTap(p: Point): void {
   const mine = unitAt(game.units, w, (UNIT_RADIUS + 10) / camera.zoom);
   if (mine) {
     selectUnits(game.units, mine, false);
+    selectedBuilding = null;
+    spawnTapRing(p);
+    return;
+  }
+  const own = buildingAt(game.buildings, worldToTile(w.x), worldToTile(w.y)) as GBuilding | null;
+  if (own) {
+    selectUnits(game.units, null, false);
+    selectedBuilding = own;
     spawnTapRing(p);
     return;
   }
@@ -812,7 +1081,10 @@ function onTap(p: Point): void {
     return;
   }
   if (selectedIds().size > 0) issueMove(w);
-  else selectUnits(game.units, null, false);
+  else {
+    selectUnits(game.units, null, false);
+    selectedBuilding = null;
+  }
 }
 
 function handleGesture(g: Gesture): void {
@@ -834,6 +1106,7 @@ function handleGesture(g: Gesture): void {
       if (lay.actionBar && pointInRect(p, lay.actionBar)) break;
       if (lay.minimap && pointInRect(p, lay.minimap)) break;
       if (lay.buildBarOpen && pointInRect(p, buildBarRect(lay, BAR_DEFS.length))) break;
+      if (selectedBuilding && pointInRect(p, buildingOpsLayout(lay).card)) break;
       touchMenu = touchMenuLayout(p, lay);
       touchMenuT = performance.now();
       buildBarOpen = false; // the command strip docks in the same band
@@ -911,6 +1184,8 @@ interface CombatSnap {
   cooldown: number;
   range: number;
   r: number; // body radius, world px
+  kind: string;
+  bld: boolean; // building combatant (vs unit)
 }
 
 function combatants(): (GUnit | GBuilding)[] {
@@ -936,6 +1211,8 @@ function snapshotCombat(): Map<number, CombatSnap> {
       cooldown: c.cooldown,
       range: c.range,
       r: combatRadius(c),
+      kind: c.kind,
+      bld: 'gx' in c,
     });
   }
   return m;
@@ -990,6 +1267,15 @@ function diffCombat(prev: Map<number, CombatSnap>): void {
     if (!nowIds.has(id)) {
       spawnExplosion(effects, p.x, p.y, Math.max(16, p.r * 2));
       sfx.play('explosion');
+      // 战报 + 引导事件：敌方死亡计击杀，己方计损失；敌方建筑另报摧毁。
+      if (p.team === 'enemy') {
+        record(stats, { type: 'kill', unit: p.kind, time: game.elapsed });
+        if (p.bld) obEvent({ type: 'enemyBuildingDestroyed', building: p.kind });
+      } else if (p.bld) {
+        record(stats, { type: 'buildingLost', building: p.kind, time: game.elapsed });
+      } else {
+        record(stats, { type: 'unitLost', unit: p.kind, time: game.elapsed });
+      }
     }
   }
   effectsFromCombatEvents(events, effects);
@@ -1091,6 +1377,26 @@ canvas.addEventListener('pointerdown', (e) => {
     return;
   }
 
+  // Guide skip + building ops buttons beat world input (left click only).
+  if (e.button === 0) {
+    const lay = hudLayout();
+    const ob = onboarding ? onboardingBarLayout(lay) : null;
+    if (ob && onboardingSkipHit(ob, p.x, p.y)) {
+      if (onboarding) obSkip(onboarding);
+      finishOnboarding();
+      dragMode = 'none';
+      return;
+    }
+    if (selectedBuilding) {
+      const op = buildingOpsHit(lay, p.x, p.y);
+      if (op) {
+        runBuildingOp(op);
+        dragMode = 'none';
+        return;
+      }
+    }
+  }
+
   // A + left click = attack-move (works on the minimap too).
   if (e.button === 0 && keys.has('a') && !pendingBuild) {
     const w = minimapToWorld(map, hudLayout(), p.x, p.y) ?? screenToWorld(camera, p.x, p.y);
@@ -1184,7 +1490,18 @@ canvas.addEventListener('pointerup', (e) => {
     boxSelect(dragStart, p, additive);
   } else if (dragMode === 'maybeSelect') {
     const w = screenToWorld(camera, p.x, p.y);
-    selectUnits(units, unitAt(units, w, (UNIT_RADIUS + 4) / camera.zoom), additive);
+    const own = buildingAt(
+      game.buildings,
+      worldToTile(w.x),
+      worldToTile(w.y),
+    ) as GBuilding | null;
+    if (own && !additive) {
+      selectUnits(units, null, false);
+      selectedBuilding = own;
+    } else {
+      selectUnits(units, unitAt(units, w, (UNIT_RADIUS + 4) / camera.zoom), additive);
+      if (!additive) selectedBuilding = null;
+    }
   } else if (dragMode === 'maybeOrder') {
     const w = screenToWorld(camera, p.x, p.y);
     // Right-click a visible enemy to focus fire; empty ground stays "move".
@@ -1475,6 +1792,7 @@ function drawBanner(): void {
   if (game.phase === 'playing') return;
   const hover = gameoverHit(gameoverLayout(viewW, viewH), mouse.x, mouse.y);
   drawGameOver(ctx, viewW, viewH, game.phase, hover);
+  drawBattleReport(ctx, viewW, viewH, reportCard);
 }
 
 function productionItems(): ProductionItem[] {
@@ -1566,6 +1884,8 @@ function frame(now: number): void {
 
   if (gameDt > 0 && game.phase === 'playing') {
     const prev = snapshotCombat();
+    const earned0 = game.economy.earned;
+    const enemyN0 = game.enemyUnits.length;
     const wEv = stepWeather(weather, gameDt);
     if (wEv) pushMessage(msgs, WEATHER_LABEL[wEv.to]);
     const speedMul = weatherMul('speed');
@@ -1577,10 +1897,46 @@ function frame(now: number): void {
     UNIT_STATS.harvester.speed = harvestBase * speedMul;
     updateOrders(orders, game.units, [...game.enemyUnits, ...game.enemyBuildings], gameDt);
     stepAttackMove();
-    tickGame(game, gameDt);
+    const ev = tickGame(game, gameDt);
     UNIT_STATS.harvester.speed = harvestBase;
     diffCombat(prev);
     updateEffects(effects, gameDt);
+
+    // F701 domain events → 战报统计 / 新手引导 / 消息。
+    for (const b of ev.built) {
+      if (b.team !== 'player') continue;
+      record(stats, { type: 'buildingBuilt', building: b.kind, time: game.elapsed });
+      obEvent({ type: 'buildingDone', building: b.kind });
+    }
+    for (const k of ev.trained) {
+      record(stats, { type: 'unitTrained', unit: k, time: game.elapsed });
+      obEvent({ type: 'unitTrained', unit: k });
+    }
+    for (const d of ev.upgrades) {
+      const b = game.buildings.find((x) => x.id === d.buildingId);
+      pushMessage(msgs, `${b ? BUILDING_LABEL[b.kind] : '建筑'} 升级完成 Lv${d.level}`);
+      sfx.play('build');
+    }
+    for (const id of ev.repaired) {
+      const b = game.buildings.find((x) => x.id === id);
+      if (b) pushMessage(msgs, `${BUILDING_LABEL[b.kind]} 维修完成`);
+    }
+    // 采矿统计 = 本 tick 入账 − 出售退款（trickle 也算矿厂收益）。
+    const mined = Math.round(game.economy.earned - earned0 - sellRefunded);
+    sellRefunded = 0;
+    if (mined > 0) record(stats, { type: 'mined', amount: mined, time: game.elapsed });
+    if (enemyN0 > 0 && game.enemyUnits.length === 0 && game.ai.wave > 0) {
+      record(stats, { type: 'waveCleared', wave: game.ai.wave, time: game.elapsed });
+    }
+    // 维修因资金耗尽暂停时给提示（节流 6s），而不是静默卡住。
+    if (
+      game.repairs.jobs.some((j) => j.engineerId !== null) &&
+      game.economy.credits <= 0 &&
+      now - repairBrokeWarnT > 6000
+    ) {
+      repairBrokeWarnT = now;
+      pushMessage(msgs, '资金不足，维修暂停');
+    }
     // Radar pulse: the HQ dish scans while it stands and the grid holds.
     const hq = game.buildings.find((b) => b.kind === 'hq' && b.done);
     radarOn = radarAvailable(!isLowPower(computePower(game.buildings)), hq !== undefined);
@@ -1596,8 +1952,36 @@ function frame(now: number): void {
     }
   }
   if (game.phase !== prevPhase) {
-    if (game.phase !== 'playing') sfx.play(game.phase === 'won' ? 'fanfare' : 'defeat');
+    if (game.phase !== 'playing') {
+      sfx.play(game.phase === 'won' ? 'fanfare' : 'defeat');
+      // 战报：结算本局、合并历史最佳并落盘，遮罩渲染 stats 的文本块。
+      record(stats, {
+        type: 'gameOver',
+        victory: game.phase === 'won',
+        elapsed: game.elapsed,
+      });
+      const store = storage();
+      const prevBest = store ? loadBest(store) : defaultBest();
+      statsBest = mergeBest(prevBest, summary(stats));
+      if (store) {
+        try {
+          saveBest(store, statsBest);
+        } catch {
+          /* storage may be unavailable */
+        }
+      }
+      reportCard = [
+        ...reportLines(stats),
+        ...(statsBest.score > prevBest.score && statsBest.score > 0 ? ['★ 新纪录！'] : []),
+        ...bestLines(statsBest),
+      ];
+      selectedBuilding = null;
+    }
     prevPhase = game.phase;
+  }
+  // A sold/destroyed building leaves the card automatically.
+  if (selectedBuilding && !game.buildings.includes(selectedBuilding)) {
+    selectedBuilding = null;
   }
   for (const m of msgs) m.ttl -= dt;
   while (msgs.length > 0 && msgs[0]!.ttl <= 0) msgs.shift();
@@ -1663,6 +2047,20 @@ function frame(now: number): void {
   drawTimer();
   drawMessages(ctx, msgs, lay);
   drawSelectionCard(ctx, game.units, lay);
+  if (selectedBuilding && game.phase === 'playing') {
+    drawBuildingOps(ctx, lay, buildingOpsModel(selectedBuilding));
+  }
+  if (onboarding && game.phase === 'playing') {
+    const g = obGoal(onboarding);
+    const p = obProgress(onboarding);
+    drawOnboardingBar(ctx, lay, {
+      title: g.title,
+      body: g.body,
+      hint: g.hint,
+      done: p.done,
+      total: p.total,
+    });
+  }
   drawMinimap(
     ctx,
     map,

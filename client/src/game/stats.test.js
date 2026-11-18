@@ -101,7 +101,7 @@ function reportLines(s, _locale = "zh") {
     "\u2014\u2014 \u6218\u62A5 \u2014\u2014",
     `\u7ED3\u679C\uFF1A${m.victory ? "\u80DC\u5229" : "\u6218\u8D25"}`,
     `\u51FB\u6740\uFF1A${m.kills}\u3000\u635F\u5931\uFF1A${m.losses}`,
-    `\u91C7\u77FF\uFF1A${m.oreMined}\u3000\u5B58\u7559\u5EFA\u7B51\uFF1A${m.buildings}`,
+    `\u91C7\u77FF\uFF1A${m.oreMined}\u3000\u5EFA\u9020\uFF1A${s.buildingsBuilt}\u3000\u5B58\u7559\uFF1A${m.buildings}`,
     `\u51FB\u9000\u6CE2\u6B21\uFF1A${m.wavesCleared}`,
     `\u5B58\u6D3B\u65F6\u957F\uFF1A${dur}`,
     `\u5F97\u5206\uFF1A${m.score}`,

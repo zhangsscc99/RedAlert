@@ -7,8 +7,14 @@ import {
   buildAt,
   createGame,
   restart,
+  restoreGame,
+  sellBuilding,
+  snapshotGame,
+  startRepair,
+  stopRepair,
   tickGame,
   trainUnit,
+  upgradeBuilding,
   type GameState,
 } from './gameState.js';
 
@@ -335,4 +341,127 @@ test('same seed and same inputs produce identical credits', () => {
   const b = play();
   assert.equal(a.economy.credits, b.economy.credits);
   assert.deepEqual(snap(a), snap(b));
+});
+
+// ------------------------------------------------------------ F701 ops -----
+
+test('buildings start at level 1, not repairing', () => {
+  const g = createGame(7);
+  for (const b of g.buildings) {
+    assert.equal(b.level, 1);
+    assert.equal(b.repairing, false);
+  }
+  assert.equal(g.upgradeJobs.length, 0);
+  assert.equal(g.repairs.jobs.length, 0);
+});
+
+test('upgradeBuilding charges, ticks and applies the armor tier', () => {
+  const g = createGame(7);
+  const hq = g.buildings.find((b) => b.kind === 'hq')!;
+  const before = g.economy.credits;
+  const r = upgradeBuilding(g, hq.id);
+  assert.ok(r.ok, 'hq upgrade should start (stock grid is powered)');
+  assert.equal(g.economy.credits, before - 800);
+  assert.equal(g.upgradeJobs.length, 1);
+
+  const again = upgradeBuilding(g, hq.id);
+  assert.equal(again.ok, false);
+  assert.equal((again as { reason?: string }).reason, 'busy');
+
+  run(g, 16);
+  assert.equal(g.upgradeJobs.length, 0);
+  assert.equal(hq.level, 2);
+  assert.equal(hq.maxHp, Math.round(BUILDING_DEFS.hq.hp * 1.25));
+  assert.equal(hq.hp, hq.maxHp); // armor tier heals the gained delta
+});
+
+test('upgradeBuilding rejects an unfinished building', () => {
+  const g = createGame(7);
+  buildKind(g, 'wall'); // 4s build, still under construction
+  const wall = g.buildings.find((b) => b.kind === 'wall')!;
+  const r = upgradeBuilding(g, wall.id);
+  assert.equal(r.ok, false);
+  assert.equal((r as { reason?: string }).reason, 'not-done');
+});
+
+test('sellBuilding refunds scaled cost and removes the building', () => {
+  const g = createGame(7);
+  buildKind(g, 'wall');
+  run(g, 5); // finish the 4s build
+  const wall = g.buildings.find((b) => b.kind === 'wall')!;
+  const before = g.economy.credits;
+  const r = sellBuilding(g, wall.id);
+  assert.ok(r.ok);
+  assert.equal(r.refund, 50); // $100 × 0.5 refund × full hp
+  assert.equal(g.economy.credits, before + 50);
+  assert.ok(!g.buildings.includes(wall));
+});
+
+test('startRepair heals, charges credits and finishes at full hp', () => {
+  const g = createGame(7);
+  const hq = g.buildings.find((b) => b.kind === 'hq')!;
+  hq.hp = hq.maxHp - 20; // 2s at 10 hp/s
+  const before = g.economy.credits;
+  assert.ok(startRepair(g, hq.id).ok);
+  assert.equal(hq.repairing, true);
+
+  const seen = new Set<number>();
+  for (let t = 0; t < 4; t += 0.25) {
+    for (const id of tickGame(g, 0.25).repaired) seen.add(id);
+  }
+  assert.equal(hq.hp, hq.maxHp);
+  assert.equal(hq.repairing, false);
+  assert.ok(seen.has(hq.id));
+  assert.ok(g.economy.credits < before, 'repair should spend credits');
+});
+
+test('stopRepair cancels an in-flight repair', () => {
+  const g = createGame(7);
+  const hq = g.buildings.find((b) => b.kind === 'hq')!;
+  hq.hp = 1000;
+  assert.ok(startRepair(g, hq.id).ok);
+  stopRepair(g, hq.id);
+  assert.equal(hq.repairing, false);
+  assert.equal(g.repairs.jobs.length, 0);
+  run(g, 1);
+  assert.equal(hq.hp, 1000); // no engineer, no healing
+});
+
+test('startRepair rejects full-hp and missing targets', () => {
+  const g = createGame(7);
+  const hq = g.buildings.find((b) => b.kind === 'hq')!;
+  const full = startRepair(g, hq.id);
+  assert.equal(full.ok, false);
+  assert.equal((full as { reason?: string }).reason, 'full');
+  assert.equal(startRepair(g, 999999).ok, false);
+});
+
+test('snapshotGame / restoreGame round-trips level and repair flag', () => {
+  const g = createGame(7);
+  const hq = g.buildings.find((b) => b.kind === 'hq')!;
+  assert.ok(upgradeBuilding(g, hq.id).ok);
+  run(g, 16);
+  hq.hp = 1000;
+  assert.ok(startRepair(g, hq.id).ok);
+
+  const g2 = restoreGame(snapshotGame(g))!;
+  const hq2 = g2.buildings.find((b) => b.kind === 'hq')!;
+  assert.equal(hq2.level, 2);
+  assert.equal(hq2.maxHp, Math.round(BUILDING_DEFS.hq.hp * 1.25));
+  assert.equal(hq2.hp, 1000);
+  assert.equal(hq2.repairing, true);
+});
+
+test('legacy saves restore with level 1 / not repairing defaults', () => {
+  const g = createGame(7);
+  const s = snapshotGame(g);
+  const opts = s.opts ?? {};
+  for (const k of Object.keys(opts)) {
+    if (k.startsWith('lvl.') || k.startsWith('rep.')) delete opts[k];
+  }
+  const g2 = restoreGame(s)!;
+  for (const b of g2.buildings) {
+    assert.equal(b.level, 1);
+    assert.equal(b.repairing, false);
+  }
 });

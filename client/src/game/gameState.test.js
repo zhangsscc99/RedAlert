@@ -777,6 +777,7 @@ var DIFFICULTY = {
   normal: { label: "Normal", startCredits: 5e3, waveIntervalScale: 1, enemyStrengthScale: 1, enemyStartInfantry: 4 },
   hard: { label: "Hard", startCredits: 3500, waveIntervalScale: 0.75, enemyStrengthScale: 1.25, enemyStartInfantry: 6 }
 };
+var DIFFICULTY_ORDER = ["easy", "normal", "hard"];
 
 // src/game/enemyAI.ts
 var AI_BUILD_KINDS = ["refinery", "barracks", "turret"];
@@ -1371,6 +1372,227 @@ function powerFactor(power) {
   if (power.ratio >= 0.5) return 0.6;
   return 0.3;
 }
+function isLowPower(power) {
+  return power.ratio < 1;
+}
+
+// src/game/save.ts
+var SAVE_VERSION = 2;
+var cloneUnit = (u) => ({ id: u.id, kind: u.kind, x: u.x, y: u.y, hp: u.hp });
+var cloneBuilding = (b) => {
+  const c = { id: b.id, kind: b.kind, gx: b.gx, gy: b.gy, hp: b.hp };
+  if (b.done !== void 0) c.done = b.done;
+  return c;
+};
+function snapshot(input) {
+  const s = {
+    version: SAVE_VERSION,
+    seed: input.seed,
+    credits: input.credits,
+    elapsed: input.elapsed,
+    units: input.units.map(cloneUnit),
+    buildings: (input.buildings ?? []).map(cloneBuilding),
+    enemyUnits: (input.enemyUnits ?? []).map(cloneUnit),
+    enemyBuildings: (input.enemyBuildings ?? []).map(cloneBuilding)
+  };
+  if (input.ai) s.ai = { ...input.ai };
+  if (input.camera) s.camera = { ...input.camera };
+  if (input.opts) s.opts = { ...input.opts };
+  return s;
+}
+
+// src/game/upgrades.ts
+var BASE_LEVEL = 1;
+var MAX_LEVEL = 3;
+var stock = (effect) => ({
+  level: 1,
+  label: "\u57FA\u7840",
+  cost: 0,
+  time: 0,
+  effect,
+  multiplier: 1,
+  needsPower: false
+});
+var UPGRADE_TABLE = {
+  hq: {
+    1: stock("armor"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 800, time: 15, effect: "armor", multiplier: 1.25, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 1500, time: 25, effect: "armor", multiplier: 1.5, needsPower: true }
+  },
+  barracks: {
+    1: stock("production"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 300, time: 12, effect: "production", multiplier: 1.25, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 600, time: 20, effect: "production", multiplier: 1.5, needsPower: true }
+  },
+  refinery: {
+    1: stock("production"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 1e3, time: 18, effect: "production", multiplier: 1.5, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 2e3, time: 30, effect: "production", multiplier: 2, needsPower: true }
+  },
+  power: {
+    1: stock("production"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 200, time: 8, effect: "production", multiplier: 1.5, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 400, time: 15, effect: "production", multiplier: 2, needsPower: true }
+  },
+  turret: {
+    1: stock("range"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 400, time: 12, effect: "range", multiplier: 1.25, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 800, time: 20, effect: "range", multiplier: 1.5, needsPower: true }
+  },
+  wall: {
+    1: stock("armor"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 50, time: 4, effect: "armor", multiplier: 1.5, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 100, time: 8, effect: "armor", multiplier: 2, needsPower: true }
+  }
+};
+function effectAt(kind, level) {
+  const t = UPGRADE_TABLE[kind][level];
+  return { effect: t.effect, multiplier: t.multiplier };
+}
+function nextLevel(level) {
+  return level === 1 ? 2 : level === 2 ? 3 : null;
+}
+function canUpgrade(b, level, credits, powered) {
+  if (!b.done) return { ok: false, reason: "not-done" };
+  const next = nextLevel(level);
+  if (next === null) return { ok: false, reason: "max-level" };
+  const tier = UPGRADE_TABLE[b.kind][next];
+  if (tier.needsPower && !powered) return { ok: false, reason: "no-power" };
+  if (credits < tier.cost) return { ok: false, reason: "funds" };
+  return { ok: true };
+}
+function startUpgrade(jobs, b, level, e, powered) {
+  if (jobs.some((j) => j.buildingId === b.id)) return { ok: false, reason: "busy" };
+  const chk = canUpgrade(b, level, e.credits, powered);
+  if (!chk.ok) return chk;
+  const to = nextLevel(level);
+  const tier = UPGRADE_TABLE[b.kind][to];
+  if (!spend(e, tier.cost)) return { ok: false, reason: "funds" };
+  const job = {
+    buildingId: b.id,
+    kind: b.kind,
+    from: level,
+    to,
+    cost: tier.cost,
+    time: tier.time,
+    elapsed: 0,
+    effect: tier.effect,
+    multiplier: tier.multiplier
+  };
+  jobs.push(job);
+  return { ok: true, job };
+}
+function tickUpgrade(jobs, dt) {
+  const done = [];
+  if (!(dt > 0)) return done;
+  for (let i = jobs.length - 1; i >= 0; i--) {
+    const j = jobs[i];
+    j.elapsed += dt;
+    if (j.elapsed >= j.time) {
+      jobs.splice(i, 1);
+      done.push({
+        buildingId: j.buildingId,
+        level: j.to,
+        effect: j.effect,
+        multiplier: j.multiplier
+      });
+    }
+  }
+  return done;
+}
+var SELL_REFUND = { 1: 0.5, 2: 0.6, 3: 0.7 };
+function canSell(jobs, buildingId) {
+  return jobs.some((j) => j.buildingId === buildingId) ? { ok: false, reason: "busy" } : { ok: true };
+}
+function sellValue(def, level, hpRatio) {
+  const hp = hpRatio > 0 ? Math.min(1, hpRatio) : 0;
+  return Math.max(0, Math.round(def.cost * SELL_REFUND[level] * hp));
+}
+
+// src/game/repair.ts
+var REPAIR_RATES = {
+  /** Fraction of unit value charged for a 0→maxHp repair. */
+  costFraction: 0.5,
+  /** Seconds to repair a unit from 0→maxHp. */
+  fullRepairTime: 30,
+  /** Hp restored per second while a repair is active. */
+  hpPerSecond: 10
+};
+function repairCost(maxHp, hp, unitValue) {
+  if (maxHp <= 0 || unitValue <= 0) return 0;
+  const missing = Math.min(Math.max(maxHp - hp, 0), maxHp);
+  return missing / maxHp * unitValue * REPAIR_RATES.costFraction;
+}
+function createRepairQueue() {
+  return { jobs: [], engineers: /* @__PURE__ */ new Map() };
+}
+function enqueue2(queue, target) {
+  if (!(target.maxHp > 0) || !(target.value >= 0)) return { ok: false, reason: "invalid" };
+  if (target.hp <= 0) return { ok: false, reason: "dead" };
+  if (target.hp >= target.maxHp) return { ok: false, reason: "full" };
+  if (queue.jobs.some((j) => j.id === target.id)) return { ok: false, reason: "duplicate" };
+  queue.jobs.push({ ...target, engineerId: null });
+  return { ok: true };
+}
+function assignEngineer(queue, engineerId, targetId) {
+  const job = queue.jobs.find((j) => j.id === targetId);
+  if (!job) return false;
+  if (job.engineerId !== null && job.engineerId !== engineerId) return false;
+  releaseEngineer(queue, engineerId);
+  job.engineerId = engineerId;
+  queue.engineers.set(engineerId, targetId);
+  return true;
+}
+function releaseEngineer(queue, engineerId) {
+  const targetId = queue.engineers.get(engineerId);
+  if (targetId === void 0) return false;
+  queue.engineers.delete(engineerId);
+  const job = queue.jobs.find((j) => j.id === targetId);
+  if (job && job.engineerId === engineerId) job.engineerId = null;
+  return true;
+}
+function notifyDestroyed(queue, targetId) {
+  const idx2 = queue.jobs.findIndex((j) => j.id === targetId);
+  if (idx2 === -1) return false;
+  const [job] = queue.jobs.splice(idx2, 1);
+  if (job.engineerId !== null) queue.engineers.delete(job.engineerId);
+  return true;
+}
+function tickRepair(queue, dt, credits) {
+  const result = { spent: 0, healed: [], finished: [] };
+  if (!(dt > 0)) return result;
+  for (const job of [...queue.jobs]) {
+    if (job.hp <= 0) notifyDestroyed(queue, job.id);
+  }
+  let funds = Math.max(credits, 0);
+  for (const job of [...queue.jobs]) {
+    if (job.engineerId === null) continue;
+    if (job.hp >= job.maxHp) {
+      finishJob(queue, job, result);
+      continue;
+    }
+    if (funds <= 0) break;
+    const wantHp = Math.min(REPAIR_RATES.hpPerSecond * dt, job.maxHp - job.hp);
+    const hpCostRate = job.value > 0 ? REPAIR_RATES.costFraction * job.value / job.maxHp : 0;
+    const affordableHp = hpCostRate > 0 ? funds / hpCostRate : wantHp;
+    const healedHp = Math.min(wantHp, affordableHp);
+    if (healedHp <= 0) break;
+    job.hp += healedHp;
+    const cost = healedHp * hpCostRate;
+    funds -= cost;
+    result.spent += cost;
+    result.healed.push({ id: job.id, hp: job.hp });
+    if (job.hp >= job.maxHp - 1e-9) {
+      job.hp = job.maxHp;
+      finishJob(queue, job, result);
+    }
+  }
+  return result;
+}
+function finishJob(queue, job, result) {
+  notifyDestroyed(queue, job.id);
+  result.finished.push(job.id);
+}
 
 // src/game/gameState.ts
 var COMBAT_STATS = {
@@ -1416,6 +1638,8 @@ function addBuilding(g, list, kind, gx, gy, team, done) {
   b.cooldownMax = 0;
   b.done = done;
   b.buildLeft = done ? 0 : def.buildTime;
+  b.level = BASE_LEVEL;
+  b.repairing = false;
   return b;
 }
 function allBuildings(g) {
@@ -1476,6 +1700,8 @@ function createGame(seed, opts = {}) {
     enemyBuildings: [],
     economy: createEconomy(o.credits),
     queue: createQueue(),
+    upgradeJobs: [],
+    repairs: createRepairQueue(),
     // A shorter waveIntervalScale banks AI income faster → waves land sooner.
     ai: createAIState(seed, 1 / Math.max(0.01, o.waveIntervalScale), {
       deep: o.deepAI,
@@ -1529,6 +1755,53 @@ function trainUnit(g, kind) {
 }
 function restart(g) {
   return createGame(g.seed, g.opts);
+}
+function gridPowered(g) {
+  const p = computePower(g.buildings);
+  return p.produced > 0 && !isLowPower(p);
+}
+function playerBuilding(g, id) {
+  return g.buildings.find((b) => b.id === id);
+}
+function upgradeBuilding(g, buildingId) {
+  if (g.phase !== "playing") return { ok: false, reason: "ended" };
+  const b = playerBuilding(g, buildingId);
+  if (!b) return { ok: false, reason: "missing" };
+  return startUpgrade(g.upgradeJobs, b, b.level, g.economy, gridPowered(g));
+}
+function sellBuilding(g, buildingId) {
+  if (g.phase !== "playing") return { ok: false, reason: "ended" };
+  const i = g.buildings.findIndex((b2) => b2.id === buildingId);
+  if (i === -1) return { ok: false, reason: "missing" };
+  if (!canSell(g.upgradeJobs, buildingId).ok) return { ok: false, reason: "busy" };
+  const b = g.buildings[i];
+  const def = BUILDING_DEFS[b.kind];
+  const prog = b.done || def.buildTime <= 0 ? 1 : Math.max(0, 1 - b.buildLeft / def.buildTime);
+  const ratio = (b.maxHp > 0 ? Math.min(1, Math.max(0, b.hp / b.maxHp)) : 0) * prog;
+  const refund = sellValue(def, b.level, ratio);
+  credit(g.economy, refund);
+  g.buildings.splice(i, 1);
+  notifyDestroyed(g.repairs, buildingId);
+  return { ok: true, refund };
+}
+function startRepair(g, buildingId) {
+  if (g.phase !== "playing") return { ok: false, reason: "ended" };
+  const b = playerBuilding(g, buildingId);
+  if (!b) return { ok: false, reason: "missing" };
+  const def = BUILDING_DEFS[b.kind];
+  if (repairCost(b.maxHp, b.hp, def.cost) > 0 && g.economy.credits <= 0) {
+    return { ok: false, reason: "funds" };
+  }
+  const r = enqueue2(g.repairs, { id: b.id, hp: b.hp, maxHp: b.maxHp, value: def.cost });
+  if (!r.ok) return r;
+  assignEngineer(g.repairs, b.id, b.id);
+  b.repairing = true;
+  return { ok: true };
+}
+function stopRepair(g, buildingId) {
+  notifyDestroyed(g.repairs, buildingId);
+  const b = playerBuilding(g, buildingId);
+  if (b) b.repairing = false;
 }
 function spawnTrained(g, kind) {
   const rax = g.buildings.find((b) => b.kind === "barracks" && b.done) ?? g.buildings.find((b) => b.done) ?? g.buildings[0];
@@ -1641,11 +1914,14 @@ function applyAICommand(g, cmd) {
   }
 }
 function tickGame(g, dt) {
-  if (g.phase !== "playing" || !(dt > 0)) return;
+  const ev = { built: [], trained: [], upgrades: [], repaired: [] };
+  if (g.phase !== "playing" || !(dt > 0)) return ev;
   g.elapsed += dt;
-  let refs = 0;
-  for (const b of g.buildings) if (b.kind === "refinery" && b.done) refs++;
-  if (refs > 0) credit(g.economy, REFINERY_TRICKLE * refs * dt);
+  let trickle = 0;
+  for (const b of g.buildings) {
+    if (b.kind === "refinery" && b.done) trickle += effectAt("refinery", b.level).multiplier;
+  }
+  if (trickle > 0) credit(g.economy, REFINERY_TRICKLE * trickle * dt);
   const factor = powerFactor(computePower(g.buildings));
   for (const b of allBuildings(g)) {
     if (!b.done) {
@@ -1653,10 +1929,32 @@ function tickGame(g, dt) {
       if (b.buildLeft <= 0) {
         b.buildLeft = 0;
         b.done = true;
+        ev.built.push(b);
       }
     }
   }
-  for (const item of tickQueue(g.queue, dt * factor)) spawnTrained(g, item.key);
+  for (const d of tickUpgrade(g.upgradeJobs, dt)) {
+    const b = playerBuilding(g, d.buildingId);
+    if (b) {
+      b.level = d.level;
+      if (d.effect === "armor") {
+        const max = Math.round(BUILDING_DEFS[b.kind].hp * d.multiplier);
+        b.hp = Math.min(max, b.hp + Math.max(0, max - b.maxHp));
+        b.maxHp = max;
+      }
+    }
+    ev.upgrades.push(d);
+  }
+  let raxMul = 1;
+  for (const b of g.buildings) {
+    if (b.kind === "barracks" && b.done && b.level > BASE_LEVEL) {
+      raxMul = Math.max(raxMul, effectAt("barracks", b.level).multiplier);
+    }
+  }
+  for (const item of tickQueue(g.queue, dt * factor * raxMul)) {
+    spawnTrained(g, item.key);
+    ev.trained.push(item.key);
+  }
   if (g.enemyBuildings.length > 0) {
     const intel = g.ai.deep ? buildAIIntel(g) : void 0;
     for (const cmd of stepAI(g.ai, dt, intel)) applyAICommand(g, cmd);
@@ -1689,8 +1987,167 @@ function tickGame(g, dt) {
   g.buildings = g.buildings.filter((b) => b.hp > 0);
   g.enemyBuildings = g.enemyBuildings.filter((b) => b.hp > 0);
   g.ai.army = g.enemyUnits.length;
+  for (const j of g.repairs.jobs) {
+    const b = playerBuilding(g, j.id);
+    j.hp = b ? b.hp : 0;
+    if (b) j.maxHp = b.maxHp;
+  }
+  const rep = tickRepair(g.repairs, dt, g.economy.credits);
+  if (rep.spent > 0) spend(g.economy, rep.spent);
+  for (const h of rep.healed) {
+    const b = playerBuilding(g, h.id);
+    if (b) b.hp = h.hp;
+  }
+  for (const id of rep.finished) {
+    const b = playerBuilding(g, id);
+    if (b) b.repairing = false;
+    ev.repaired.push(id);
+  }
+  if (g.upgradeJobs.length > 0) {
+    const aliveB = new Set(g.buildings.map((b) => b.id));
+    g.upgradeJobs = g.upgradeJobs.filter((j) => aliveB.has(j.buildingId));
+  }
   if (!g.buildings.some((b) => b.kind === "hq")) g.phase = "lost";
   else if (g.enemyUnits.length === 0 && g.enemyBuildings.length === 0) g.phase = "won";
+  return ev;
+}
+var savedUnit = (u) => ({ id: u.id, kind: u.kind, x: u.x, y: u.y, hp: u.hp });
+var savedBuilding = (b) => {
+  const s = { id: b.id, kind: b.kind, gx: b.gx, gy: b.gy, hp: b.hp };
+  if (b.done) s.done = true;
+  return s;
+};
+function buildingSaveExtras(g) {
+  const o = {};
+  for (const b of g.buildings) {
+    if (b.level !== BASE_LEVEL) o[`lvl.${b.id}`] = b.level;
+    if (b.repairing) o[`rep.${b.id}`] = true;
+  }
+  return o;
+}
+function applySavedLevel(b, level) {
+  b.level = level;
+  const fx = effectAt(b.kind, level);
+  if (fx.effect === "armor" && level > BASE_LEVEL) {
+    b.maxHp = Math.round(BUILDING_DEFS[b.kind].hp * fx.multiplier);
+  }
+}
+function snapshotGame(g, camera) {
+  return snapshot({
+    seed: g.seed,
+    credits: Math.floor(g.economy.credits),
+    elapsed: g.elapsed,
+    units: g.units.map(savedUnit),
+    buildings: g.buildings.map(savedBuilding),
+    enemyUnits: g.enemyUnits.map(savedUnit),
+    enemyBuildings: g.enemyBuildings.map(savedBuilding),
+    ai: { phase: g.ai.phase, credits: g.ai.credits, army: g.ai.army, wave: g.ai.wave },
+    camera: camera ? { x: camera.x, y: camera.y, zoom: camera.zoom } : void 0,
+    opts: {
+      credits: g.opts.credits,
+      infantry: g.opts.infantry,
+      enemyInfantry: g.opts.enemyInfantry,
+      enemyBase: g.opts.enemyBase,
+      enemyStrength: g.opts.enemyStrength,
+      waveIntervalScale: g.opts.waveIntervalScale,
+      deepAI: g.opts.deepAI,
+      aiDifficulty: DIFFICULTY_ORDER.indexOf(g.opts.aiDifficulty),
+      ...buildingSaveExtras(g)
+    }
+  });
+}
+var isUnitKind = (k) => k in UNIT_STATS;
+var isBuildingKind = (k) => k in BUILDING_DEFS;
+var isAIPhase = (p) => p === "gather" || p === "build" || p === "scout" || p === "muster" || p === "attack";
+function restoreBuilding(list, s, team) {
+  if (!isBuildingKind(s.kind)) return null;
+  const def = BUILDING_DEFS[s.kind];
+  const b = place(list, s.kind, s.gx, s.gy, s.id);
+  b.team = team;
+  b.x = (s.gx + def.w / 2) * TILE_SIZE;
+  b.y = (s.gy + def.h / 2) * TILE_SIZE;
+  b.range = 0;
+  b.damage = 0;
+  b.cooldown = 0;
+  b.cooldownMax = 0;
+  b.hp = Math.min(Math.max(0, s.hp), def.hp);
+  b.done = s.done === true;
+  b.buildLeft = b.done ? 0 : def.buildTime;
+  b.level = BASE_LEVEL;
+  b.repairing = false;
+  return b;
+}
+function restoreUnits(list, saved, team, strength) {
+  for (const s of saved) {
+    if (!isUnitKind(s.kind)) return false;
+    const u = makeGUnit(s.id, s.kind, 0, 0, team, team === "enemy" ? strength : 1);
+    u.x = s.x;
+    u.y = s.y;
+    u.hp = Math.min(Math.max(0, s.hp), u.maxHp);
+    list.push(u);
+  }
+  return true;
+}
+function restoreGame(s) {
+  const o = s.opts ?? {};
+  const opts = {};
+  if (typeof o.credits === "number") opts.credits = o.credits;
+  if (typeof o.infantry === "number") opts.infantry = o.infantry;
+  if (typeof o.enemyInfantry === "number") opts.enemyInfantry = o.enemyInfantry;
+  if (typeof o.enemyBase === "boolean") opts.enemyBase = o.enemyBase;
+  if (typeof o.enemyStrength === "number") opts.enemyStrength = o.enemyStrength;
+  if (typeof o.waveIntervalScale === "number") opts.waveIntervalScale = o.waveIntervalScale;
+  if (typeof o.deepAI === "boolean") opts.deepAI = o.deepAI;
+  if (typeof o.aiDifficulty === "number") {
+    const d = DIFFICULTY_ORDER[o.aiDifficulty];
+    if (d) opts.aiDifficulty = d;
+  }
+  const g = createGame(s.seed ?? 0, opts);
+  g.units = [];
+  g.enemyUnits = [];
+  g.harvesters = [];
+  g.buildings = [];
+  g.enemyBuildings = [];
+  if (!restoreUnits(g.units, s.units ?? [], "player", 1)) return null;
+  if (!restoreUnits(g.enemyUnits, s.enemyUnits ?? [], "enemy", g.opts.enemyStrength)) return null;
+  for (const b of s.buildings ?? []) {
+    const rb = restoreBuilding(g.buildings, b, "player");
+    if (!rb) return null;
+    const lv = o[`lvl.${rb.id}`];
+    if (typeof lv === "number") {
+      const lvl = lv >= MAX_LEVEL ? MAX_LEVEL : lv <= BASE_LEVEL ? BASE_LEVEL : Math.round(lv);
+      applySavedLevel(rb, lvl);
+      rb.hp = Math.min(Math.max(0, b.hp), rb.maxHp);
+    }
+    if (o[`rep.${rb.id}`] === true && rb.hp < rb.maxHp) {
+      const r = startRepair(g, rb.id);
+      if (!r.ok) rb.repairing = false;
+    }
+  }
+  for (const b of s.enemyBuildings ?? [])
+    if (!restoreBuilding(g.enemyBuildings, b, "enemy")) return null;
+  for (const u of g.units) {
+    if (u.kind === "harvester") g.harvesters.push(createHarvester(u));
+  }
+  let maxId = g.nextId;
+  for (const e of [...g.units, ...g.enemyUnits, ...g.buildings, ...g.enemyBuildings]) {
+    maxId = Math.max(maxId, e.id + 1);
+  }
+  g.nextId = maxId;
+  if (s.credits !== void 0) g.economy.credits = s.credits;
+  g.elapsed = s.elapsed ?? 0;
+  if (s.ai) {
+    if (isAIPhase(s.ai.phase)) g.ai.phase = s.ai.phase;
+    if (!g.ai.deep && (g.ai.phase === "scout" || g.ai.phase === "muster")) g.ai.phase = "build";
+    g.ai.credits = s.ai.credits;
+    g.ai.army = s.ai.army;
+    g.ai.wave = s.ai.wave;
+  } else {
+    g.ai.army = g.enemyUnits.length;
+  }
+  const hq = g.enemyBuildings.find((b) => b.kind === "hq");
+  if (hq) g.enemyAnchor = { x: hq.gx + 2, y: hq.gy + BUILDING_DEFS.hq.h };
+  return g;
 }
 
 // src/game/gameState.test.ts
@@ -1969,4 +2426,112 @@ test("same seed and same inputs produce identical credits", () => {
   const b = play();
   assert.equal(a.economy.credits, b.economy.credits);
   assert.deepEqual(snap(a), snap(b));
+});
+test("buildings start at level 1, not repairing", () => {
+  const g = createGame(7);
+  for (const b of g.buildings) {
+    assert.equal(b.level, 1);
+    assert.equal(b.repairing, false);
+  }
+  assert.equal(g.upgradeJobs.length, 0);
+  assert.equal(g.repairs.jobs.length, 0);
+});
+test("upgradeBuilding charges, ticks and applies the armor tier", () => {
+  const g = createGame(7);
+  const hq = g.buildings.find((b) => b.kind === "hq");
+  const before = g.economy.credits;
+  const r = upgradeBuilding(g, hq.id);
+  assert.ok(r.ok, "hq upgrade should start (stock grid is powered)");
+  assert.equal(g.economy.credits, before - 800);
+  assert.equal(g.upgradeJobs.length, 1);
+  const again = upgradeBuilding(g, hq.id);
+  assert.equal(again.ok, false);
+  assert.equal(again.reason, "busy");
+  run(g, 16);
+  assert.equal(g.upgradeJobs.length, 0);
+  assert.equal(hq.level, 2);
+  assert.equal(hq.maxHp, Math.round(BUILDING_DEFS.hq.hp * 1.25));
+  assert.equal(hq.hp, hq.maxHp);
+});
+test("upgradeBuilding rejects an unfinished building", () => {
+  const g = createGame(7);
+  buildKind(g, "wall");
+  const wall = g.buildings.find((b) => b.kind === "wall");
+  const r = upgradeBuilding(g, wall.id);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "not-done");
+});
+test("sellBuilding refunds scaled cost and removes the building", () => {
+  const g = createGame(7);
+  buildKind(g, "wall");
+  run(g, 5);
+  const wall = g.buildings.find((b) => b.kind === "wall");
+  const before = g.economy.credits;
+  const r = sellBuilding(g, wall.id);
+  assert.ok(r.ok);
+  assert.equal(r.refund, 50);
+  assert.equal(g.economy.credits, before + 50);
+  assert.ok(!g.buildings.includes(wall));
+});
+test("startRepair heals, charges credits and finishes at full hp", () => {
+  const g = createGame(7);
+  const hq = g.buildings.find((b) => b.kind === "hq");
+  hq.hp = hq.maxHp - 20;
+  const before = g.economy.credits;
+  assert.ok(startRepair(g, hq.id).ok);
+  assert.equal(hq.repairing, true);
+  const seen = /* @__PURE__ */ new Set();
+  for (let t = 0; t < 4; t += 0.25) {
+    for (const id of tickGame(g, 0.25).repaired) seen.add(id);
+  }
+  assert.equal(hq.hp, hq.maxHp);
+  assert.equal(hq.repairing, false);
+  assert.ok(seen.has(hq.id));
+  assert.ok(g.economy.credits < before, "repair should spend credits");
+});
+test("stopRepair cancels an in-flight repair", () => {
+  const g = createGame(7);
+  const hq = g.buildings.find((b) => b.kind === "hq");
+  hq.hp = 1e3;
+  assert.ok(startRepair(g, hq.id).ok);
+  stopRepair(g, hq.id);
+  assert.equal(hq.repairing, false);
+  assert.equal(g.repairs.jobs.length, 0);
+  run(g, 1);
+  assert.equal(hq.hp, 1e3);
+});
+test("startRepair rejects full-hp and missing targets", () => {
+  const g = createGame(7);
+  const hq = g.buildings.find((b) => b.kind === "hq");
+  const full = startRepair(g, hq.id);
+  assert.equal(full.ok, false);
+  assert.equal(full.reason, "full");
+  assert.equal(startRepair(g, 999999).ok, false);
+});
+test("snapshotGame / restoreGame round-trips level and repair flag", () => {
+  const g = createGame(7);
+  const hq = g.buildings.find((b) => b.kind === "hq");
+  assert.ok(upgradeBuilding(g, hq.id).ok);
+  run(g, 16);
+  hq.hp = 1e3;
+  assert.ok(startRepair(g, hq.id).ok);
+  const g2 = restoreGame(snapshotGame(g));
+  const hq2 = g2.buildings.find((b) => b.kind === "hq");
+  assert.equal(hq2.level, 2);
+  assert.equal(hq2.maxHp, Math.round(BUILDING_DEFS.hq.hp * 1.25));
+  assert.equal(hq2.hp, 1e3);
+  assert.equal(hq2.repairing, true);
+});
+test("legacy saves restore with level 1 / not repairing defaults", () => {
+  const g = createGame(7);
+  const s = snapshotGame(g);
+  const opts = s.opts ?? {};
+  for (const k of Object.keys(opts)) {
+    if (k.startsWith("lvl.") || k.startsWith("rep.")) delete opts[k];
+  }
+  const g2 = restoreGame(s);
+  for (const b of g2.buildings) {
+    assert.equal(b.level, 1);
+    assert.equal(b.repairing, false);
+  }
 });

@@ -148,7 +148,7 @@ export function reportLines(s: Stats, _locale: 'zh' | 'en' = 'zh'): string[] {
     '—— 战报 ——',
     `结果：${m.victory ? '胜利' : '战败'}`,
     `击杀：${m.kills}　损失：${m.losses}`,
-    `采矿：${m.oreMined}　存留建筑：${m.buildings}`,
+    `采矿：${m.oreMined}　建造：${s.buildingsBuilt}　存留：${m.buildings}`,
     `击退波次：${m.wavesCleared}`,
     `存活时长：${dur}`,
     `得分：${m.score}`,
@@ -206,4 +206,13 @@ export function loadBest(storage: KeyValueStorage): BestRecord {
 
 export function saveBest(storage: KeyValueStorage, best: BestRecord): void {
   storage.setItem(BEST_KEY, JSON.stringify(best));
+}
+
+/** 历史最佳 block appended under reportLines on the end screen. */
+export function bestLines(best: BestRecord): string[] {
+  return [
+    '—— 历史最佳 ——',
+    `得分：${best.score}　击杀：${best.kills}`,
+    `采矿：${best.oreMined}　波次：${best.wavesCleared}`,
+  ];
 }
