@@ -33,7 +33,7 @@ var SIGHT_RADIUS = {
 };
 var RADAR_SIGHT_BONUS = 4;
 var SOURCE_FADE_SECONDS = 1.5;
-function createFog(map2) {
+function createFog(map2, cfg = {}) {
   return {
     w: map2.w,
     h: map2.h,
@@ -41,7 +41,10 @@ function createFog(map2) {
     visible: new Uint8Array(map2.w * map2.h),
     scans: [],
     prevSources: [],
-    fading: []
+    fading: [],
+    sight: { ...SIGHT_RADIUS, ...cfg.sight },
+    radarBonus: cfg.radarBonus ?? RADAR_SIGHT_BONUS,
+    fadeSeconds: cfg.fadeSeconds ?? SOURCE_FADE_SECONDS
   };
 }
 function unitSource(u) {
@@ -56,9 +59,12 @@ function buildingSource(b) {
     id: b.id
   };
 }
-function sightRadius(s) {
-  const base = s.sight !== void 0 ? s.sight : s.kind !== void 0 ? SIGHT_RADIUS[s.kind] : 0;
-  return base + (s.radar ? RADAR_SIGHT_BONUS : 0);
+function radarSource(b) {
+  return { ...buildingSource(b), radar: true };
+}
+function sightRadius(fog, s) {
+  const base = s.sight !== void 0 ? s.sight : s.kind !== void 0 ? fog.sight[s.kind] : 0;
+  return base + (s.radar ? fog.radarBonus : 0);
 }
 function sourceKey(s, tx, ty) {
   if (s.id !== void 0) return `id:${s.id}`;
@@ -87,28 +93,30 @@ function updateFog(fog, map2, sources, dt = 0) {
   fog.visible.fill(0);
   const next = [];
   for (const s of sources) {
-    const r = sightRadius(s);
+    const r = sightRadius(fog, s);
     if (r <= 0) continue;
     const cx = worldToTile(s.x);
     const cy = worldToTile(s.y);
     stamp(fog, map2, cx, cy, r);
     next.push({ key: sourceKey(s, cx, cy), x: cx, y: cy, r });
   }
-  if (dt > 0) {
+  if (dt > 0 && fog.fadeSeconds > 0) {
     const currentKeys = new Set(next.map((n) => n.key));
     for (const prev of fog.prevSources) {
       if (!currentKeys.has(prev.key)) {
-        fog.fading.push({ x: prev.x, y: prev.y, r: prev.r, ttl: SOURCE_FADE_SECONDS });
+        fog.fading.push({ x: prev.x, y: prev.y, r: prev.r, ttl: fog.fadeSeconds });
       }
     }
   }
   fog.prevSources = next;
   const fading = [];
-  for (const f of fog.fading) {
-    f.ttl -= dt;
-    if (f.ttl <= 0) continue;
-    stamp(fog, map2, f.x, f.y, f.r * f.ttl / SOURCE_FADE_SECONDS);
-    fading.push(f);
+  if (fog.fadeSeconds > 0) {
+    for (const f of fog.fading) {
+      f.ttl -= dt;
+      if (f.ttl <= 0) continue;
+      stamp(fog, map2, f.x, f.y, f.r * f.ttl / fog.fadeSeconds);
+      fading.push(f);
+    }
   }
   fog.fading = fading;
   const scans = [];
@@ -276,4 +284,59 @@ test("unitSource and buildingSource adapt game objects", () => {
   assert.ok(isVisible(fog, 22, 21));
   assert.ok(isVisible(fog, 22 + 8, 21));
   assert.ok(!isVisible(fog, 22 + 9, 21));
+});
+test("FogConfig.sight overrides per-kind radius", () => {
+  const fog = createFog(map, { sight: { infantry: 2, hq: 12 } });
+  assert.equal(sightRadius(fog, src(10, 10, "infantry")), 2);
+  assert.equal(sightRadius(fog, src(10, 10, "hq")), 12);
+  assert.equal(sightRadius(fog, src(10, 10, "tank")), SIGHT_RADIUS.tank);
+  updateFog(fog, map, [src(10, 10, "infantry")]);
+  assert.ok(isVisible(fog, 12, 10));
+  assert.ok(!isVisible(fog, 13, 10));
+});
+test("FogConfig.radarBonus replaces RADAR_SIGHT_BONUS", () => {
+  const fog = createFog(map, { radarBonus: 10 });
+  const s = src(10, 10, "hq");
+  s.radar = true;
+  assert.equal(sightRadius(fog, s), SIGHT_RADIUS.hq + 10);
+});
+test("radarSource flags a building for the sight bonus", () => {
+  const b = { id: 3, kind: "hq", gx: 8, gy: 8, hp: 1, maxHp: 1, done: true };
+  const plain = buildingSource(b);
+  const dish = radarSource(b);
+  assert.equal(plain.radar, void 0);
+  assert.equal(dish.radar, true);
+  assert.equal(dish.id, b.id);
+  const fog = createFog(map);
+  assert.equal(sightRadius(fog, dish), SIGHT_RADIUS.hq + RADAR_SIGHT_BONUS);
+});
+test("fadeSeconds 0: destroyed building loses sight instantly", () => {
+  const fog = createFog(map, { fadeSeconds: 0 });
+  const b = { id: 7, kind: "hq", gx: 16, gy: 16, hp: 1, maxHp: 1, done: true };
+  updateFog(fog, map, [buildingSource(b)], 0.1);
+  assert.ok(isVisible(fog, 25, 17));
+  updateFog(fog, map, [], 0.1);
+  assert.ok(!isVisible(fog, 25, 17));
+  assert.ok(!isVisible(fog, 18, 17));
+  assert.equal(fog.fading.length, 0);
+  assert.ok(isExplored(fog, 25, 17));
+});
+test("custom fadeSeconds tunes the collapse duration", () => {
+  const fog = createFog(map, { fadeSeconds: 4 });
+  const b = { id: 8, kind: "hq", gx: 16, gy: 16, hp: 1, maxHp: 1, done: true };
+  updateFog(fog, map, [buildingSource(b)], 0.1);
+  updateFog(fog, map, [], 0.1);
+  assert.equal(fog.fading.length, 1);
+  updateFog(fog, map, [], 0.9);
+  assert.ok(isVisible(fog, 24, 17));
+});
+test("memory: enemy hidden once unseen, terrain stays explored", () => {
+  const fog = createFog(map);
+  updateFog(fog, map, [src(10, 10)]);
+  const enemy = { id: 1, x: 12 * TILE_SIZE, y: 10 * TILE_SIZE };
+  assert.deepEqual(filterVisibleEnemies(fog, [enemy]), [enemy]);
+  updateFog(fog, map, [src(28, 28)]);
+  assert.deepEqual(filterVisibleEnemies(fog, [enemy]), []);
+  assert.ok(isExplored(fog, 12, 10));
+  assert.equal(fogAlpha(fog, 12, 10), 0.5);
 });

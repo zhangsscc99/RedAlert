@@ -2,6 +2,114 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
+// src/game/grid.ts
+var TILE_SIZE = 32;
+function worldToTile(px) {
+  return Math.floor(px / TILE_SIZE);
+}
+
+// src/game/buildings.ts
+var RADAR_SCAN = { radius: 12 * TILE_SIZE, period: 5 };
+
+// src/game/fog.ts
+var SIGHT_RADIUS = {
+  infantry: 4,
+  tank: 6,
+  harvester: 6,
+  hq: 8,
+  barracks: 8,
+  refinery: 8,
+  power: 8,
+  turret: 8,
+  wall: 8
+};
+var RADAR_SIGHT_BONUS = 4;
+var SOURCE_FADE_SECONDS = 1.5;
+function createFog(map, cfg = {}) {
+  return {
+    w: map.w,
+    h: map.h,
+    explored: new Uint8Array(map.w * map.h),
+    visible: new Uint8Array(map.w * map.h),
+    scans: [],
+    prevSources: [],
+    fading: [],
+    sight: { ...SIGHT_RADIUS, ...cfg.sight },
+    radarBonus: cfg.radarBonus ?? RADAR_SIGHT_BONUS,
+    fadeSeconds: cfg.fadeSeconds ?? SOURCE_FADE_SECONDS
+  };
+}
+function sightRadius(fog, s) {
+  const base = s.sight !== void 0 ? s.sight : s.kind !== void 0 ? fog.sight[s.kind] : 0;
+  return base + (s.radar ? fog.radarBonus : 0);
+}
+function sourceKey(s, tx, ty) {
+  if (s.id !== void 0) return `id:${s.id}`;
+  return `${s.kind ?? "?"}@${tx},${ty}`;
+}
+function revealScan(fog, wx, wy, radiusTiles, ttlSeconds) {
+  fog.scans.push({ x: worldToTile(wx), y: worldToTile(wy), r: radiusTiles, ttl: ttlSeconds });
+}
+function stamp(fog, map, cx, cy, r) {
+  if (r <= 0) return;
+  const ri = Math.ceil(r);
+  const r2 = r * r;
+  for (let dy = -ri; dy <= ri; dy++) {
+    for (let dx = -ri; dx <= ri; dx++) {
+      if (dx * dx + dy * dy > r2) continue;
+      const x = cx + dx;
+      const y = cy + dy;
+      if (x < 0 || y < 0 || x >= map.w || y >= map.h) continue;
+      const i = y * map.w + x;
+      fog.visible[i] = 1;
+      fog.explored[i] = 1;
+    }
+  }
+}
+function updateFog(fog, map, sources, dt = 0) {
+  fog.visible.fill(0);
+  const next = [];
+  for (const s of sources) {
+    const r = sightRadius(fog, s);
+    if (r <= 0) continue;
+    const cx = worldToTile(s.x);
+    const cy = worldToTile(s.y);
+    stamp(fog, map, cx, cy, r);
+    next.push({ key: sourceKey(s, cx, cy), x: cx, y: cy, r });
+  }
+  if (dt > 0 && fog.fadeSeconds > 0) {
+    const currentKeys = new Set(next.map((n) => n.key));
+    for (const prev of fog.prevSources) {
+      if (!currentKeys.has(prev.key)) {
+        fog.fading.push({ x: prev.x, y: prev.y, r: prev.r, ttl: fog.fadeSeconds });
+      }
+    }
+  }
+  fog.prevSources = next;
+  const fading = [];
+  if (fog.fadeSeconds > 0) {
+    for (const f of fog.fading) {
+      f.ttl -= dt;
+      if (f.ttl <= 0) continue;
+      stamp(fog, map, f.x, f.y, f.r * f.ttl / fog.fadeSeconds);
+      fading.push(f);
+    }
+  }
+  fog.fading = fading;
+  const scans = [];
+  for (const sc of fog.scans) {
+    sc.ttl -= dt;
+    if (sc.ttl <= 0) continue;
+    stamp(fog, map, sc.x, sc.y, sc.r);
+    scans.push(sc);
+  }
+  fog.scans = scans;
+}
+function isVisible(fog, x, y) {
+  if (x < 0 || y < 0 || x >= fog.w || y >= fog.h) return false;
+  return fog.visible[y * fog.w + x] === 1;
+}
+
 // src/game/radar.ts
 function createRadar(opts) {
   return {
@@ -10,6 +118,11 @@ function createRadar(opts) {
     contactTtl: opts.contactTtl,
     cx: opts.cx ?? 0,
     cy: opts.cy ?? 0,
+    scanRadius: opts.scanRadius ?? opts.radius,
+    scanTtl: opts.scanTtl ?? 2,
+    scanCooldown: opts.scanCooldown ?? 0,
+    degradedRadius: opts.degradedRadius ?? opts.radius / 4,
+    nextScanAt: 0,
     phase: 0,
     time: 0,
     contacts: /* @__PURE__ */ new Map()
@@ -18,13 +131,14 @@ function createRadar(opts) {
 function radarAvailable(powered, built) {
   return powered && built;
 }
-function stepRadar(radar, dt, units, viewerTeam) {
+function stepRadar(radar, dt, units, viewerTeam, online = true) {
   radar.time += dt;
   const result = { added: [], expired: [] };
+  const reach = Math.min(radar.radius, online ? radar.radius : radar.degradedRadius);
   radar.phase += dt / radar.sweepSeconds;
   while (radar.phase >= 1) {
     radar.phase -= 1;
-    const r2 = radar.radius * radar.radius;
+    const r2 = reach * reach;
     for (const u of units) {
       if (u.team === viewerTeam) continue;
       const dx = u.x - radar.cx;
@@ -63,6 +177,37 @@ function contactsIn(radar, rect) {
     }
   }
   return out;
+}
+function scanCooldownLeft(radar) {
+  return Math.max(0, radar.nextScanAt - radar.time);
+}
+function radarScan(radar, x, y, units, viewerTeam, online = true) {
+  if (scanCooldownLeft(radar) > 0) return null;
+  radar.nextScanAt = radar.time + radar.scanCooldown;
+  const radius = Math.min(radar.scanRadius, online ? radar.scanRadius : radar.degradedRadius);
+  const r2 = radius * radius;
+  const contacts = [];
+  for (const u of units) {
+    if (u.team === viewerTeam) continue;
+    const dx = u.x - x;
+    const dy = u.y - y;
+    if (dx * dx + dy * dy > r2) continue;
+    let c = radar.contacts.get(u.id);
+    if (c) {
+      c.x = u.x;
+      c.y = u.y;
+      c.kind = u.kind;
+      c.stamp = radar.time;
+    } else {
+      c = { id: u.id, x: u.x, y: u.y, kind: u.kind, stamp: radar.time };
+      radar.contacts.set(u.id, c);
+    }
+    contacts.push(c);
+  }
+  return { x, y, radius, ttl: radar.scanTtl, degraded: !online, contacts };
+}
+function stampScan(fog, ping) {
+  revealScan(fog, ping.x, ping.y, ping.radius / TILE_SIZE, ping.ttl);
 }
 
 // src/game/radar.test.ts
@@ -134,4 +279,69 @@ test("contactsIn returns only contacts inside the rect", () => {
   const inRect = contactsIn(r, { x: 0, y: 0, w: 50, h: 50 });
   assert.deepEqual(inRect.map((c) => c.id), [1]);
   assert.equal(contactsIn(r, { x: 0, y: 0, w: 200, h: 200 }).length, 2);
+});
+test("radarScan returns every enemy in the pulse, with ids", () => {
+  const r = createRadar({ radius: 500, sweepSeconds: 4, contactTtl: 10, scanRadius: 100, scanTtl: 3 });
+  const units = [
+    unit(1, 40, 0, "enemy"),
+    unit(2, -60, -60, "enemy", "infantry"),
+    unit(3, 0, 0, "player"),
+    // friendly: never a contact
+    unit(4, 300, 0, "enemy")
+    // outside the pulse
+  ];
+  const ping = radarScan(r, 0, 0, units, "player");
+  assert.ok(ping);
+  assert.equal(ping.degraded, false);
+  assert.equal(ping.radius, 100);
+  assert.equal(ping.ttl, 3);
+  assert.deepEqual(ping.contacts.map((c) => c.id).sort(), [1, 2]);
+  assert.equal(ping.contacts[1].kind, "infantry");
+  assert.equal(r.contacts.size, 2);
+  assert.equal(r.contacts.get(4), void 0);
+});
+test("radarScan honors scanCooldown via scanCooldownLeft", () => {
+  const r = createRadar({ radius: 100, sweepSeconds: 1, contactTtl: 10, scanCooldown: 5 });
+  assert.ok(radarScan(r, 0, 0, [], "player"));
+  assert.equal(radarScan(r, 0, 0, [], "player"), null);
+  assert.ok(scanCooldownLeft(r) > 0);
+  assert.ok(scanCooldownLeft(r) <= 5);
+  stepRadar(r, 6, [], "player");
+  assert.equal(scanCooldownLeft(r), 0);
+  assert.ok(radarScan(r, 0, 0, [], "player"));
+});
+test("scan opts default: radius reach, 2s ttl, no cooldown, quarter reach offline", () => {
+  const r = createRadar({ radius: 200, sweepSeconds: 1, contactTtl: 10 });
+  assert.equal(r.scanRadius, 200);
+  assert.equal(r.scanTtl, 2);
+  assert.equal(r.scanCooldown, 0);
+  assert.equal(r.degradedRadius, 50);
+  assert.ok(radarScan(r, 0, 0, [], "player"));
+  assert.ok(radarScan(r, 0, 0, [], "player"));
+});
+test("offline radar degrades to a small reveal instead of failing", () => {
+  const r = createRadar({ radius: 200, sweepSeconds: 1, contactTtl: 10, degradedRadius: 40 });
+  const units = [unit(1, 30, 0, "enemy"), unit(2, 150, 0, "enemy")];
+  const ping = radarScan(r, 0, 0, units, "player", false);
+  assert.ok(ping);
+  assert.equal(ping.degraded, true);
+  assert.equal(ping.radius, 40);
+  assert.deepEqual(ping.contacts.map((c) => c.id), [1]);
+  r.contacts.clear();
+  const res = stepRadar(r, 1, units, "player", false);
+  assert.deepEqual(res.added.map((c) => c.id), [1]);
+});
+test("stampScan writes the pulse reveal into the fog", () => {
+  const map = { w: 32, h: 32, seed: 0, tiles: new Uint8Array(32 * 32) };
+  const fog = createFog(map);
+  const r = createRadar({ radius: 200, sweepSeconds: 1, contactTtl: 10, scanRadius: 4 * TILE_SIZE, scanTtl: 1 });
+  const ping = radarScan(r, 16 * TILE_SIZE, 16 * TILE_SIZE, [], "player");
+  assert.ok(ping);
+  stampScan(fog, ping);
+  updateFog(fog, map, [], 0.5);
+  assert.ok(isVisible(fog, 16, 16));
+  assert.ok(isVisible(fog, 20, 16));
+  assert.ok(!isVisible(fog, 21, 16));
+  updateFog(fog, map, [], 0.6);
+  assert.ok(!isVisible(fog, 16, 16));
 });
