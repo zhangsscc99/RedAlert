@@ -15,10 +15,12 @@ export type SlotId = 1 | 2 | 3;
 export const SLOT_IDS: readonly SlotId[] = [1, 2, 3];
 
 export interface SlotMeta {
-  savedAt: number; // epoch ms when the slot was written
-  elapsed: number; // seconds into the match
+  savedAt: number; // epoch ms when the slot was written (menu timestamp)
+  elapsed: number; // seconds into the match (menu duration)
   credits: number;
   phase: string;
+  difficulty?: string; // difficulty the match started on
+  result?: string; // 'playing' | 'won' | 'lost' — how the match stands
 }
 
 export interface SlotInfo {
@@ -48,7 +50,18 @@ function readMeta(storage: SlotStorage, id: SlotId): SlotMeta | null {
   const m = raw as Record<string, unknown>;
   if (!isNum(m.savedAt) || !isNum(m.elapsed) || !isNum(m.credits) || typeof m.phase !== 'string')
     return null;
-  return { savedAt: m.savedAt, elapsed: m.elapsed, credits: m.credits, phase: m.phase };
+  // v2-era metas carry no difficulty/result — they're optional on read.
+  if (m.difficulty !== undefined && typeof m.difficulty !== 'string') return null;
+  if (m.result !== undefined && typeof m.result !== 'string') return null;
+  const meta: SlotMeta = {
+    savedAt: m.savedAt,
+    elapsed: m.elapsed,
+    credits: m.credits,
+    phase: m.phase,
+  };
+  if (m.difficulty !== undefined) meta.difficulty = m.difficulty;
+  if (m.result !== undefined) meta.result = m.result;
+  return meta;
 }
 
 /** All three slots in order; empty/corrupt slots report meta: null. */
@@ -59,6 +72,15 @@ export function listSlots(storage: SlotStorage): SlotInfo[] {
 export interface SaveSlotExtra {
   phase?: string; // match phase label for the list page, default 'playing'
   savedAt?: number; // epoch ms, default Date.now()
+  difficulty?: string; // menu label, default state.difficulty
+  result?: string; // outcome label, default derived from state.stats
+}
+
+/** Outcome shown on the slot list: stats verdict, else the phase label. */
+function resultOf(state: SaveState, extra: SaveSlotExtra): string {
+  if (extra.result !== undefined) return extra.result;
+  if (state.stats?.over) return state.stats.victory ? 'won' : 'lost';
+  return extra.phase ?? 'playing';
 }
 
 /** Write a save blob + its meta record into a slot. Returns the stored meta. */
@@ -73,7 +95,10 @@ export function saveSlot(
     elapsed: state.elapsed ?? 0,
     credits: state.credits ?? 0,
     phase: extra.phase ?? 'playing',
+    result: resultOf(state, extra),
   };
+  const difficulty = extra.difficulty ?? state.difficulty;
+  if (difficulty !== undefined) meta.difficulty = difficulty;
   storage.setItem(slotKey(id), serialize(state));
   storage.setItem(metaKey(id), JSON.stringify(meta));
   return meta;
