@@ -29,7 +29,7 @@ var AI_TANK_COST = 50;
 var AI_INFANTRY_PER_WAVE = 6;
 var AI_ARMY_PER_WAVE = 15;
 var ATTACK_JITTER_TILES = 6;
-function createAIState(seed) {
+function createAIState(seed, incomeScale = 1) {
   return {
     phase: "gather",
     credits: 0,
@@ -37,6 +37,7 @@ function createAIState(seed) {
     wave: 0,
     timer: 0,
     seed,
+    incomeScale,
     rng: mulberry32(seed)
   };
 }
@@ -45,7 +46,7 @@ function stepAI(s, dt) {
   s.timer += dt;
   while (s.timer >= AI_TICK) {
     s.timer -= AI_TICK;
-    s.credits += AI_INCOME_PER_TICK;
+    s.credits += AI_INCOME_PER_TICK * s.incomeScale;
     switch (s.phase) {
       case "gather":
         if (s.credits >= AI_BUILD_CREDITS) s.phase = "build";

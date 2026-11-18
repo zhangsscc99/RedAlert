@@ -34,10 +34,11 @@ import {
   type QueueItem,
 } from './economy.js';
 import { stepCombat } from './combat.js';
-import { createAIState, stepAI, type AICommand, type AIState } from './enemyAI.js';
+import { createAIState, stepAI, type AICommand, type AIPhase, type AIState } from './enemyAI.js';
 import { createHarvester, updateHarvesters, type Harvester } from './harvest.js';
 import { computePower, powerFactor } from './power.js';
 import type { Point } from './selection.js';
+import { snapshot, type SavedBuilding, type SavedUnit, type SaveState } from './save.js';
 
 export { BUILDING_DEFS } from './buildings.js';
 export type { BuildingKind } from './buildings.js';
@@ -83,6 +84,10 @@ export interface GameOpts {
   infantry?: number; // starting player infantry, default 6
   enemyInfantry?: number; // starting enemy guards, default 4
   enemyBase?: boolean; // give the AI an HQ to defend, default true
+  /** Multiplies enemy unit hp/damage at spawn, default 1. */
+  enemyStrength?: number;
+  /** Multiplies the gap between AI waves: <1 attacks sooner, default 1. */
+  waveIntervalScale?: number;
 }
 
 export interface GameState {
@@ -107,14 +112,22 @@ export interface GameState {
 
 // ------------------------------------------------------------------ setup --
 
-function makeGUnit(id: number, kind: UnitKind, tx: number, ty: number, team: Team): GUnit {
+function makeGUnit(
+  id: number,
+  kind: UnitKind,
+  tx: number,
+  ty: number,
+  team: Team,
+  strength = 1,
+): GUnit {
   const s = UNIT_STATS[kind];
   const c = COMBAT_STATS[kind];
+  const hp = Math.round(s.hp * strength);
   return {
     id,
     kind,
-    hp: s.hp,
-    maxHp: s.hp,
+    hp,
+    maxHp: hp,
     x: tileCenter(tx),
     y: tileCenter(ty),
     angle: -Math.PI / 2,
@@ -123,7 +136,7 @@ function makeGUnit(id: number, kind: UnitKind, tx: number, ty: number, team: Tea
     selected: false,
     team,
     range: c.range,
-    damage: c.damage,
+    damage: Math.round(c.damage * strength),
     cooldown: 0,
     cooldownMax: c.cooldownMax,
     repathT: 0,
@@ -215,6 +228,8 @@ export function createGame(seed: number, opts: GameOpts = {}): GameState {
     infantry: opts.infantry ?? 6,
     enemyInfantry: opts.enemyInfantry ?? 4,
     enemyBase: opts.enemyBase ?? true,
+    enemyStrength: opts.enemyStrength ?? 1,
+    waveIntervalScale: opts.waveIntervalScale ?? 1,
   };
   const map = generateMap(seed);
   const g: GameState = {
@@ -228,7 +243,8 @@ export function createGame(seed: number, opts: GameOpts = {}): GameState {
     enemyBuildings: [],
     economy: createEconomy(o.credits),
     queue: createQueue(),
-    ai: createAIState(seed),
+    // A shorter waveIntervalScale banks AI income faster → waves land sooner.
+    ai: createAIState(seed, 1 / Math.max(0.01, o.waveIntervalScale)),
     phase: 'playing',
     elapsed: 0,
     nextId: 1,
@@ -257,7 +273,7 @@ export function createGame(seed: number, opts: GameOpts = {}): GameState {
     }
   }
   for (const t of freeTilesNear(map, allBuildings(g), g.enemyAnchor.x, g.enemyAnchor.y, o.enemyInfantry)) {
-    g.enemyUnits.push(makeGUnit(g.nextId++, 'infantry', t.x, t.y, 'enemy'));
+    g.enemyUnits.push(makeGUnit(g.nextId++, 'infantry', t.x, t.y, 'enemy', o.enemyStrength));
   }
   g.ai.army = g.enemyUnits.length;
   return g;
@@ -323,7 +339,7 @@ function spawnTrained(g: GameState, kind: UnitKind): void {
 /** Spawn an AI-trained enemy next to its base anchor. */
 function spawnEnemy(g: GameState, kind: 'infantry' | 'tank'): void {
   const t = freeTilesNear(g.map, allBuildings(g), g.enemyAnchor.x, g.enemyAnchor.y, 1)[0];
-  if (t) g.enemyUnits.push(makeGUnit(g.nextId++, kind, t.x, t.y, 'enemy'));
+  if (t) g.enemyUnits.push(makeGUnit(g.nextId++, kind, t.x, t.y, 'enemy', g.opts.enemyStrength));
 }
 
 /** Route one unit toward a world-px goal (snapped to a passable tile). */
@@ -437,4 +453,135 @@ export function tickGame(g: GameState, dt: number): void {
 
   if (!g.buildings.some((b) => b.kind === 'hq')) g.phase = 'lost';
   else if (g.enemyUnits.length === 0 && g.enemyBuildings.length === 0) g.phase = 'won';
+}
+
+// ---------------------------------------------------------------- save -----
+
+const savedUnit = (u: GUnit): SavedUnit => ({ id: u.id, kind: u.kind, x: u.x, y: u.y, hp: u.hp });
+
+const savedBuilding = (b: GBuilding): SavedBuilding => {
+  const s: SavedBuilding = { id: b.id, kind: b.kind, gx: b.gx, gy: b.gy, hp: b.hp };
+  if (b.done) s.done = true;
+  return s;
+};
+
+/** SaveState snapshot of a live match (camera is optional, host-supplied). */
+export function snapshotGame(g: GameState, camera?: { x: number; y: number; zoom: number }): SaveState {
+  return snapshot({
+    seed: g.seed,
+    credits: Math.floor(g.economy.credits),
+    elapsed: g.elapsed,
+    units: g.units.map(savedUnit),
+    buildings: g.buildings.map(savedBuilding),
+    enemyUnits: g.enemyUnits.map(savedUnit),
+    enemyBuildings: g.enemyBuildings.map(savedBuilding),
+    ai: { phase: g.ai.phase, credits: g.ai.credits, army: g.ai.army, wave: g.ai.wave },
+    camera: camera ? { x: camera.x, y: camera.y, zoom: camera.zoom } : undefined,
+    opts: {
+      credits: g.opts.credits,
+      infantry: g.opts.infantry,
+      enemyInfantry: g.opts.enemyInfantry,
+      enemyBase: g.opts.enemyBase,
+      enemyStrength: g.opts.enemyStrength,
+      waveIntervalScale: g.opts.waveIntervalScale,
+    },
+  });
+}
+
+const isUnitKind = (k: string): k is UnitKind => k in UNIT_STATS;
+const isBuildingKind = (k: string): k is BuildingKind => k in BUILDING_DEFS;
+const isAIPhase = (p: string): p is AIPhase => p === 'gather' || p === 'build' || p === 'attack';
+
+/** Rebuild a GBuilding at an explicit id (restore path bypasses nextId). */
+function restoreBuilding(
+  list: GBuilding[],
+  s: SavedBuilding,
+  team: Team,
+): GBuilding | null {
+  if (!isBuildingKind(s.kind)) return null;
+  const def = BUILDING_DEFS[s.kind];
+  const b = place(list, s.kind, s.gx, s.gy, s.id) as GBuilding;
+  b.team = team;
+  b.x = (s.gx + def.w / 2) * TILE_SIZE;
+  b.y = (s.gy + def.h / 2) * TILE_SIZE;
+  b.range = 0;
+  b.damage = 0;
+  b.cooldown = 0;
+  b.cooldownMax = 0;
+  b.hp = Math.min(Math.max(0, s.hp), def.hp);
+  b.done = s.done === true;
+  b.buildLeft = b.done ? 0 : def.buildTime;
+  return b;
+}
+
+function restoreUnits(
+  list: GUnit[],
+  saved: readonly SavedUnit[],
+  team: Team,
+  strength: number,
+): boolean {
+  for (const s of saved) {
+    if (!isUnitKind(s.kind)) return false;
+    const u = makeGUnit(s.id, s.kind, 0, 0, team, team === 'enemy' ? strength : 1);
+    u.x = s.x;
+    u.y = s.y;
+    u.hp = Math.min(Math.max(0, s.hp), u.maxHp);
+    list.push(u);
+  }
+  return true;
+}
+
+/**
+ * Rebuild a live match from a parsed save. Returns null when any saved
+ * entity references an unknown kind — a corrupt save must not produce a
+ * half-valid match. Unit orders, selection and harvester cargo are not
+ * serialized; restored units start idle.
+ */
+export function restoreGame(s: SaveState): GameState | null {
+  const o = s.opts ?? {};
+  const opts: GameOpts = {};
+  if (typeof o.credits === 'number') opts.credits = o.credits;
+  if (typeof o.infantry === 'number') opts.infantry = o.infantry;
+  if (typeof o.enemyInfantry === 'number') opts.enemyInfantry = o.enemyInfantry;
+  if (typeof o.enemyBase === 'boolean') opts.enemyBase = o.enemyBase;
+  if (typeof o.enemyStrength === 'number') opts.enemyStrength = o.enemyStrength;
+  if (typeof o.waveIntervalScale === 'number') opts.waveIntervalScale = o.waveIntervalScale;
+
+  const g = createGame(s.seed ?? 0, opts);
+  g.units = [];
+  g.enemyUnits = [];
+  g.harvesters = [];
+  g.buildings = [];
+  g.enemyBuildings = [];
+
+  if (!restoreUnits(g.units, s.units ?? [], 'player', 1)) return null;
+  if (!restoreUnits(g.enemyUnits, s.enemyUnits ?? [], 'enemy', g.opts.enemyStrength)) return null;
+  for (const b of s.buildings ?? []) if (!restoreBuilding(g.buildings, b, 'player')) return null;
+  for (const b of s.enemyBuildings ?? [])
+    if (!restoreBuilding(g.enemyBuildings, b, 'enemy')) return null;
+
+  for (const u of g.units) {
+    if (u.kind === 'harvester') g.harvesters.push(createHarvester(u));
+  }
+
+  // Keep the shared id space above every restored id.
+  let maxId = g.nextId;
+  for (const e of [...g.units, ...g.enemyUnits, ...g.buildings, ...g.enemyBuildings]) {
+    maxId = Math.max(maxId, e.id + 1);
+  }
+  g.nextId = maxId;
+
+  if (s.credits !== undefined) g.economy.credits = s.credits;
+  g.elapsed = s.elapsed ?? 0;
+  if (s.ai) {
+    if (isAIPhase(s.ai.phase)) g.ai.phase = s.ai.phase;
+    g.ai.credits = s.ai.credits;
+    g.ai.army = s.ai.army;
+    g.ai.wave = s.ai.wave;
+  } else {
+    g.ai.army = g.enemyUnits.length;
+  }
+  const hq = g.enemyBuildings.find((b) => b.kind === 'hq');
+  if (hq) g.enemyAnchor = { x: hq.gx + 2, y: hq.gy + BUILDING_DEFS.hq.h };
+  return g;
 }

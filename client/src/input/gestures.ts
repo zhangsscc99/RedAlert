@@ -140,7 +140,14 @@ export function createGestureRecognizer(opts: GestureRecognizerOpts = {}): Gestu
         return;
       }
 
-      if (p.phase === 'pending' && dist({ x: p.sx, y: p.sy }, p) >= dragThreshold) {
+      // Promote to drag only once the finger exceeds BOTH the tap distance
+      // and the longpress tolerance. With the defaults (10 < 12) a hold that
+      // wobbles 10-12px used to be claimed by box-select before the longpress
+      // could fire; now the longpress keeps its full tolerance window.
+      if (
+        p.phase === 'pending' &&
+        dist({ x: p.sx, y: p.sy }, p) >= Math.max(dragThreshold, lpTolerance)
+      ) {
         p.phase = 'drag'; // becomes a box-select drag; longpress is off the table
       }
     },
