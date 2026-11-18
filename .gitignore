@@ -6,3 +6,4 @@ node_modules/
 server/dist.bak-*/
 test-build/
 wt/
+client/e2e/shots/
