@@ -2,15 +2,21 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   AI_ARMY_PER_WAVE,
+  AI_ARTILLERY,
+  AI_AIRSTRIKE,
   AI_BASE_CAP,
   AI_BUILDING_COST,
   AI_DEFEND_RATIO,
   AI_EXPAND_TICKS,
+  AI_FLANK_MIN,
+  AI_FLANK_SHARE,
   AI_FOCUS_HOLD,
+  AI_HEAL_RATIO,
   AI_INCOME_PER_TICK,
   AI_INFANTRY_PER_WAVE,
   AI_LEVEL_CREDITS,
   AI_MAX_LEVEL,
+  AI_PIN_MIN,
   AI_RAID_MAX,
   AI_RAID_MIN,
   AI_RAID_RESERVE,
@@ -21,6 +27,7 @@ import {
   AI_THREAT_SIZE,
   counterWeights,
   createAIState,
+  pickObjective,
   stepAI,
   threatScore,
   type AIBuildKind,
@@ -29,6 +36,7 @@ import {
   type AIRect,
   type AIState,
 } from './enemyAI.js';
+import { worldToTile, type GameMap } from './grid.js';
 import { BUILDING_DEFS } from './buildings.js';
 import { WAVE_BALANCE, type Difficulty } from './balance.js';
 
@@ -967,6 +975,292 @@ test('adaptive mode is deterministic per seed and intel sequence', () => {
         ...stepAI(s, 1, {
           sightings: t === 40 ? [{ kind: 'harvester', x: 30, y: 30 }] : [],
           raidThreat: t >= 70 && t < 75 ? 9 : 0,
+        }),
+      );
+    }
+    return out;
+  };
+  assert.deepEqual(run(), run());
+});
+
+// --------------------------------------------------- F1003: coordinated --
+
+test('coordinated is opt-in: adaptive alone never flanks, strikes, or supports', () => {
+  const s = createAIState(5, 1, { adaptive: true, level: 3 });
+  assert.equal(s.coordinated, false);
+  s.phase = 'attack';
+  s.army = 10;
+  s.wavePeak = 10;
+  s.flankers = 4; // would strike under coordinated
+  s.known = { pos: { x: 100, y: 100 }, units: { tank: 4 }, structures: {}, tick: 0 };
+  const cmds = runForIntel(s, 30, { flankArrived: true });
+  assert.ok(!cmds.some((c) => c.type === 'flank'));
+  assert.ok(!cmds.some((c) => c.type === 'strike'));
+  assert.ok(!cmds.some((c) => c.type === 'support'));
+
+  // Opting in pulls the whole layer stack up with it.
+  const c = createAIState(5, 1, { coordinated: true });
+  assert.ok(c.coordinated && c.adaptive && c.tactics && c.deep);
+  assert.equal(c.flankers, 0);
+  assert.equal(c.objective, null);
+  assert.deepEqual(c.defenses, []);
+});
+
+test('a coordinated wave splits into a pin prong and a routed flank', () => {
+  const map: GameMap = { w: 64, h: 64, seed: 1, tiles: new Uint8Array(64 * 64) };
+  const s = createAIState(5, 1, { coordinated: true, map });
+  s.phase = 'muster';
+  s.army = s.musterSize;
+  s.sinceWave = s.waveGap;
+  const anchor = { x: 48 * 32 + 16, y: 8 * 32 + 16 };
+  // Recon reports a turret squarely on the base→objective lane.
+  const cmds = stepAI(s, 1, {
+    anchor,
+    sightings: [{ kind: 'turret', x: 30 * 32, y: 20 * 32 }],
+  });
+  assert.equal(s.wave, 1);
+
+  const move = cmds.find((c) => c.type === 'move');
+  const flank = cmds.find((c) => c.type === 'flank');
+  assert.ok(move && move.type === 'move');
+  assert.ok(flank && flank.type === 'flank');
+  assert.equal(
+    flank.count,
+    Math.min(Math.floor(s.musterSize * AI_FLANK_SHARE), s.musterSize - AI_PIN_MIN),
+  );
+  assert.equal(s.flankers, flank.count);
+  assert.deepEqual(flank.to, move.to, 'both prongs converge on the same target');
+
+  // The turret's footprint plus its range were banked as route blockers.
+  assert.equal(s.defenses.length, 2);
+  assert.ok(flank.path && flank.path.length > 0, 'a routed flank carries waypoints');
+  const pad = Math.ceil((BUILDING_DEFS.turret.range ?? 0) / 32);
+  const gx = worldToTile(30 * 32) - 1;
+  const gy = worldToTile(20 * 32) - 1;
+  for (const p of flank.path) {
+    const tx = worldToTile(p.x);
+    const ty = worldToTile(p.y);
+    const inside =
+      tx >= gx - pad && tx < gx + 2 + pad && ty >= gy - pad && ty < gy + 2 + pad;
+    assert.ok(!inside, `waypoint (${tx},${ty}) sits inside the turret's range`);
+  }
+});
+
+test('a wave too small to spare a squad launches as a single pin', () => {
+  const s = createAIState(5, 1, { coordinated: true });
+  s.phase = 'muster';
+  s.army = AI_PIN_MIN + AI_FLANK_MIN - 1; // peeling off would starve both prongs
+  s.sinceWave = s.waveGap;
+  s.spotted = true; // early commit with whatever has rallied
+  const cmds = stepAI(s, 1);
+  assert.equal(s.wave, 1);
+  assert.ok(cmds.some((c) => c.type === 'move'));
+  assert.ok(!cmds.some((c) => c.type === 'flank'));
+  assert.equal(s.flankers, 0);
+});
+
+test('without a map the flank still peels off, just unrouted', () => {
+  const s = createAIState(5, 1, { coordinated: true });
+  s.phase = 'muster';
+  s.army = s.musterSize;
+  s.sinceWave = s.waveGap;
+  const cmds = stepAI(s, 1, { sightings: [{ kind: 'refinery', x: 500, y: 500 }] });
+  const flank = cmds.find((c) => c.type === 'flank');
+  assert.ok(flank && flank.type === 'flank');
+  assert.equal(flank.path, null);
+  assert.equal(s.flankers, flank.count);
+});
+
+test('the joint strike fires once when the flank reports in', () => {
+  const s = createAIState(5, 1, { coordinated: true });
+  s.phase = 'attack';
+  s.army = 10;
+  s.wavePeak = 10;
+  s.flankers = 4;
+  s.objective = { x: 300, y: 200 };
+
+  const first = stepAI(s, 1, { flankArrived: true });
+  const st = first.find((c) => c.type === 'strike');
+  assert.ok(st && st.type === 'strike');
+  assert.equal(st.count, 4);
+  assert.deepEqual(st.to, { x: 300, y: 200 });
+  assert.equal(s.flankers, 0, 'the squad is spent with its strike');
+
+  const again = stepAI(s, 1, { flankArrived: true });
+  assert.ok(!again.some((c) => c.type === 'strike'), 'one strike per flank');
+});
+
+test('battered coordinated units retreat to the depot and rejoin at healRatio', () => {
+  const s = createAIState(7, 1, { coordinated: true });
+  assert.equal(s.retreatRatio, AI_RETREAT_RATIO, 'flat 35% spec threshold');
+  assert.equal(s.healRatio, AI_HEAL_RATIO, 'units rejoin once repaired to 70%');
+  s.phase = 'attack';
+  s.army = 10;
+  s.wavePeak = 10;
+  const anchor = { x: 1, y: 2 };
+  const pad = { x: 90, y: 90 };
+
+  const r = stepAI(s, 1, { lowHp: 2, anchor, repairPad: pad });
+  const retreat = r.find((c) => c.type === 'retreat');
+  assert.ok(retreat && retreat.type === 'retreat');
+  assert.equal(retreat.count, 2);
+  assert.deepEqual(retreat.to, pad, 'battered units head for the repair depot');
+  assert.equal(retreat.healTo, AI_HEAL_RATIO, 'the order carries the 70% mark');
+  assert.equal(s.healing, 2);
+
+  const j = stepAI(s, 1, { healed: 2, anchor, repairPad: pad });
+  const rejoin = j.find((c) => c.type === 'rejoin');
+  assert.ok(rejoin && rejoin.type === 'rejoin');
+  assert.equal(rejoin.count, 2);
+  assert.equal(s.healing, 0);
+
+  // Without a reported depot the retreat falls back to the base anchor,
+  // and an explicit healRatio override wins over the default.
+  const b = createAIState(7, 1, { coordinated: true });
+  b.phase = 'attack';
+  b.army = 10;
+  const r2 = stepAI(b, 1, { lowHp: 1, anchor });
+  const rt2 = r2.find((c) => c.type === 'retreat');
+  assert.ok(rt2 && rt2.type === 'retreat');
+  assert.deepEqual(rt2.to, anchor);
+
+  const custom = createAIState(7, 1, { coordinated: true, healRatio: 0.9 });
+  custom.phase = 'attack';
+  custom.army = 10;
+  const r3 = stepAI(custom, 1, { lowHp: 1, anchor });
+  const rt3 = r3.find((c) => c.type === 'retreat');
+  assert.ok(rt3 && rt3.type === 'retreat' && rt3.healTo === 0.9);
+});
+
+test('objective picks weigh structure value against troop density', () => {
+  // A lone HQ (6) vs a refinery (5) ringed by 4 tanks (+2): density wins.
+  assert.deepEqual(
+    pickObjective([
+      { kind: 'hq', x: 0, y: 0 },
+      { kind: 'refinery', x: 600, y: 600 },
+      { kind: 'tank', x: 620, y: 600 },
+      { kind: 'tank', x: 580, y: 600 },
+      { kind: 'tank', x: 600, y: 620 },
+      { kind: 'tank', x: 600, y: 580 },
+    ]),
+    { x: 600, y: 600 },
+  );
+
+  // Bare, the HQ still outranks the refinery.
+  assert.deepEqual(
+    pickObjective([
+      { kind: 'hq', x: 0, y: 0 },
+      { kind: 'refinery', x: 600, y: 600 },
+    ]),
+    { x: 0, y: 0 },
+  );
+
+  // Economy ordering: refinery > barracks > power.
+  assert.deepEqual(
+    pickObjective([
+      { kind: 'power', x: 0, y: 0 },
+      { kind: 'barracks', x: 10, y: 0 },
+      { kind: 'refinery', x: 20, y: 0 },
+    ]),
+    { x: 20, y: 0 },
+  );
+
+  // Density alone can crown a massed army over a lone turret.
+  assert.deepEqual(
+    pickObjective([
+      { kind: 'turret', x: 0, y: 0 },
+      { kind: 'tank', x: 900, y: 900 },
+      ...Array.from({ length: 11 }, (_, i) => ({
+        kind: 'tank' as const,
+        x: 900 + i,
+        y: 900,
+      })),
+    ]),
+    { x: 900, y: 900 },
+  );
+
+  assert.equal(pickObjective([]), null);
+});
+
+test('sightings steer a coordinated wave at the picked objective', () => {
+  const s = createAIState(7, 1, { coordinated: true });
+  s.phase = 'attack';
+  s.army = 10;
+  stepAI(s, 1, {
+    sightings: [
+      { kind: 'hq', x: 0, y: 0 },
+      { kind: 'refinery', x: 600, y: 600 },
+      { kind: 'tank', x: 620, y: 600 },
+      { kind: 'tank', x: 580, y: 600 },
+      { kind: 'tank', x: 600, y: 620 },
+      { kind: 'tank', x: 600, y: 580 },
+    ],
+  });
+  assert.deepEqual(s.objective, { x: 600, y: 600 });
+  assert.deepEqual(s.known.pos, { x: 500, y: 500 }, 'the centroid still feeds fallback intel');
+});
+
+test('level >= 2 marks artillery on cooldown; level 3 adds airstrikes', () => {
+  const mk = (level: number): AIState => {
+    const s = createAIState(5, 1, { coordinated: true, level });
+    s.phase = 'attack';
+    s.army = 8;
+    s.wavePeak = 8;
+    s.objective = { x: 400, y: 400 };
+    return s;
+  };
+
+  const l1 = mk(1);
+  assert.ok(
+    !runFor(l1, 60).some((c) => c.type === 'support'),
+    'level 1 fields no support fire',
+  );
+
+  const l2 = mk(2);
+  const art = stepAI(l2, 1).find((c) => c.type === 'support');
+  assert.ok(art && art.type === 'support' && art.kind === 'artillery');
+  assert.equal(art.damage, AI_ARTILLERY.damage);
+  assert.equal(art.radius, AI_ARTILLERY.radius);
+  assert.deepEqual(art.to, { x: 400, y: 400 });
+  // The marker holds for the table's cooldown, then re-arms.
+  assert.ok(
+    !runFor(l2, AI_ARTILLERY.cooldown - 1).some((c) => c.type === 'support'),
+    'artillery stays silent inside its cooldown',
+  );
+  const again = stepAI(l2, 1).find((c) => c.type === 'support');
+  assert.ok(again && again.type === 'support' && again.kind === 'artillery');
+
+  const l3 = mk(3);
+  const first = stepAI(l3, 1);
+  assert.ok(first.some((c) => c.type === 'support' && c.kind === 'artillery'));
+  const air = first.find((c) => c.type === 'support' && c.kind === 'airstrike');
+  assert.ok(air && air.type === 'support');
+  assert.equal(air.damage, AI_AIRSTRIKE.damage);
+  assert.equal(air.radius, AI_AIRSTRIKE.radius);
+  // The airstrike rides its own longer cooldown.
+  assert.ok(
+    !runFor(l3, AI_AIRSTRIKE.cooldown - 1).some(
+      (c) => c.type === 'support' && c.kind === 'airstrike',
+    ),
+  );
+  assert.ok(
+    stepAI(l3, 1).some((c) => c.type === 'support' && c.kind === 'airstrike'),
+    'airstrike re-arms after its own cooldown',
+  );
+});
+
+test('coordinated mode is deterministic per seed and intel sequence', () => {
+  const map: GameMap = { w: 64, h: 64, seed: 1, tiles: new Uint8Array(64 * 64) };
+  const run = (): AICommand[] => {
+    const s = createAIState(7, 1, { coordinated: true, level: 2, map });
+    const out: AICommand[] = [];
+    for (let t = 0; t < 200; t++) {
+      out.push(
+        ...stepAI(s, 1, {
+          anchor: { x: 48 * 32 + 16, y: 8 * 32 + 16 },
+          sightings: t === 40 ? [{ kind: 'turret', x: 30 * 32, y: 20 * 32 }] : [],
+          flankArrived: t >= 100 && s.flankers > 0,
+          lowHp: t === 150 ? 2 : 0,
         }),
       );
     }

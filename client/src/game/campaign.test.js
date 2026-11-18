@@ -701,6 +701,8 @@ var AI_LEVEL_EXPAND_PACE = [1, 0.9, 0.8, 0.65];
 var AI_LEVEL_SCREEN = [0, 1, 2, 3];
 var AI_LEVEL_TANK_BIAS = [1, 1.15, 1.35, 1.6];
 var AI_LEVEL_RAID_PACE = [1, 0.8, 0.6, 0.45];
+var AI_HEAL_RATIO = 0.7;
+var AI_DENSITY_RADIUS = 6 * TILE_SIZE;
 var EXPAND_WANT = {
   refinery: [1, 1, 1, 2, 2, 2, 2],
   barracks: [0, 1, 1, 1, 1, 2, 2],
@@ -715,7 +717,8 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
   const musterSize = opts.musterSize ?? Math.max(2, Math.round(AI_ARMY_PER_WAVE * sizeScale));
   const rawLevel = opts.level ?? 0;
   const level = Number.isFinite(rawLevel) ? Math.max(0, Math.min(AI_MAX_LEVEL, Math.floor(rawLevel))) : 0;
-  const adaptive = (opts.adaptive ?? false) || level > 0;
+  const coordinated = opts.coordinated ?? false;
+  const adaptive = (opts.adaptive ?? false) || level > 0 || coordinated;
   const tactics = (opts.tactics ?? false) || adaptive;
   return {
     phase: "gather",
@@ -735,7 +738,9 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
     spotted: false,
     scoutSent: false,
     retreatSent: false,
-    retreatRatio: opts.retreatRatio ?? (tactics ? AI_RETREAT_BY_DIFFICULTY[difficulty] : AI_RETREAT_RATIO),
+    // Coordinated mode falls back at the flat 35% spec threshold; plain
+    // tactics keeps its per-difficulty scale.
+    retreatRatio: opts.retreatRatio ?? (coordinated || !tactics ? AI_RETREAT_RATIO : AI_RETREAT_BY_DIFFICULTY[difficulty]),
     expand: opts.expandBase ?? false,
     ticks: 0,
     buildings: { refinery: 0, barracks: 0, turret: 0 },
@@ -764,7 +769,15 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
     raiders: 0,
     raidRecalled: false,
     raidPos: null,
-    wavePeak: 0
+    wavePeak: 0,
+    coordinated,
+    flankers: 0,
+    healRatio: opts.healRatio ?? AI_HEAL_RATIO,
+    objective: null,
+    defenses: [],
+    map: opts.map ?? null,
+    artilleryCd: 0,
+    airstrikeCd: 0
   };
 }
 function scanBuildSite(q) {

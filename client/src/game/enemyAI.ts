@@ -34,8 +34,20 @@
 // interval flex with the scouted player threat; and a 0–3 difficulty
 // curve level scales the AI's starting bank, expansion pace, unit mix,
 // and harass cadence.
+//
+// opts.coordinated (implies adaptive) layers the F1003 pincer doctrine:
+// each launched wave splits into a frontal pin and a flanking squad that
+// is routed around the player's buildings and gun ranges with
+// findPathAvoiding (a caller-supplied map; unrouted when absent), then
+// both prongs strike together once the host reports the flank arrived;
+// battered units fall back toward the repair depot and rejoin once the
+// host heals them to `healRatio` (default 70%); the wave's objective is
+// picked by structure value plus the troop density standing around it;
+// and curve level >= 2 marks artillery barrages (level 3 adds airstrikes)
+// on param-table cooldowns.
 
-import { MAP_H, MAP_W, mulberry32, tileCenter, worldToTile } from './grid.js';
+import { MAP_H, MAP_W, TILE_SIZE, mulberry32, tileCenter, worldToTile, type GameMap } from './grid.js';
+import { findPathAvoiding, type Blocker } from './pathfind.js';
 import { DIFFICULTY, WAVE_BALANCE, type Difficulty } from './balance.js';
 import { ARMOR_TYPES, ROLE_STATS, damageMultiplier, type ArmorType, type WeaponType } from './unitRoles.js';
 import { BUILDING_DEFS, type BuildingKind } from './buildings.js';
@@ -158,6 +170,21 @@ export interface AIState {
   raidPos: { x: number; y: number } | null;
   /** Largest army the current push has fielded (rout bookkeeping). */
   wavePeak: number;
+  /** F1003 coordinated layer (pincer waves / depot repair / objectives / support). */
+  coordinated: boolean;
+  /** Flank-squad units believed en route (host-corrected via intel.flankers). */
+  flankers: number;
+  /** hp fraction a retreated unit must regain before the host rejoins it. */
+  healRatio: number;
+  /** Picked main objective — structure value plus nearby troop density. */
+  objective: { x: number; y: number } | null;
+  /** Player structure footprints (guns padded by range) the flank skirts. */
+  defenses: Blocker[];
+  /** Map the flank router searches; null → flanks go out unrouted. */
+  map: GameMap | null;
+  /** Support-fire cooldowns remaining, in AI ticks. */
+  artilleryCd: number;
+  airstrikeCd: number;
 }
 
 export type AICommand =
@@ -166,8 +193,9 @@ export type AICommand =
   | { type: 'attack' }
   | { type: 'scout'; to: { x: number; y: number } } // newest unit probes ahead
   | { type: 'rally'; to: { x: number; y: number } } // survivors regroup at home
-  // battered units fall back; `count` = how many were ordered home
-  | { type: 'retreat'; to: { x: number; y: number }; count?: number }
+  // battered units fall back; `count` = how many were ordered home;
+  // `healTo` (coordinated only) = hp fraction the host repairs them to
+  | { type: 'retreat'; to: { x: number; y: number }; count?: number; healTo?: number }
   | { type: 'build'; kind: AIBuildKind; at: { x: number; y: number } } // `at` in tiles
   | { type: 'defend'; to: { x: number; y: number }; count: number } // hold `count` units home
   | { type: 'focus'; to: { x: number; y: number } } // wave locks one target
@@ -175,7 +203,14 @@ export type AICommand =
   // `count` raiders peel off the push to flank the player economy at `to`
   | { type: 'harass'; to: { x: number; y: number }; count: number }
   // the raid squad breaks off and falls back home when outmatched
-  | { type: 'recall'; to: { x: number; y: number }; count: number };
+  | { type: 'recall'; to: { x: number; y: number }; count: number }
+  // `count` units peel off to flank `to`; `path` (world-px waypoints) skirts
+  // the player's buildings and gun ranges — null when the AI has no map
+  | { type: 'flank'; to: { x: number; y: number }; count: number; path: { x: number; y: number }[] | null }
+  // the flank arrived — both prongs open the assault together at `to`
+  | { type: 'strike'; to: { x: number; y: number }; count: number }
+  // support-fire marker: the host resolves an area strike at `to`
+  | { type: 'support'; kind: 'artillery' | 'airstrike'; to: { x: number; y: number }; radius: number; damage: number };
 
 /**
  * Host-supplied per-tick observations for the deep machine. Everything is
@@ -244,6 +279,12 @@ export interface AIIntel {
   raiders?: number;
   /** Player defenders near the raid target; > raiders recalls the squad. */
   raidThreat?: number;
+  /** Live flank-squad units; corrects the AI's own tally so losses free the slot. */
+  flankers?: number;
+  /** True once the flank squad reaches its strike point — fires 'strike'. */
+  flankArrived?: boolean;
+  /** World-px point of the AI's repair depot — coordinated retreats prefer it. */
+  repairPad?: { x: number; y: number };
 }
 
 export interface AIOptions {
@@ -299,6 +340,21 @@ export interface AIOptions {
   level?: number;
   /** Seconds between harass dispatches at level 0 pace; default scales with level. */
   raidPeriod?: number;
+  /**
+   * Enable the F1003 coordination layer: each wave splits into a frontal
+   * pin plus a flanking squad routed around the player's buildings and gun
+   * ranges (findPathAvoiding over `map`) that strikes together on arrival;
+   * battered units fall back toward intel.repairPad and rejoin at
+   * `healRatio`; the wave's objective is picked by structure value plus
+   * nearby troop density; and curve level >= 2 marks artillery barrages
+   * (level 3 adds airstrikes) on param-table cooldowns. Implies `adaptive`
+   * (and `tactics`/`deep`). Default false = identical to no options.
+   */
+  coordinated?: boolean;
+  /** Map the flank router searches; absent → 'flank' commands carry no path. */
+  map?: GameMap;
+  /** hp fraction a retreated unit must regain before rejoining. Default AI_HEAL_RATIO. */
+  healRatio?: number;
 }
 
 export const AI_TICK = 1; // seconds between decision ticks
@@ -425,6 +481,44 @@ export const AI_LEVEL_SCREEN: readonly number[] = [0, 1, 2, 3];
 export const AI_LEVEL_TANK_BIAS: readonly number[] = [1, 1.15, 1.35, 1.6];
 export const AI_LEVEL_RAID_PACE: readonly number[] = [1, 0.8, 0.6, 0.45];
 
+// ----------------------------------------------------- coordinated (F1003)
+
+/** Fraction of a launched wave peeled off as the flanking squad. */
+export const AI_FLANK_SHARE = 0.4;
+/** Smallest flanking squad — below this the whole wave forms the pin. */
+export const AI_FLANK_MIN = 3;
+/** Troops the frontal pin keeps at minimum when a flank peels off. */
+export const AI_PIN_MIN = 4;
+/** hp fraction a retreated unit must regain before it rejoins the push. */
+export const AI_HEAL_RATIO = 0.7;
+/**
+ * Radius (world px) around a candidate objective that counts nearby player
+ * units — a structure ringed by defenders is a richer target than a lone one.
+ */
+export const AI_DENSITY_RADIUS = 6 * TILE_SIZE;
+/** Objective score added per player unit inside AI_DENSITY_RADIUS. */
+export const AI_DENSITY_WEIGHT = 0.5;
+/**
+ * Objective value per structure kind: the refinery outranks the barracks,
+ * which outranks a power plant, which outranks static defense — the AI
+ * pushes at the economy's throat, not the guns.
+ */
+export const AI_OBJECTIVE_VALUE: Record<BuildingKind, number> = {
+  refinery: 5,
+  barracks: 4,
+  power: 3,
+  hq: 6,
+  turret: 2,
+  wall: 0.5,
+};
+/**
+ * Support-fire tables by kind: the curve level that unlocks it, seconds
+ * between markers, the area damage the host resolves, and the blast radius
+ * (world px). Level >= 2 marks artillery; level 3 also marks airstrikes.
+ */
+export const AI_ARTILLERY = { minLevel: 2, cooldown: 25, damage: 60, radius: 96 } as const;
+export const AI_AIRSTRIKE = { minLevel: 3, cooldown: 45, damage: 120, radius: 64 } as const;
+
 /**
  * Desired building counts per expansion level, in build-priority order.
  * The level rises with elapsed ticks × difficulty pace and is itself capped
@@ -460,11 +554,14 @@ export function armorOfUnitKind(kind: UnitKind): ArmorType {
   return AI_ARMOR[kind];
 }
 
+/** Unit kinds the sightings stream can carry (everything else is a structure). */
+function isUnitKind(kind: UnitKind | BuildingKind): kind is UnitKind {
+  return kind === 'infantry' || kind === 'tank' || kind === 'harvester';
+}
+
 /** Armor class for any sighted kind — units map through AI_ARMOR, the rest are buildings. */
 function armorOfKind(kind: UnitKind | BuildingKind): ArmorType {
-  return kind === 'infantry' || kind === 'tank' || kind === 'harvester'
-    ? AI_ARMOR[kind]
-    : 'building';
+  return isUnitKind(kind) ? AI_ARMOR[kind] : 'building';
 }
 
 export function createAIState(seed: number, incomeScale = 1, opts: AIOptions = {}): AIState {
@@ -478,7 +575,8 @@ export function createAIState(seed: number, incomeScale = 1, opts: AIOptions = {
   const level = Number.isFinite(rawLevel)
     ? Math.max(0, Math.min(AI_MAX_LEVEL, Math.floor(rawLevel)))
     : 0;
-  const adaptive = (opts.adaptive ?? false) || level > 0;
+  const coordinated = opts.coordinated ?? false;
+  const adaptive = (opts.adaptive ?? false) || level > 0 || coordinated;
   const tactics = (opts.tactics ?? false) || adaptive;
   return {
     phase: 'gather',
@@ -497,8 +595,11 @@ export function createAIState(seed: number, incomeScale = 1, opts: AIOptions = {
     spotted: false,
     scoutSent: false,
     retreatSent: false,
+    // Coordinated mode falls back at the flat 35% spec threshold; plain
+    // tactics keeps its per-difficulty scale.
     retreatRatio:
-      opts.retreatRatio ?? (tactics ? AI_RETREAT_BY_DIFFICULTY[difficulty] : AI_RETREAT_RATIO),
+      opts.retreatRatio ??
+      (coordinated || !tactics ? AI_RETREAT_RATIO : AI_RETREAT_BY_DIFFICULTY[difficulty]),
     expand: opts.expandBase ?? false,
     ticks: 0,
     buildings: { refinery: 0, barracks: 0, turret: 0 },
@@ -528,6 +629,14 @@ export function createAIState(seed: number, incomeScale = 1, opts: AIOptions = {
     raidRecalled: false,
     raidPos: null,
     wavePeak: 0,
+    coordinated,
+    flankers: 0,
+    healRatio: opts.healRatio ?? AI_HEAL_RATIO,
+    objective: null,
+    defenses: [],
+    map: opts.map ?? null,
+    artilleryCd: 0,
+    airstrikeCd: 0,
   };
 }
 
@@ -564,6 +673,11 @@ export function stepAI(s: AIState, dt: number, intel?: AIIntel): AICommand[] {
       maybeRaidRecall(s, intel, cmds);
       maybeRaid(s, intel, cmds);
     }
+    if (s.coordinated) {
+      syncFlankers(s, intel);
+      maybeFlankStrike(s, intel, cmds);
+      maybeSupport(s, cmds);
+    }
     switch (s.phase) {
       case 'gather':
         if (s.credits >= AI_BUILD_CREDITS) s.phase = s.deep ? 'scout' : 'build';
@@ -580,7 +694,7 @@ export function stepAI(s: AIState, dt: number, intel?: AIIntel): AICommand[] {
           s.army += 1;
           cmds.push({ type: 'train', kind });
         }
-        if (s.army >= AI_ARMY_PER_WAVE) launchWave(s, cmds);
+        if (s.army >= AI_ARMY_PER_WAVE) launchWave(s, cmds, intel);
         break;
       }
       case 'scout': {
@@ -615,7 +729,7 @@ export function stepAI(s: AIState, dt: number, intel?: AIIntel): AICommand[] {
         const commit = Math.max(2, Math.ceil(goal / 3));
         const rested = !s.tactics || s.sinceWave >= wait * AI_MIN_REST_RATIO;
         if (ready || (s.spotted && s.army >= commit && rested)) {
-          launchWave(s, cmds);
+          launchWave(s, cmds, intel);
         } else {
           maybeRetreat(s, intel, cmds);
         }
@@ -627,6 +741,7 @@ export function stepAI(s: AIState, dt: number, intel?: AIIntel): AICommand[] {
           s.retreatSent = false;
           s.focus = null; // the next wave locks a fresh target
           s.wavePeak = 0;
+          s.flankers = 0; // a wiped wave's flank squad is gone with it
           // Regroup survivors at base so the next wave pushes as one.
           if (s.deep) cmds.push({ type: 'rally', to: anchorOf(intel) });
         } else if (!maybeRout(s, intel, cmds)) {
@@ -730,7 +845,7 @@ function recordIntel(s: AIState, intel?: AIIntel): void {
   let x = 0;
   let y = 0;
   for (const it of seen) {
-    if (it.kind === 'infantry' || it.kind === 'tank' || it.kind === 'harvester') {
+    if (isUnitKind(it.kind)) {
       units[it.kind] = (units[it.kind] ?? 0) + 1;
       if (it.kind === 'harvester') harv ??= it;
     } else {
@@ -750,6 +865,14 @@ function recordIntel(s: AIState, intel?: AIIntel): void {
   // The harass squad hunts economy: miners first, else their refinery.
   const eco = harv ?? ref;
   if (s.adaptive && eco) s.raidPos = { x: eco.x, y: eco.y };
+  if (s.coordinated) {
+    // The freshest structure footprints become the front line the flank
+    // skirts, and the wave's objective is re-picked off this sighting.
+    const d = defenseBlockers(seen);
+    if (d.length > 0) s.defenses = d;
+    const o = pickObjective(seen);
+    if (o) s.objective = o;
+  }
 }
 
 /**
@@ -834,7 +957,14 @@ function maybeRetreat(s: AIState, intel: AIIntel | undefined, cmds: AICommand[])
   }
   if (s.retreatSent) return;
   s.retreatSent = true;
-  cmds.push({ type: 'retreat', to: anchorOf(intel), count: stranded });
+  const retreat: Extract<AICommand, { type: 'retreat' }> = {
+    type: 'retreat',
+    to: repairAnchor(s, intel),
+    count: stranded,
+  };
+  // Coordinated retreats tell the host the hp fraction to repair them to.
+  if (s.coordinated) retreat.healTo = s.healRatio;
+  cmds.push(retreat);
   if (s.tactics) s.healing += stranded; // they queue for repairs at base
 }
 
@@ -843,8 +973,16 @@ function anchorOf(intel?: AIIntel): { x: number; y: number } {
   return intel?.anchor ?? { x: tileCenter((MAP_W * 3) >> 2), y: tileCenter(MAP_H >> 2) };
 }
 
+/**
+ * Fall-back point for coordinated retreats: the reported repair depot when
+ * the host supplies one, else the plain base anchor.
+ */
+function repairAnchor(s: AIState, intel?: AIIntel): { x: number; y: number } {
+  return (s.coordinated && intel?.repairPad) || anchorOf(intel);
+}
+
 /** Flip to attack, count the wave, and send it at a jittered map center. */
-function launchWave(s: AIState, cmds: AICommand[]): void {
+function launchWave(s: AIState, cmds: AICommand[], intel?: AIIntel): void {
   s.phase = 'attack';
   s.wave += 1;
   s.sinceWave = 0;
@@ -855,20 +993,32 @@ function launchWave(s: AIState, cmds: AICommand[]): void {
   s.wavePeak = s.army; // rout bookkeeping: half of this means turn home
   s.raiders = 0; // the launch 'move' re-absorbs the raid squad
   s.raidRecalled = false;
-  cmds.push({ type: 'move', to: attackTarget(s) }, { type: 'attack' });
+  s.flankers = 0; // and the flank squad — both re-form on the new launch
+  const to = attackTarget(s);
+  cmds.push({ type: 'move', to }, { type: 'attack' });
+  if (s.coordinated) maybeLaunchFlank(s, intel, cmds, to);
 }
 
 function attackTarget(s: AIState): { x: number; y: number } {
-  // Tactics waves steer at the last-known enemy position, not the center.
-  if (s.tactics && s.known.pos) {
-    const tx = Math.floor(worldToTile(s.known.pos.x) + (s.rng() * 2 - 1) * ATTACK_JITTER_TILES);
-    const ty = Math.floor(worldToTile(s.known.pos.y) + (s.rng() * 2 - 1) * ATTACK_JITTER_TILES);
-    return {
-      x: tileCenter(Math.min(MAP_W - 1, Math.max(0, tx))),
-      y: tileCenter(Math.min(MAP_H - 1, Math.max(0, ty))),
-    };
-  }
+  // Coordinated waves steer at the picked objective; tactics waves steer
+  // at the last-known enemy position; everyone else at the map center.
+  const pos = s.coordinated ? s.objective ?? s.known.pos : s.tactics ? s.known.pos : null;
+  if (pos) return jitterAround(s, pos, ATTACK_JITTER_TILES);
   return jitterTarget(s, ATTACK_JITTER_TILES);
+}
+
+/** Tile-center point jittered ±jitterTiles around `pos` and clamped on-map. */
+function jitterAround(
+  s: AIState,
+  pos: { x: number; y: number },
+  jitterTiles: number,
+): { x: number; y: number } {
+  const tx = Math.floor(worldToTile(pos.x) + (s.rng() * 2 - 1) * jitterTiles);
+  const ty = Math.floor(worldToTile(pos.y) + (s.rng() * 2 - 1) * jitterTiles);
+  return {
+    x: tileCenter(Math.min(MAP_W - 1, Math.max(0, tx))),
+    y: tileCenter(Math.min(MAP_H - 1, Math.max(0, ty))),
+  };
 }
 
 function jitterTarget(s: AIState, jitterTiles: number): { x: number; y: number } {
@@ -1009,7 +1159,14 @@ function maybeRout(s: AIState, intel: AIIntel | undefined, cmds: AICommand[]): b
   s.spotted = false;
   s.retreatSent = true; // the whole force already has its orders
   s.healing += low; // the battered survivors queue for repairs
-  cmds.push({ type: 'retreat', to: anchorOf(intel), count: s.army });
+  s.flankers = 0; // the routed retreat re-absorbs the flank squad
+  const rout: Extract<AICommand, { type: 'retreat' }> = {
+    type: 'retreat',
+    to: repairAnchor(s, intel),
+    count: s.army,
+  };
+  if (s.coordinated) rout.healTo = s.healRatio;
+  cmds.push(rout);
   return true;
 }
 
@@ -1177,4 +1334,145 @@ function rectHitsAny(
     if (gx < r.gx + r.w && gx + w > r.gx && gy < r.gy + r.h && gy + h > r.gy) return true;
   }
   return false;
+}
+
+// ----------------------------------------------------- coordinated (F1003)
+
+/**
+ * Structure sightings → pathing blockers for the flank router. Every
+ * footprint is impassable, and armed structures (turrets) also project a
+ * second blocker padded out to their weapon range so the routed path
+ * skirts their coverage entirely.
+ */
+function defenseBlockers(seen: readonly AISighting[]): Blocker[] {
+  const out: Blocker[] = [];
+  for (const it of seen) {
+    if (isUnitKind(it.kind)) continue;
+    const def = BUILDING_DEFS[it.kind];
+    // Sightings carry the contact's center — re-anchor to the top-left tile.
+    const gx = worldToTile(it.x) - (def.w >> 1);
+    const gy = worldToTile(it.y) - (def.h >> 1);
+    out.push({ gx, gy, w: def.w, h: def.h });
+    const pad = Math.ceil((def.range ?? 0) / TILE_SIZE);
+    if (pad > 0) out.push({ gx: gx - pad, gy: gy - pad, w: def.w + pad * 2, h: def.h + pad * 2 });
+  }
+  return out;
+}
+
+/**
+ * Pick the wave's main objective (exported pure, testable): every sighting
+ * is a candidate, scored by its structure value — refinery > barracks >
+ * power > static defense — plus the troop density standing within
+ * AI_DENSITY_RADIUS of it. Units score on density alone, so a massed army
+ * can outrank a lone building. Ties go to the first sighting (deterministic
+ * given a stable intel order); empty intel yields no objective.
+ */
+export function pickObjective(sightings: readonly AISighting[]): { x: number; y: number } | null {
+  let best: { x: number; y: number } | null = null;
+  let bestScore = -Infinity;
+  const r2 = AI_DENSITY_RADIUS * AI_DENSITY_RADIUS;
+  for (const it of sightings) {
+    let score = isUnitKind(it.kind) ? 0 : AI_OBJECTIVE_VALUE[it.kind];
+    for (const u of sightings) {
+      if (!isUnitKind(u.kind)) continue;
+      const dx = u.x - it.x;
+      const dy = u.y - it.y;
+      if (dx * dx + dy * dy <= r2) score += AI_DENSITY_WEIGHT;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = { x: it.x, y: it.y };
+    }
+  }
+  return best;
+}
+
+/**
+ * Wave split: peel AI_FLANK_SHARE of the army off as the flanking squad
+ * while the rest form the frontal pin. The squad is routed around the
+ * banked defenses with findPathAvoiding when a map is available — the path
+ * is a world-px waypoint list from the AI's anchor to the wave target.
+ * Squads smaller than AI_FLANK_MIN (or that would starve the pin below
+ * AI_PIN_MIN) don't form; the wave launches as a single pin instead.
+ */
+function maybeLaunchFlank(
+  s: AIState,
+  intel: AIIntel | undefined,
+  cmds: AICommand[],
+  to: { x: number; y: number },
+): void {
+  const n = Math.min(Math.floor(s.army * AI_FLANK_SHARE), s.army - AI_PIN_MIN);
+  if (n < AI_FLANK_MIN) return;
+  s.flankers = n;
+  cmds.push({ type: 'flank', to: { x: to.x, y: to.y }, count: n, path: flankPath(s, intel, to) });
+}
+
+/** Route the flank squad around the banked defenses; null without a map/route. */
+function flankPath(
+  s: AIState,
+  intel: AIIntel | undefined,
+  to: { x: number; y: number },
+): { x: number; y: number }[] | null {
+  if (!s.map) return null;
+  const a = anchorOf(intel);
+  const path = findPathAvoiding(
+    s.map,
+    { x: worldToTile(a.x), y: worldToTile(a.y) },
+    { x: worldToTile(to.x), y: worldToTile(to.y) },
+    s.defenses,
+  );
+  if (!path) return null;
+  return path.map((t) => ({ x: tileCenter(t.x), y: tileCenter(t.y) }));
+}
+
+/** Host-corrected flanker tally — losses free the squad slot like raiders. */
+function syncFlankers(s: AIState, intel?: AIIntel): void {
+  if (intel?.flankers === undefined) return;
+  s.flankers = Math.max(0, Math.min(s.army, Math.floor(intel.flankers)));
+}
+
+/**
+ * Joint assault: once the host reports the flank squad in position, one
+ * 'strike' order sends both prongs in together at the locked focus, the
+ * picked objective, the last-known position, or a fresh attack target.
+ */
+function maybeFlankStrike(s: AIState, intel: AIIntel | undefined, cmds: AICommand[]): void {
+  if (s.flankers <= 0 || !intel?.flankArrived) return;
+  const at = s.focus ?? s.objective ?? s.known.pos ?? attackTarget(s);
+  cmds.push({ type: 'strike', to: { x: at.x, y: at.y }, count: s.flankers });
+  s.flankers = 0;
+}
+
+/**
+ * Support fire: while a wave is engaged and a target is known, curve
+ * level >= 2 marks an artillery barrage every AI_ARTILLERY.cooldown ticks
+ * and level 3 adds an airstrike on its own longer cooldown. Cooldowns,
+ * damage and blast radius all come from the param tables.
+ */
+function maybeSupport(s: AIState, cmds: AICommand[]): void {
+  s.artilleryCd = Math.max(0, s.artilleryCd - AI_TICK);
+  s.airstrikeCd = Math.max(0, s.airstrikeCd - AI_TICK);
+  if (s.phase !== 'attack' || s.army <= 0) return;
+  const at = s.focus ?? s.objective ?? s.known.pos;
+  if (!at) return;
+  if (s.level >= AI_ARTILLERY.minLevel && s.artilleryCd <= 0) {
+    s.artilleryCd = AI_ARTILLERY.cooldown;
+    cmds.push({
+      type: 'support',
+      kind: 'artillery',
+      to: { x: at.x, y: at.y },
+      radius: AI_ARTILLERY.radius,
+      damage: AI_ARTILLERY.damage,
+    });
+  }
+  if (s.level >= AI_AIRSTRIKE.minLevel && s.airstrikeCd <= 0) {
+    s.airstrikeCd = AI_AIRSTRIKE.cooldown;
+    cmds.push({
+      type: 'support',
+      kind: 'airstrike',
+      to: { x: at.x, y: at.y },
+      radius: AI_AIRSTRIKE.radius,
+      damage: AI_AIRSTRIKE.damage,
+    });
+  }
 }

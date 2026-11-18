@@ -19,6 +19,15 @@ function mulberry32(seed) {
     return ((t ^ t >>> 14) >>> 0) / 4294967296;
   };
 }
+function idx(map, x, y) {
+  return y * map.w + x;
+}
+function inBounds(map, x, y) {
+  return x >= 0 && y >= 0 && x < map.w && y < map.h;
+}
+function isPassable(map, x, y) {
+  return inBounds(map, x, y) && map.tiles[idx(map, x, y)] === GRASS;
+}
 function worldToTile(px) {
   return Math.floor(px / TILE_SIZE);
 }
@@ -36,6 +45,154 @@ var TERRAIN_COSTS = {
 };
 var COST_GRASS = TERRAIN_COSTS[GRASS];
 var MIN_TERRAIN_COST = Math.min(TERRAIN_COSTS[ROAD], COST_GRASS, TERRAIN_COSTS[ORE]);
+var SQRT2 = Math.SQRT2;
+var DIRS = [
+  [1, 0, 1],
+  [-1, 0, 1],
+  [0, 1, 1],
+  [0, -1, 1],
+  [1, 1, SQRT2],
+  [1, -1, SQRT2],
+  [-1, 1, SQRT2],
+  [-1, -1, SQRT2]
+];
+function octile(ax, ay, bx, by) {
+  const dx = Math.abs(bx - ax);
+  const dy = Math.abs(by - ay);
+  return dx + dy + (SQRT2 - 2) * Math.min(dx, dy);
+}
+var Heap = class {
+  constructor(f) {
+    this.f = f;
+  }
+  items = [];
+  get size() {
+    return this.items.length;
+  }
+  push(n) {
+    const items = this.items;
+    items.push(n);
+    let i = items.length - 1;
+    while (i > 0) {
+      const p = i - 1 >> 1;
+      if (this.f[items[p]] <= this.f[n]) break;
+      items[i] = items[p];
+      i = p;
+    }
+    items[i] = n;
+  }
+  pop() {
+    const items = this.items;
+    const top = items[0];
+    const last = items.pop();
+    if (items.length > 0) {
+      let i = 0;
+      for (; ; ) {
+        const l = i * 2 + 1;
+        const r = l + 1;
+        if (l >= items.length) break;
+        const m = r < items.length && this.f[items[r]] < this.f[items[l]] ? r : l;
+        if (this.f[items[m]] >= this.f[last]) break;
+        items[i] = items[m];
+        i = m;
+      }
+      items[i] = last;
+    }
+    return top;
+  }
+};
+function astar(map, sx, sy, gx, gy, passable, stepClear, enterCost, budget, hScale = 1, heur) {
+  const n = map.w * map.h;
+  const g = new Float64Array(n).fill(Infinity);
+  const f = new Float64Array(n).fill(Infinity);
+  const came = new Int32Array(n).fill(-1);
+  const closed = new Uint8Array(n);
+  const start = idx(map, sx, sy);
+  const goal = idx(map, gx, gy);
+  g[start] = 0;
+  f[start] = heur ? heur[start] : octile(sx, sy, gx, gy) * hScale;
+  if (f[start] === Infinity || heur && heur[goal] === Infinity) return null;
+  const open = new Heap(f);
+  open.push(start);
+  while (open.size > 0) {
+    if (budget && budget.left <= 0) return null;
+    const cur = open.pop();
+    if (cur === goal) return reconstruct(map, came, start, goal);
+    if (closed[cur]) continue;
+    closed[cur] = 1;
+    if (budget) budget.left--;
+    const cx = cur % map.w;
+    const cy = cur / map.w | 0;
+    for (const [dx, dy, cost] of DIRS) {
+      const nx = cx + dx;
+      const ny = cy + dy;
+      if (!passable(nx, ny)) continue;
+      if (dx !== 0 && dy !== 0) {
+        if (!passable(cx + dx, cy) || !passable(cx, cy + dy)) continue;
+      }
+      if (stepClear && !stepClear(cx, cy, nx, ny)) continue;
+      const ni = idx(map, nx, ny);
+      const ng = g[cur] + cost + (enterCost ? enterCost(nx, ny, cost) : 0);
+      if (ng < g[ni]) {
+        const h = heur ? heur[ni] : octile(nx, ny, gx, gy) * hScale;
+        if (h === Infinity) continue;
+        g[ni] = ng;
+        f[ni] = ng + h;
+        came[ni] = cur;
+        open.push(ni);
+      }
+    }
+  }
+  return null;
+}
+function findPathAvoiding(map, from, to, blockers) {
+  const blocked = new Uint8Array(map.w * map.h);
+  for (const b of blockers) {
+    for (let y = b.gy; y < b.gy + b.h; y++) {
+      for (let x = b.gx; x < b.gx + b.w; x++) {
+        if (inBounds(map, x, y)) blocked[idx(map, x, y)] = 1;
+      }
+    }
+  }
+  const passable = (x, y) => isPassable(map, x, y) && !blocked[idx(map, x, y)];
+  const s = nearestPassable(map, from.x, from.y, passable);
+  const g = nearestPassable(map, to.x, to.y, passable);
+  if (!s || !g) return null;
+  if (s.x === g.x && s.y === g.y) return [];
+  return astar(map, s.x, s.y, g.x, g.y, passable);
+}
+function reconstruct(map, came, start, goal) {
+  const path = [];
+  let cur = goal;
+  while (cur !== start && cur !== -1) {
+    path.push({ x: cur % map.w, y: cur / map.w | 0 });
+    cur = came[cur];
+  }
+  path.reverse();
+  return path;
+}
+function nearestPassable(map, x, y, passable, maxRadius = 8) {
+  if (passable(x, y)) return { x, y };
+  for (let r = 1; r <= maxRadius; r++) {
+    let best = null;
+    let bestD = Infinity;
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+        const nx = x + dx;
+        const ny = y + dy;
+        if (!passable(nx, ny)) continue;
+        const d = dx * dx + dy * dy;
+        if (d < bestD) {
+          bestD = d;
+          best = { x: nx, y: ny };
+        }
+      }
+    }
+    if (best) return best;
+  }
+  return null;
+}
 
 // src/game/units.ts
 var UNIT_STATS = {
@@ -265,6 +422,22 @@ var AI_LEVEL_EXPAND_PACE = [1, 0.9, 0.8, 0.65];
 var AI_LEVEL_SCREEN = [0, 1, 2, 3];
 var AI_LEVEL_TANK_BIAS = [1, 1.15, 1.35, 1.6];
 var AI_LEVEL_RAID_PACE = [1, 0.8, 0.6, 0.45];
+var AI_FLANK_SHARE = 0.4;
+var AI_FLANK_MIN = 3;
+var AI_PIN_MIN = 4;
+var AI_HEAL_RATIO = 0.7;
+var AI_DENSITY_RADIUS = 6 * TILE_SIZE;
+var AI_DENSITY_WEIGHT = 0.5;
+var AI_OBJECTIVE_VALUE = {
+  refinery: 5,
+  barracks: 4,
+  power: 3,
+  hq: 6,
+  turret: 2,
+  wall: 0.5
+};
+var AI_ARTILLERY = { minLevel: 2, cooldown: 25, damage: 60, radius: 96 };
+var AI_AIRSTRIKE = { minLevel: 3, cooldown: 45, damage: 120, radius: 64 };
 var EXPAND_WANT = {
   refinery: [1, 1, 1, 2, 2, 2, 2],
   barracks: [0, 1, 1, 1, 1, 2, 2],
@@ -284,8 +457,11 @@ var AI_ARMOR = {
   tank: "vehicle",
   harvester: "vehicle"
 };
+function isUnitKind(kind) {
+  return kind === "infantry" || kind === "tank" || kind === "harvester";
+}
 function armorOfKind(kind) {
-  return kind === "infantry" || kind === "tank" || kind === "harvester" ? AI_ARMOR[kind] : "building";
+  return isUnitKind(kind) ? AI_ARMOR[kind] : "building";
 }
 function createAIState(seed, incomeScale = 1, opts = {}) {
   const difficulty = opts.difficulty ?? "normal";
@@ -295,7 +471,8 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
   const musterSize = opts.musterSize ?? Math.max(2, Math.round(AI_ARMY_PER_WAVE * sizeScale));
   const rawLevel = opts.level ?? 0;
   const level = Number.isFinite(rawLevel) ? Math.max(0, Math.min(AI_MAX_LEVEL, Math.floor(rawLevel))) : 0;
-  const adaptive = (opts.adaptive ?? false) || level > 0;
+  const coordinated = opts.coordinated ?? false;
+  const adaptive = (opts.adaptive ?? false) || level > 0 || coordinated;
   const tactics = (opts.tactics ?? false) || adaptive;
   return {
     phase: "gather",
@@ -315,7 +492,9 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
     spotted: false,
     scoutSent: false,
     retreatSent: false,
-    retreatRatio: opts.retreatRatio ?? (tactics ? AI_RETREAT_BY_DIFFICULTY[difficulty] : AI_RETREAT_RATIO),
+    // Coordinated mode falls back at the flat 35% spec threshold; plain
+    // tactics keeps its per-difficulty scale.
+    retreatRatio: opts.retreatRatio ?? (coordinated || !tactics ? AI_RETREAT_RATIO : AI_RETREAT_BY_DIFFICULTY[difficulty]),
     expand: opts.expandBase ?? false,
     ticks: 0,
     buildings: { refinery: 0, barracks: 0, turret: 0 },
@@ -344,7 +523,15 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
     raiders: 0,
     raidRecalled: false,
     raidPos: null,
-    wavePeak: 0
+    wavePeak: 0,
+    coordinated,
+    flankers: 0,
+    healRatio: opts.healRatio ?? AI_HEAL_RATIO,
+    objective: null,
+    defenses: [],
+    map: opts.map ?? null,
+    artilleryCd: 0,
+    airstrikeCd: 0
   };
 }
 function stepAI(s, dt, intel) {
@@ -373,6 +560,11 @@ function stepAI(s, dt, intel) {
       maybeRaidRecall(s, intel, cmds);
       maybeRaid(s, intel, cmds);
     }
+    if (s.coordinated) {
+      syncFlankers(s, intel);
+      maybeFlankStrike(s, intel, cmds);
+      maybeSupport(s, cmds);
+    }
     switch (s.phase) {
       case "gather":
         if (s.credits >= AI_BUILD_CREDITS) s.phase = s.deep ? "scout" : "build";
@@ -386,7 +578,7 @@ function stepAI(s, dt, intel) {
           s.army += 1;
           cmds.push({ type: "train", kind });
         }
-        if (s.army >= AI_ARMY_PER_WAVE) launchWave(s, cmds);
+        if (s.army >= AI_ARMY_PER_WAVE) launchWave(s, cmds, intel);
         break;
       }
       case "scout": {
@@ -418,7 +610,7 @@ function stepAI(s, dt, intel) {
         const commit = Math.max(2, Math.ceil(goal / 3));
         const rested = !s.tactics || s.sinceWave >= wait * AI_MIN_REST_RATIO;
         if (ready || s.spotted && s.army >= commit && rested) {
-          launchWave(s, cmds);
+          launchWave(s, cmds, intel);
         } else {
           maybeRetreat(s, intel, cmds);
         }
@@ -430,6 +622,7 @@ function stepAI(s, dt, intel) {
           s.retreatSent = false;
           s.focus = null;
           s.wavePeak = 0;
+          s.flankers = 0;
           if (s.deep) cmds.push({ type: "rally", to: anchorOf(intel) });
         } else if (!maybeRout(s, intel, cmds)) {
           cmds.push({ type: "attack" });
@@ -496,7 +689,7 @@ function recordIntel(s, intel) {
   let x = 0;
   let y = 0;
   for (const it of seen) {
-    if (it.kind === "infantry" || it.kind === "tank" || it.kind === "harvester") {
+    if (isUnitKind(it.kind)) {
       units[it.kind] = (units[it.kind] ?? 0) + 1;
       if (it.kind === "harvester") harv ??= it;
     } else {
@@ -515,6 +708,12 @@ function recordIntel(s, intel) {
   s.spotted = true;
   const eco = harv ?? ref;
   if (s.adaptive && eco) s.raidPos = { x: eco.x, y: eco.y };
+  if (s.coordinated) {
+    const d = defenseBlockers(seen);
+    if (d.length > 0) s.defenses = d;
+    const o = pickObjective(seen);
+    if (o) s.objective = o;
+  }
 }
 function maybeRecon(s, intel, cmds) {
   if (s.phase === "gather" || s.phase === "scout" || s.saving) return;
@@ -570,13 +769,22 @@ function maybeRetreat(s, intel, cmds) {
   }
   if (s.retreatSent) return;
   s.retreatSent = true;
-  cmds.push({ type: "retreat", to: anchorOf(intel), count: stranded });
+  const retreat = {
+    type: "retreat",
+    to: repairAnchor(s, intel),
+    count: stranded
+  };
+  if (s.coordinated) retreat.healTo = s.healRatio;
+  cmds.push(retreat);
   if (s.tactics) s.healing += stranded;
 }
 function anchorOf(intel) {
   return intel?.anchor ?? { x: tileCenter(MAP_W * 3 >> 2), y: tileCenter(MAP_H >> 2) };
 }
-function launchWave(s, cmds) {
+function repairAnchor(s, intel) {
+  return s.coordinated && intel?.repairPad || anchorOf(intel);
+}
+function launchWave(s, cmds, intel) {
   s.phase = "attack";
   s.wave += 1;
   s.sinceWave = 0;
@@ -587,18 +795,23 @@ function launchWave(s, cmds) {
   s.wavePeak = s.army;
   s.raiders = 0;
   s.raidRecalled = false;
-  cmds.push({ type: "move", to: attackTarget(s) }, { type: "attack" });
+  s.flankers = 0;
+  const to = attackTarget(s);
+  cmds.push({ type: "move", to }, { type: "attack" });
+  if (s.coordinated) maybeLaunchFlank(s, intel, cmds, to);
 }
 function attackTarget(s) {
-  if (s.tactics && s.known.pos) {
-    const tx = Math.floor(worldToTile(s.known.pos.x) + (s.rng() * 2 - 1) * ATTACK_JITTER_TILES);
-    const ty = Math.floor(worldToTile(s.known.pos.y) + (s.rng() * 2 - 1) * ATTACK_JITTER_TILES);
-    return {
-      x: tileCenter(Math.min(MAP_W - 1, Math.max(0, tx))),
-      y: tileCenter(Math.min(MAP_H - 1, Math.max(0, ty)))
-    };
-  }
+  const pos = s.coordinated ? s.objective ?? s.known.pos : s.tactics ? s.known.pos : null;
+  if (pos) return jitterAround(s, pos, ATTACK_JITTER_TILES);
   return jitterTarget(s, ATTACK_JITTER_TILES);
+}
+function jitterAround(s, pos, jitterTiles) {
+  const tx = Math.floor(worldToTile(pos.x) + (s.rng() * 2 - 1) * jitterTiles);
+  const ty = Math.floor(worldToTile(pos.y) + (s.rng() * 2 - 1) * jitterTiles);
+  return {
+    x: tileCenter(Math.min(MAP_W - 1, Math.max(0, tx))),
+    y: tileCenter(Math.min(MAP_H - 1, Math.max(0, ty)))
+  };
 }
 function jitterTarget(s, jitterTiles) {
   const tx = MAP_W / 2 + (s.rng() * 2 - 1) * jitterTiles;
@@ -690,7 +903,14 @@ function maybeRout(s, intel, cmds) {
   s.spotted = false;
   s.retreatSent = true;
   s.healing += low;
-  cmds.push({ type: "retreat", to: anchorOf(intel), count: s.army });
+  s.flankers = 0;
+  const rout = {
+    type: "retreat",
+    to: repairAnchor(s, intel),
+    count: s.army
+  };
+  if (s.coordinated) rout.healTo = s.healRatio;
+  cmds.push(rout);
   return true;
 }
 function expandLevel(s) {
@@ -797,6 +1017,93 @@ function rectHitsAny(rects, gx, gy, w, h) {
     if (gx < r.gx + r.w && gx + w > r.gx && gy < r.gy + r.h && gy + h > r.gy) return true;
   }
   return false;
+}
+function defenseBlockers(seen) {
+  const out = [];
+  for (const it of seen) {
+    if (isUnitKind(it.kind)) continue;
+    const def = BUILDING_DEFS[it.kind];
+    const gx = worldToTile(it.x) - (def.w >> 1);
+    const gy = worldToTile(it.y) - (def.h >> 1);
+    out.push({ gx, gy, w: def.w, h: def.h });
+    const pad = Math.ceil((def.range ?? 0) / TILE_SIZE);
+    if (pad > 0) out.push({ gx: gx - pad, gy: gy - pad, w: def.w + pad * 2, h: def.h + pad * 2 });
+  }
+  return out;
+}
+function pickObjective(sightings) {
+  let best = null;
+  let bestScore = -Infinity;
+  const r2 = AI_DENSITY_RADIUS * AI_DENSITY_RADIUS;
+  for (const it of sightings) {
+    let score = isUnitKind(it.kind) ? 0 : AI_OBJECTIVE_VALUE[it.kind];
+    for (const u of sightings) {
+      if (!isUnitKind(u.kind)) continue;
+      const dx = u.x - it.x;
+      const dy = u.y - it.y;
+      if (dx * dx + dy * dy <= r2) score += AI_DENSITY_WEIGHT;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = { x: it.x, y: it.y };
+    }
+  }
+  return best;
+}
+function maybeLaunchFlank(s, intel, cmds, to) {
+  const n = Math.min(Math.floor(s.army * AI_FLANK_SHARE), s.army - AI_PIN_MIN);
+  if (n < AI_FLANK_MIN) return;
+  s.flankers = n;
+  cmds.push({ type: "flank", to: { x: to.x, y: to.y }, count: n, path: flankPath(s, intel, to) });
+}
+function flankPath(s, intel, to) {
+  if (!s.map) return null;
+  const a = anchorOf(intel);
+  const path = findPathAvoiding(
+    s.map,
+    { x: worldToTile(a.x), y: worldToTile(a.y) },
+    { x: worldToTile(to.x), y: worldToTile(to.y) },
+    s.defenses
+  );
+  if (!path) return null;
+  return path.map((t) => ({ x: tileCenter(t.x), y: tileCenter(t.y) }));
+}
+function syncFlankers(s, intel) {
+  if (intel?.flankers === void 0) return;
+  s.flankers = Math.max(0, Math.min(s.army, Math.floor(intel.flankers)));
+}
+function maybeFlankStrike(s, intel, cmds) {
+  if (s.flankers <= 0 || !intel?.flankArrived) return;
+  const at = s.focus ?? s.objective ?? s.known.pos ?? attackTarget(s);
+  cmds.push({ type: "strike", to: { x: at.x, y: at.y }, count: s.flankers });
+  s.flankers = 0;
+}
+function maybeSupport(s, cmds) {
+  s.artilleryCd = Math.max(0, s.artilleryCd - AI_TICK);
+  s.airstrikeCd = Math.max(0, s.airstrikeCd - AI_TICK);
+  if (s.phase !== "attack" || s.army <= 0) return;
+  const at = s.focus ?? s.objective ?? s.known.pos;
+  if (!at) return;
+  if (s.level >= AI_ARTILLERY.minLevel && s.artilleryCd <= 0) {
+    s.artilleryCd = AI_ARTILLERY.cooldown;
+    cmds.push({
+      type: "support",
+      kind: "artillery",
+      to: { x: at.x, y: at.y },
+      radius: AI_ARTILLERY.radius,
+      damage: AI_ARTILLERY.damage
+    });
+  }
+  if (s.level >= AI_AIRSTRIKE.minLevel && s.airstrikeCd <= 0) {
+    s.airstrikeCd = AI_AIRSTRIKE.cooldown;
+    cmds.push({
+      type: "support",
+      kind: "airstrike",
+      to: { x: at.x, y: at.y },
+      radius: AI_AIRSTRIKE.radius,
+      damage: AI_AIRSTRIKE.damage
+    });
+  }
 }
 
 // src/game/enemyAI.test.ts
@@ -1564,6 +1871,252 @@ test("adaptive mode is deterministic per seed and intel sequence", () => {
         ...stepAI(s, 1, {
           sightings: t === 40 ? [{ kind: "harvester", x: 30, y: 30 }] : [],
           raidThreat: t >= 70 && t < 75 ? 9 : 0
+        })
+      );
+    }
+    return out;
+  };
+  assert.deepEqual(run(), run());
+});
+test("coordinated is opt-in: adaptive alone never flanks, strikes, or supports", () => {
+  const s = createAIState(5, 1, { adaptive: true, level: 3 });
+  assert.equal(s.coordinated, false);
+  s.phase = "attack";
+  s.army = 10;
+  s.wavePeak = 10;
+  s.flankers = 4;
+  s.known = { pos: { x: 100, y: 100 }, units: { tank: 4 }, structures: {}, tick: 0 };
+  const cmds = runForIntel(s, 30, { flankArrived: true });
+  assert.ok(!cmds.some((c2) => c2.type === "flank"));
+  assert.ok(!cmds.some((c2) => c2.type === "strike"));
+  assert.ok(!cmds.some((c2) => c2.type === "support"));
+  const c = createAIState(5, 1, { coordinated: true });
+  assert.ok(c.coordinated && c.adaptive && c.tactics && c.deep);
+  assert.equal(c.flankers, 0);
+  assert.equal(c.objective, null);
+  assert.deepEqual(c.defenses, []);
+});
+test("a coordinated wave splits into a pin prong and a routed flank", () => {
+  const map = { w: 64, h: 64, seed: 1, tiles: new Uint8Array(64 * 64) };
+  const s = createAIState(5, 1, { coordinated: true, map });
+  s.phase = "muster";
+  s.army = s.musterSize;
+  s.sinceWave = s.waveGap;
+  const anchor = { x: 48 * 32 + 16, y: 8 * 32 + 16 };
+  const cmds = stepAI(s, 1, {
+    anchor,
+    sightings: [{ kind: "turret", x: 30 * 32, y: 20 * 32 }]
+  });
+  assert.equal(s.wave, 1);
+  const move = cmds.find((c) => c.type === "move");
+  const flank = cmds.find((c) => c.type === "flank");
+  assert.ok(move && move.type === "move");
+  assert.ok(flank && flank.type === "flank");
+  assert.equal(
+    flank.count,
+    Math.min(Math.floor(s.musterSize * AI_FLANK_SHARE), s.musterSize - AI_PIN_MIN)
+  );
+  assert.equal(s.flankers, flank.count);
+  assert.deepEqual(flank.to, move.to, "both prongs converge on the same target");
+  assert.equal(s.defenses.length, 2);
+  assert.ok(flank.path && flank.path.length > 0, "a routed flank carries waypoints");
+  const pad = Math.ceil((BUILDING_DEFS.turret.range ?? 0) / 32);
+  const gx = worldToTile(30 * 32) - 1;
+  const gy = worldToTile(20 * 32) - 1;
+  for (const p of flank.path) {
+    const tx = worldToTile(p.x);
+    const ty = worldToTile(p.y);
+    const inside = tx >= gx - pad && tx < gx + 2 + pad && ty >= gy - pad && ty < gy + 2 + pad;
+    assert.ok(!inside, `waypoint (${tx},${ty}) sits inside the turret's range`);
+  }
+});
+test("a wave too small to spare a squad launches as a single pin", () => {
+  const s = createAIState(5, 1, { coordinated: true });
+  s.phase = "muster";
+  s.army = AI_PIN_MIN + AI_FLANK_MIN - 1;
+  s.sinceWave = s.waveGap;
+  s.spotted = true;
+  const cmds = stepAI(s, 1);
+  assert.equal(s.wave, 1);
+  assert.ok(cmds.some((c) => c.type === "move"));
+  assert.ok(!cmds.some((c) => c.type === "flank"));
+  assert.equal(s.flankers, 0);
+});
+test("without a map the flank still peels off, just unrouted", () => {
+  const s = createAIState(5, 1, { coordinated: true });
+  s.phase = "muster";
+  s.army = s.musterSize;
+  s.sinceWave = s.waveGap;
+  const cmds = stepAI(s, 1, { sightings: [{ kind: "refinery", x: 500, y: 500 }] });
+  const flank = cmds.find((c) => c.type === "flank");
+  assert.ok(flank && flank.type === "flank");
+  assert.equal(flank.path, null);
+  assert.equal(s.flankers, flank.count);
+});
+test("the joint strike fires once when the flank reports in", () => {
+  const s = createAIState(5, 1, { coordinated: true });
+  s.phase = "attack";
+  s.army = 10;
+  s.wavePeak = 10;
+  s.flankers = 4;
+  s.objective = { x: 300, y: 200 };
+  const first = stepAI(s, 1, { flankArrived: true });
+  const st = first.find((c) => c.type === "strike");
+  assert.ok(st && st.type === "strike");
+  assert.equal(st.count, 4);
+  assert.deepEqual(st.to, { x: 300, y: 200 });
+  assert.equal(s.flankers, 0, "the squad is spent with its strike");
+  const again = stepAI(s, 1, { flankArrived: true });
+  assert.ok(!again.some((c) => c.type === "strike"), "one strike per flank");
+});
+test("battered coordinated units retreat to the depot and rejoin at healRatio", () => {
+  const s = createAIState(7, 1, { coordinated: true });
+  assert.equal(s.retreatRatio, AI_RETREAT_RATIO, "flat 35% spec threshold");
+  assert.equal(s.healRatio, AI_HEAL_RATIO, "units rejoin once repaired to 70%");
+  s.phase = "attack";
+  s.army = 10;
+  s.wavePeak = 10;
+  const anchor = { x: 1, y: 2 };
+  const pad = { x: 90, y: 90 };
+  const r = stepAI(s, 1, { lowHp: 2, anchor, repairPad: pad });
+  const retreat = r.find((c) => c.type === "retreat");
+  assert.ok(retreat && retreat.type === "retreat");
+  assert.equal(retreat.count, 2);
+  assert.deepEqual(retreat.to, pad, "battered units head for the repair depot");
+  assert.equal(retreat.healTo, AI_HEAL_RATIO, "the order carries the 70% mark");
+  assert.equal(s.healing, 2);
+  const j = stepAI(s, 1, { healed: 2, anchor, repairPad: pad });
+  const rejoin = j.find((c) => c.type === "rejoin");
+  assert.ok(rejoin && rejoin.type === "rejoin");
+  assert.equal(rejoin.count, 2);
+  assert.equal(s.healing, 0);
+  const b = createAIState(7, 1, { coordinated: true });
+  b.phase = "attack";
+  b.army = 10;
+  const r2 = stepAI(b, 1, { lowHp: 1, anchor });
+  const rt2 = r2.find((c) => c.type === "retreat");
+  assert.ok(rt2 && rt2.type === "retreat");
+  assert.deepEqual(rt2.to, anchor);
+  const custom = createAIState(7, 1, { coordinated: true, healRatio: 0.9 });
+  custom.phase = "attack";
+  custom.army = 10;
+  const r3 = stepAI(custom, 1, { lowHp: 1, anchor });
+  const rt3 = r3.find((c) => c.type === "retreat");
+  assert.ok(rt3 && rt3.type === "retreat" && rt3.healTo === 0.9);
+});
+test("objective picks weigh structure value against troop density", () => {
+  assert.deepEqual(
+    pickObjective([
+      { kind: "hq", x: 0, y: 0 },
+      { kind: "refinery", x: 600, y: 600 },
+      { kind: "tank", x: 620, y: 600 },
+      { kind: "tank", x: 580, y: 600 },
+      { kind: "tank", x: 600, y: 620 },
+      { kind: "tank", x: 600, y: 580 }
+    ]),
+    { x: 600, y: 600 }
+  );
+  assert.deepEqual(
+    pickObjective([
+      { kind: "hq", x: 0, y: 0 },
+      { kind: "refinery", x: 600, y: 600 }
+    ]),
+    { x: 0, y: 0 }
+  );
+  assert.deepEqual(
+    pickObjective([
+      { kind: "power", x: 0, y: 0 },
+      { kind: "barracks", x: 10, y: 0 },
+      { kind: "refinery", x: 20, y: 0 }
+    ]),
+    { x: 20, y: 0 }
+  );
+  assert.deepEqual(
+    pickObjective([
+      { kind: "turret", x: 0, y: 0 },
+      { kind: "tank", x: 900, y: 900 },
+      ...Array.from({ length: 11 }, (_, i) => ({
+        kind: "tank",
+        x: 900 + i,
+        y: 900
+      }))
+    ]),
+    { x: 900, y: 900 }
+  );
+  assert.equal(pickObjective([]), null);
+});
+test("sightings steer a coordinated wave at the picked objective", () => {
+  const s = createAIState(7, 1, { coordinated: true });
+  s.phase = "attack";
+  s.army = 10;
+  stepAI(s, 1, {
+    sightings: [
+      { kind: "hq", x: 0, y: 0 },
+      { kind: "refinery", x: 600, y: 600 },
+      { kind: "tank", x: 620, y: 600 },
+      { kind: "tank", x: 580, y: 600 },
+      { kind: "tank", x: 600, y: 620 },
+      { kind: "tank", x: 600, y: 580 }
+    ]
+  });
+  assert.deepEqual(s.objective, { x: 600, y: 600 });
+  assert.deepEqual(s.known.pos, { x: 500, y: 500 }, "the centroid still feeds fallback intel");
+});
+test("level >= 2 marks artillery on cooldown; level 3 adds airstrikes", () => {
+  const mk = (level) => {
+    const s = createAIState(5, 1, { coordinated: true, level });
+    s.phase = "attack";
+    s.army = 8;
+    s.wavePeak = 8;
+    s.objective = { x: 400, y: 400 };
+    return s;
+  };
+  const l1 = mk(1);
+  assert.ok(
+    !runFor(l1, 60).some((c) => c.type === "support"),
+    "level 1 fields no support fire"
+  );
+  const l2 = mk(2);
+  const art = stepAI(l2, 1).find((c) => c.type === "support");
+  assert.ok(art && art.type === "support" && art.kind === "artillery");
+  assert.equal(art.damage, AI_ARTILLERY.damage);
+  assert.equal(art.radius, AI_ARTILLERY.radius);
+  assert.deepEqual(art.to, { x: 400, y: 400 });
+  assert.ok(
+    !runFor(l2, AI_ARTILLERY.cooldown - 1).some((c) => c.type === "support"),
+    "artillery stays silent inside its cooldown"
+  );
+  const again = stepAI(l2, 1).find((c) => c.type === "support");
+  assert.ok(again && again.type === "support" && again.kind === "artillery");
+  const l3 = mk(3);
+  const first = stepAI(l3, 1);
+  assert.ok(first.some((c) => c.type === "support" && c.kind === "artillery"));
+  const air = first.find((c) => c.type === "support" && c.kind === "airstrike");
+  assert.ok(air && air.type === "support");
+  assert.equal(air.damage, AI_AIRSTRIKE.damage);
+  assert.equal(air.radius, AI_AIRSTRIKE.radius);
+  assert.ok(
+    !runFor(l3, AI_AIRSTRIKE.cooldown - 1).some(
+      (c) => c.type === "support" && c.kind === "airstrike"
+    )
+  );
+  assert.ok(
+    stepAI(l3, 1).some((c) => c.type === "support" && c.kind === "airstrike"),
+    "airstrike re-arms after its own cooldown"
+  );
+});
+test("coordinated mode is deterministic per seed and intel sequence", () => {
+  const map = { w: 64, h: 64, seed: 1, tiles: new Uint8Array(64 * 64) };
+  const run = () => {
+    const s = createAIState(7, 1, { coordinated: true, level: 2, map });
+    const out = [];
+    for (let t = 0; t < 200; t++) {
+      out.push(
+        ...stepAI(s, 1, {
+          anchor: { x: 48 * 32 + 16, y: 8 * 32 + 16 },
+          sightings: t === 40 ? [{ kind: "turret", x: 30 * 32, y: 20 * 32 }] : [],
+          flankArrived: t >= 100 && s.flankers > 0,
+          lowHp: t === 150 ? 2 : 0
         })
       );
     }
