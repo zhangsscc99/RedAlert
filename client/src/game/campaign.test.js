@@ -619,6 +619,7 @@ var DIFFICULTY = {
 };
 
 // src/game/enemyAI.ts
+var AI_INFANTRY_PER_WAVE = 6;
 var AI_ARMY_PER_WAVE = 15;
 var AI_RETREAT_RATIO = 0.35;
 var AI_CONTACT_RANGE = ROLE_STATS.scout.sight;
@@ -631,6 +632,13 @@ var AI_RETREAT_BY_DIFFICULTY = {
   normal: 0.28,
   hard: 0.35
 };
+var AI_MAX_LEVEL = 3;
+var AI_RAID_PERIOD = 45;
+var AI_LEVEL_CREDITS = [0, 150, 300, 500];
+var AI_LEVEL_EXPAND_PACE = [1, 0.9, 0.8, 0.65];
+var AI_LEVEL_SCREEN = [0, 1, 2, 3];
+var AI_LEVEL_TANK_BIAS = [1, 1.15, 1.35, 1.6];
+var AI_LEVEL_RAID_PACE = [1, 0.8, 0.6, 0.45];
 var EXPAND_WANT = {
   refinery: [1, 1, 1, 2, 2, 2, 2],
   barracks: [0, 1, 1, 1, 1, 2, 2],
@@ -643,10 +651,13 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
   const waveGap = opts.waveGap ?? WAVE_BALANCE.interval * tier.waveIntervalScale;
   const sizeScale = tier.enemyStartInfantry / DIFFICULTY.normal.enemyStartInfantry;
   const musterSize = opts.musterSize ?? Math.max(2, Math.round(AI_ARMY_PER_WAVE * sizeScale));
-  const tactics = opts.tactics ?? false;
+  const rawLevel = opts.level ?? 0;
+  const level = Number.isFinite(rawLevel) ? Math.max(0, Math.min(AI_MAX_LEVEL, Math.floor(rawLevel))) : 0;
+  const adaptive = (opts.adaptive ?? false) || level > 0;
+  const tactics = (opts.tactics ?? false) || adaptive;
   return {
     phase: "gather",
-    credits: 0,
+    credits: AI_LEVEL_CREDITS[level],
     army: 0,
     wave: 0,
     timer: 0,
@@ -672,7 +683,8 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
     saving: false,
     siteSelector: opts.buildSite ?? scanBuildSite,
     baseCap: opts.baseCap ?? AI_BASE_CAP,
-    expandTicks: opts.expandTicks ?? AI_EXPAND_TICKS,
+    // Higher curve levels expand on a faster clock (level 0 = base pace).
+    expandTicks: opts.expandTicks ?? AI_EXPAND_TICKS * AI_LEVEL_EXPAND_PACE[level],
     tactics,
     known: { pos: null, units: {}, structures: {}, tick: -1 },
     focus: null,
@@ -680,7 +692,17 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
     scoutsActive: 0,
     healing: 0,
     // Faster tiers scout more often: hard probes ~30s, easy ~54s.
-    scoutPeriod: opts.scoutPeriod ?? AI_SCOUT_PERIOD * tier.waveIntervalScale
+    scoutPeriod: opts.scoutPeriod ?? AI_SCOUT_PERIOD * tier.waveIntervalScale,
+    adaptive,
+    level,
+    infantryScreen: Math.max(0, AI_INFANTRY_PER_WAVE - AI_LEVEL_SCREEN[level]),
+    tankBias: AI_LEVEL_TANK_BIAS[level],
+    raidPeriod: opts.raidPeriod ?? AI_RAID_PERIOD * AI_LEVEL_RAID_PACE[level],
+    lastRaidTick: 0,
+    raiders: 0,
+    raidRecalled: false,
+    raidPos: null,
+    wavePeak: 0
   };
 }
 function scanBuildSite(q) {
