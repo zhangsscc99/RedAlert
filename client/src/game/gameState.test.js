@@ -801,6 +801,27 @@ var AI_ORDER_SETTLE = 30;
 var AI_BASE_CAP = 6;
 var AI_DEFEND_RATIO = 1.5;
 var AI_SITE_RADIUS = 14;
+var AI_SCOUT_PERIOD = 40;
+var AI_SCOUT_MAX = 2;
+var AI_FOCUS_HOLD = 3;
+var AI_FOCUS_WOUND_BONUS = 3;
+var AI_MIN_REST_RATIO = 0.4;
+var AI_RETREAT_BY_DIFFICULTY = {
+  easy: 0.2,
+  normal: 0.28,
+  hard: 0.35
+};
+var AI_TARGET_VALUE = {
+  infantry: 1,
+  tank: 2,
+  harvester: 5,
+  hq: 6,
+  barracks: 4,
+  refinery: 4,
+  power: 2,
+  turret: 3,
+  wall: 0.5
+};
 var EXPAND_WANT = {
   refinery: [1, 1, 1, 2, 2, 2, 2],
   barracks: [0, 1, 1, 1, 1, 2, 2],
@@ -823,12 +844,16 @@ var AI_ARMOR = {
 function armorOfUnitKind(kind) {
   return AI_ARMOR[kind];
 }
+function armorOfKind(kind) {
+  return kind === "infantry" || kind === "tank" || kind === "harvester" ? AI_ARMOR[kind] : "building";
+}
 function createAIState(seed, incomeScale = 1, opts = {}) {
   const difficulty = opts.difficulty ?? "normal";
   const tier = DIFFICULTY[difficulty];
   const waveGap = opts.waveGap ?? WAVE_BALANCE.interval * tier.waveIntervalScale;
   const sizeScale = tier.enemyStartInfantry / DIFFICULTY.normal.enemyStartInfantry;
   const musterSize = opts.musterSize ?? Math.max(2, Math.round(AI_ARMY_PER_WAVE * sizeScale));
+  const tactics = opts.tactics ?? false;
   return {
     phase: "gather",
     credits: 0,
@@ -838,7 +863,7 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
     seed,
     incomeScale,
     rng: mulberry32(seed),
-    deep: opts.deep ?? false,
+    deep: (opts.deep ?? false) || tactics,
     difficulty,
     musterSize,
     waveGap,
@@ -847,7 +872,7 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
     spotted: false,
     scoutSent: false,
     retreatSent: false,
-    retreatRatio: opts.retreatRatio ?? AI_RETREAT_RATIO,
+    retreatRatio: opts.retreatRatio ?? (tactics ? AI_RETREAT_BY_DIFFICULTY[difficulty] : AI_RETREAT_RATIO),
     expand: opts.expandBase ?? false,
     ticks: 0,
     buildings: { refinery: 0, barracks: 0, turret: 0 },
@@ -857,7 +882,15 @@ function createAIState(seed, incomeScale = 1, opts = {}) {
     saving: false,
     siteSelector: opts.buildSite ?? scanBuildSite,
     baseCap: opts.baseCap ?? AI_BASE_CAP,
-    expandTicks: opts.expandTicks ?? AI_EXPAND_TICKS
+    expandTicks: opts.expandTicks ?? AI_EXPAND_TICKS,
+    tactics,
+    known: { pos: null, units: {}, structures: {}, tick: -1 },
+    focus: null,
+    lastScoutTick: 0,
+    scoutsActive: 0,
+    healing: 0,
+    // Faster tiers scout more often: hard probes ~30s, easy ~54s.
+    scoutPeriod: opts.scoutPeriod ?? AI_SCOUT_PERIOD * tier.waveIntervalScale
   };
 }
 function stepAI(s, dt, intel) {
@@ -875,6 +908,11 @@ function stepAI(s, dt, intel) {
       syncBuildings(s, intel);
       maybeDefend(s, intel, cmds);
       maybeBuild(s, intel, cmds);
+    }
+    if (s.tactics) {
+      recordIntel(s, intel);
+      maybeRejoin(s, intel, cmds);
+      maybeRecon(s, intel, cmds);
     }
     switch (s.phase) {
       case "gather":
@@ -897,6 +935,7 @@ function stepAI(s, dt, intel) {
           s.credits -= AI_INFANTRY_COST;
           s.army += 1;
           s.scoutSent = true;
+          s.lastScoutTick = s.ticks;
           cmds.push(
             { type: "train", kind: "infantry" },
             { type: "scout", to: jitterTarget(s, SCOUT_JITTER_TILES) }
@@ -914,9 +953,11 @@ function stepAI(s, dt, intel) {
           s.army += 1;
           cmds.push({ type: "train", kind });
         }
-        const ready = s.army >= s.musterSize && s.sinceWave >= effectiveWaveGap(s);
-        const commit = Math.max(2, Math.ceil(s.musterSize / 3));
-        if (ready || s.spotted && s.army >= commit) {
+        const goal = armyGoal(s);
+        const ready = s.army >= goal && s.sinceWave >= effectiveWaveGap(s);
+        const commit = Math.max(2, Math.ceil(goal / 3));
+        const rested = !s.tactics || s.sinceWave >= effectiveWaveGap(s) * AI_MIN_REST_RATIO;
+        if (ready || s.spotted && s.army >= commit && rested) {
           launchWave(s, cmds);
         } else {
           maybeRetreat(s, intel, cmds);
@@ -927,9 +968,11 @@ function stepAI(s, dt, intel) {
         if (s.army <= 0) {
           s.phase = s.deep ? "muster" : "build";
           s.retreatSent = false;
+          s.focus = null;
           if (s.deep) cmds.push({ type: "rally", to: anchorOf(intel) });
         } else {
           cmds.push({ type: "attack" });
+          if (s.tactics) maybeFocus(s, intel, cmds);
           maybeRetreat(s, intel, cmds);
         }
         break;
@@ -939,6 +982,10 @@ function stepAI(s, dt, intel) {
 }
 function pickTrainKind(s, intel) {
   if (s.army < AI_INFANTRY_PER_WAVE) return "infantry";
+  if (s.tactics && s.known.tick >= 0) {
+    const w = counterWeights({ ...s.known.units, ...s.known.structures });
+    return w.tank >= w.infantry ? "tank" : "infantry";
+  }
   const counts = intel?.playerArmor;
   if (!counts) return "tank";
   const score = (kind) => {
@@ -950,6 +997,100 @@ function pickTrainKind(s, intel) {
   };
   return score("tank") >= score("infantry") ? "tank" : "infantry";
 }
+function counterWeights(forces) {
+  const w = { infantry: 0, tank: 0 };
+  for (const key of Object.keys(forces)) {
+    const count = forces[key] ?? 0;
+    if (count <= 0) continue;
+    const armor = armorOfKind(key);
+    w.infantry += count * damageMultiplier("bullet", armor);
+    w.tank += count * damageMultiplier("rocket", armor);
+  }
+  return w;
+}
+function focusScore(it) {
+  return AI_TARGET_VALUE[it.kind] + (1 - Math.min(1, Math.max(0, it.hpRatio ?? 1))) * AI_FOCUS_WOUND_BONUS;
+}
+function pickFocusTarget(sightings) {
+  let best = null;
+  let bestScore = -Infinity;
+  for (const it of sightings) {
+    const v = focusScore(it);
+    if (v > bestScore) {
+      bestScore = v;
+      best = it;
+    }
+  }
+  return best;
+}
+function recordIntel(s, intel) {
+  const seen = intel?.sightings;
+  if (!seen || seen.length === 0) return;
+  const units = {};
+  const structures = {};
+  let x = 0;
+  let y = 0;
+  for (const it of seen) {
+    if (it.kind === "infantry" || it.kind === "tank" || it.kind === "harvester") {
+      units[it.kind] = (units[it.kind] ?? 0) + 1;
+    } else {
+      structures[it.kind] = (structures[it.kind] ?? 0) + 1;
+    }
+    x += it.x;
+    y += it.y;
+  }
+  s.known = {
+    pos: { x: x / seen.length, y: y / seen.length },
+    units,
+    structures,
+    tick: s.ticks
+  };
+  s.spotted = true;
+}
+function maybeRecon(s, intel, cmds) {
+  if (s.phase === "gather" || s.phase === "scout" || s.saving) return;
+  if (intel?.scouts !== void 0) {
+    s.scoutsActive = Math.max(0, Math.min(AI_SCOUT_MAX, Math.floor(intel.scouts)));
+  }
+  if (s.scoutsActive >= AI_SCOUT_MAX) return;
+  if (s.ticks - s.lastScoutTick < s.scoutPeriod) return;
+  const n = Math.min(AI_SCOUT_MAX - s.scoutsActive, Math.floor(s.credits / AI_INFANTRY_COST));
+  if (n <= 0) return;
+  for (let i = 0; i < n; i++) {
+    s.credits -= AI_INFANTRY_COST;
+    s.army += 1;
+    s.scoutsActive += 1;
+    cmds.push({ type: "train", kind: "infantry" }, { type: "scout", to: reconTarget(s) });
+  }
+  s.lastScoutTick = s.ticks;
+}
+function reconTarget(s) {
+  const cx = s.known.pos ? worldToTile(s.known.pos.x) : MAP_W / 2;
+  const cy = s.known.pos ? worldToTile(s.known.pos.y) : MAP_H / 2;
+  const tx = Math.floor(cx + (s.rng() * 2 - 1) * SCOUT_JITTER_TILES);
+  const ty = Math.floor(cy + (s.rng() * 2 - 1) * SCOUT_JITTER_TILES);
+  return {
+    x: tileCenter(Math.min(MAP_W - 1, Math.max(0, tx))),
+    y: tileCenter(Math.min(MAP_H - 1, Math.max(0, ty)))
+  };
+}
+function maybeFocus(s, intel, cmds) {
+  if (s.focus) {
+    if (s.ticks < s.focus.until) return;
+    s.focus = null;
+  }
+  const target = pickFocusTarget(intel?.sightings ?? []);
+  if (!target) return;
+  s.focus = { x: target.x, y: target.y, until: s.ticks + AI_FOCUS_HOLD };
+  cmds.push({ type: "focus", to: { x: target.x, y: target.y } });
+}
+function maybeRejoin(s, intel, cmds) {
+  const healed = Math.min(intel?.healed ?? 0, s.healing);
+  if (healed <= 0) return;
+  s.healing -= healed;
+  const to = s.focus ?? s.known.pos ?? attackTarget(s);
+  cmds.push({ type: "rejoin", to, count: healed });
+}
 function maybeRetreat(s, intel, cmds) {
   if (!s.deep) return;
   const low = intel?.lowHp ?? 0;
@@ -960,7 +1101,8 @@ function maybeRetreat(s, intel, cmds) {
   }
   if (s.retreatSent) return;
   s.retreatSent = true;
-  cmds.push({ type: "retreat", to: anchorOf(intel) });
+  cmds.push({ type: "retreat", to: anchorOf(intel), count: stranded });
+  if (s.tactics) s.healing += stranded;
 }
 function anchorOf(intel) {
   return intel?.anchor ?? { x: tileCenter(MAP_W * 3 >> 2), y: tileCenter(MAP_H >> 2) };
@@ -972,9 +1114,18 @@ function launchWave(s, cmds) {
   s.spotted = false;
   s.retreatSent = false;
   s.defenders = 0;
+  s.focus = null;
   cmds.push({ type: "move", to: attackTarget(s) }, { type: "attack" });
 }
 function attackTarget(s) {
+  if (s.tactics && s.known.pos) {
+    const tx = Math.floor(worldToTile(s.known.pos.x) + (s.rng() * 2 - 1) * ATTACK_JITTER_TILES);
+    const ty = Math.floor(worldToTile(s.known.pos.y) + (s.rng() * 2 - 1) * ATTACK_JITTER_TILES);
+    return {
+      x: tileCenter(Math.min(MAP_W - 1, Math.max(0, tx))),
+      y: tileCenter(Math.min(MAP_H - 1, Math.max(0, ty)))
+    };
+  }
   return jitterTarget(s, ATTACK_JITTER_TILES);
 }
 function jitterTarget(s, jitterTiles) {
@@ -990,6 +1141,10 @@ function expandLevel(s) {
 }
 function trainsPerTick(s) {
   return s.expand ? 1 + s.buildings.barracks : 1;
+}
+function armyGoal(s) {
+  if (!s.tactics) return s.musterSize;
+  return Math.min(WAVE_BALANCE.max, s.musterSize + WAVE_BALANCE.growth * s.wave);
 }
 function effectiveWaveGap(s) {
   if (!s.expand) return s.waveGap;
@@ -1377,13 +1532,22 @@ function isLowPower(power) {
 }
 
 // src/game/save.ts
-var SAVE_VERSION = 2;
-var cloneUnit = (u) => ({ id: u.id, kind: u.kind, x: u.x, y: u.y, hp: u.hp });
+var SAVE_VERSION = 3;
+var cloneUnit = (u) => {
+  const c = { id: u.id, kind: u.kind, x: u.x, y: u.y, hp: u.hp };
+  if (u.kills !== void 0) c.kills = u.kills;
+  return c;
+};
 var cloneBuilding = (b) => {
   const c = { id: b.id, kind: b.kind, gx: b.gx, gy: b.gy, hp: b.hp };
   if (b.done !== void 0) c.done = b.done;
+  if (b.level !== void 0) c.level = b.level;
+  if (b.repair !== void 0) c.repair = b.repair;
   return c;
 };
+var cloneStats = (s) => ({ ...s });
+var cloneWeather = (w) => ({ ...w });
+var cloneRadar = (r) => ({ ...r });
 function snapshot(input) {
   const s = {
     version: SAVE_VERSION,
@@ -1398,6 +1562,12 @@ function snapshot(input) {
   if (input.ai) s.ai = { ...input.ai };
   if (input.camera) s.camera = { ...input.camera };
   if (input.opts) s.opts = { ...input.opts };
+  if (input.fog) s.fog = { w: input.fog.w, h: input.fog.h, explored: Array.from(input.fog.explored) };
+  if (input.stats) s.stats = cloneStats(input.stats);
+  if (input.wave !== void 0) s.wave = input.wave;
+  if (input.difficulty !== void 0) s.difficulty = input.difficulty;
+  if (input.weather) s.weather = cloneWeather(input.weather);
+  if (input.radar) s.radar = cloneRadar(input.radar);
   return s;
 }
 
