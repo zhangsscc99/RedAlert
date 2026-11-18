@@ -5,6 +5,7 @@
 
 import { ORE, WATER, TILE_SIZE, type Camera, type GameMap } from '../game/index.ts';
 import {
+  GRASS_PALETTES,
   SHORE_DX,
   SHORE_DY,
   drawOreTile,
@@ -127,9 +128,15 @@ export function prerenderMap(map: GameMap, opts: PrerenderOptions = {}): HTMLCan
 
   const glints: { x: number; y: number; phase: number }[] = [];
 
+  // Season palette: derived from the map seed (stable per map) unless the
+  // caller overrides it. Resolved up front so the grass texture itself is
+  // baked in the season's colours; the uniform tint near the end only has
+  // to unify water, ore and paths on top.
+  const season = opts.season ?? SEASONS[Math.abs(map.seed | 0) % SEASONS.length]!;
+
   // Grass everywhere first via a pre-rendered noise pattern; water and ore
   // are drawn over it.
-  const grassTex = makeGrassTexture();
+  const grassTex = makeGrassTexture(GRASS_PALETTES[season]);
   ctx.fillStyle = ctx.createPattern(grassTex, 'repeat')!;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
@@ -183,8 +190,9 @@ export function prerenderMap(map: GameMap, opts: PrerenderOptions = {}): HTMLCan
           ctx.fillStyle = `rgba(255,232,150,${((r - 0.92) * 1.6).toFixed(3)})`;
           ctx.fillRect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE);
         }
-        // One twinkle point per crystal, deterministic per tile.
-        const n = 1 + Math.min(2, Math.floor(density / 3));
+        // One twinkle point per crystal, deterministic per tile — but a
+        // nearly depleted bed stops sparkling entirely.
+        const n = r < 0.2 ? 0 : 1 + Math.min(2, Math.floor(density / 3));
         for (let i = 0; i < n; i++) {
           glints.push({
             x: x * TILE_SIZE + 4 + rand01(x, y, 200 + i) * (TILE_SIZE - 8),
@@ -528,9 +536,8 @@ export function prerenderMap(map: GameMap, opts: PrerenderOptions = {}): HTMLCan
   }
 
   // Seasonal grade: one uniform tint composited over the whole map so the
-  // far view reads as a single coherent season. Defaults to the map seed so
-  // a given map always looks the same; callers may override via opts.season.
-  const season = opts.season ?? SEASONS[Math.abs(map.seed | 0) % SEASONS.length]!;
+  // far view reads as a single coherent season. The palette was resolved at
+  // the top of this function so the grass texture already matches.
   ctx.globalCompositeOperation = 'overlay';
   ctx.fillStyle = SEASON_TINT[season];
   ctx.fillRect(0, 0, canvas.width, canvas.height);

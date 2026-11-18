@@ -13,6 +13,7 @@ export type SfxName =
   | 'defeat'
   | 'buildStart'
   | 'buildComplete'
+  | 'mine'
   | 'harvestUnload'
   | 'promote'
   | 'lowPower'
@@ -24,15 +25,83 @@ export type UnitVoice = 'infantry' | 'tank' | 'harvester' | 'turret';
 /** Mixer groups: UI feedback, weapons/explosions, unit voice barks. */
 export type SfxGroup = 'ui' | 'combat' | 'voice';
 
+/** Camera view needed to spatialize a world position (all units px). */
+export interface SpatialView {
+  /** World-space coordinate shown at the viewport's top-left corner. */
+  x: number;
+  y: number;
+  zoom: number;
+  /** Viewport size in screen px. */
+  w: number;
+  h: number;
+}
+
+/** Distance→loudness/position tuning; see DEFAULT_SPATIAL for defaults. */
+export interface SpatialParams {
+  /** Screen-px radius around the view centre that plays at full volume. */
+  refDistance: number;
+  /** Screen-px distance where gain floors out at `minGain`. */
+  maxDistance: number;
+  /** Residual loudness for far off-screen sources, 0..1. */
+  minGain: number;
+  /** Stereo offset for a source at the screen edge, 0..1. */
+  panRange: number;
+}
+
+export const DEFAULT_SPATIAL: SpatialParams = {
+  refDistance: 260,
+  maxDistance: 1500,
+  minGain: 0.06,
+  panRange: 0.8,
+};
+
+/**
+ * Map a world-space point to a gain/pan pair relative to the camera view
+ * centre: inside `refDistance` it plays at full volume, then loudness eases
+ * linearly down to `minGain` at `maxDistance`; pan tracks the horizontal
+ * offset from centre, clamped at the screen edge so far off-screen sources
+ * sit fully in one channel. Pure — exported for callers and tests.
+ */
+export function spatialMix(
+  wx: number,
+  wy: number,
+  view: SpatialView,
+  p: SpatialParams = DEFAULT_SPATIAL,
+): { gain: number; pan: number } {
+  const cx = view.x + view.w / (2 * view.zoom);
+  const cy = view.y + view.h / (2 * view.zoom);
+  const dx = (wx - cx) * view.zoom;
+  const dy = (wy - cy) * view.zoom;
+  const d = Math.hypot(dx, dy);
+  const span = Math.max(1, p.maxDistance - p.refDistance);
+  const t = Math.min(1, Math.max(0, (d - p.refDistance) / span));
+  const gain = 1 - (1 - p.minGain) * t;
+  const halfW = Math.max(1, view.w / 2);
+  const pan = Math.min(1, Math.max(-1, dx / halfW)) * p.panRange;
+  return { gain, pan };
+}
+
 export interface Sfx {
   readonly enabled: boolean;
   masterVolume: number;
   setEnabled(on: boolean): void;
   /**
-   * Play a named effect. `opts.gain` (0..1) scales loudness for
-   * off-screen/distance attenuation; omit for full volume.
+   * Play a named effect. `opts.gain` (0..1) and `opts.pan` (-1..1) scale
+   * loudness/stereo position for off-screen or distance-attenuated
+   * sources; alternatively pass `opts.at` (world px) plus `opts.view`
+   * (camera view) and both are derived from spatialMix.
    */
-  play(name: SfxName, opts?: { gain?: number }): void;
+  play(
+    name: SfxName,
+    opts?: {
+      gain?: number;
+      pan?: number;
+      at?: { x: number; y: number };
+      view?: SpatialView;
+    },
+  ): void;
+  /** Retune the distance attenuation used by play's at/view shorthand. */
+  setSpatial?(params: Partial<SpatialParams>): void;
   /** Selection acknowledgment bark for a unit kind. */
   unitAck(kind: UnitVoice): void;
   /** Order confirmation bark for a unit kind. */
@@ -57,6 +126,7 @@ export function createSfx(): Sfx {
   const groupVol: Record<SfxGroup, number> = { ui: 1, combat: 1, voice: 1 };
   const buses = {} as Record<SfxGroup, GainNode>;
   const lastPlay = new Map<string, number>();
+  const spatial: SpatialParams = { ...DEFAULT_SPATIAL };
 
   function ensureCtx(): AudioContext | null {
     if (ctx) {
@@ -307,6 +377,35 @@ export function createSfx(): Sfx {
         });
       },
     },
+    // Two drill ticks + a faint metallic ping while a harvester chews ore.
+    mine: {
+      group: 'ui',
+      fn: (c, bus) => {
+        playNoise(c, bus, {
+          dur: 0.05,
+          filter: 'bandpass',
+          freq: 2300,
+          q: 4,
+          peak: 0.22,
+        });
+        playNoise(c, bus, {
+          dur: 0.05,
+          filter: 'bandpass',
+          freq: 1800,
+          q: 4,
+          t0offset: 0.1,
+          peak: 0.2,
+        });
+        playTone(c, bus, {
+          type: 'triangle',
+          f0: 1500,
+          f1: 900,
+          t0offset: 0.02,
+          dur: 0.09,
+          peak: 0.1,
+        });
+      },
+    },
     // Three-note rising chime when construction finishes.
     buildComplete: {
       group: 'ui',
@@ -510,22 +609,42 @@ export function createSfx(): Sfx {
     setEnabled(on: boolean): void {
       enabled = on;
     },
-    play(name: SfxName, opts?: { gain?: number }): void {
+    play(name, opts): void {
       if (!enabled) return;
       if (!rateOk(name, RATE_LIMIT_MS)) return;
       const c = readyCtx();
       if (!c) return;
       const s = shots[name];
       let bus: AudioNode = buses[s.group] ?? master!;
-      // Distance/off-screen attenuation: a throwaway gain staged before
-      // the group bus so group/master volumes still apply on top.
-      if (opts?.gain !== undefined) {
+      // Distance/off-screen attenuation + stereo position: throwaway nodes
+      // staged before the group bus so group/master volumes still apply.
+      let gain = opts?.gain;
+      let pan = opts?.pan;
+      if (opts?.at && opts.view) {
+        const m = spatialMix(opts.at.x, opts.at.y, opts.view, spatial);
+        gain = (gain ?? 1) * m.gain;
+        pan ??= m.pan;
+      }
+      if (gain !== undefined) {
         const g = c.createGain();
-        g.gain.value = Math.min(1, Math.max(0, opts.gain));
+        g.gain.value = Math.min(1, Math.max(0, gain));
         g.connect(bus);
         bus = g;
       }
+      if (
+        pan !== undefined &&
+        Math.abs(pan) > 1e-3 &&
+        typeof c.createStereoPanner === 'function'
+      ) {
+        const p = c.createStereoPanner();
+        p.pan.value = Math.min(1, Math.max(-1, pan));
+        p.connect(bus);
+        bus = p;
+      }
       s.fn(c, bus);
+    },
+    setSpatial(params: Partial<SpatialParams>): void {
+      Object.assign(spatial, params);
     },
     unitAck(kind: UnitVoice): void {
       playVoice(kind, 'ack', acks);

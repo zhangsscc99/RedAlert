@@ -28,17 +28,62 @@ export function tileShadeTier(x: number, y: number): number {
 
 const GRASS_TEX = 128; // pattern tile size in px
 
+/** Season-tinted grass palette: base fill, blotch colours, speckles. */
+export interface GrassPalette {
+  base: string;
+  patches: string[];
+  speckDark: string;
+  speckLight: string;
+}
+
+export type GrassSeason = 'spring' | 'summer' | 'autumn' | 'winter';
+
+/**
+ * One coordinated palette per season: hues stay inside a muted olive-green
+ * family (fresh → deep → dried → frost-bleached) so any pick reads as the
+ * same terrain under a different sky rather than a different tileset.
+ */
+export const GRASS_PALETTES: Record<GrassSeason, GrassPalette> = {
+  spring: {
+    base: '#4a8a35',
+    patches: ['#529440', '#44803a', '#57a044', '#478a3d', '#5aa448', '#3f7c36'],
+    speckDark: 'rgba(12,44,10,0.14)',
+    speckLight: 'rgba(205,235,140,0.13)',
+  },
+  summer: {
+    base: '#3d7a2e',
+    patches: ['#427f31', '#36702a', '#458a34', '#38762c', '#4a8c38', '#336a28'],
+    speckDark: 'rgba(10,40,8,0.14)',
+    speckLight: 'rgba(185,225,135,0.12)',
+  },
+  autumn: {
+    base: '#6b7230',
+    patches: ['#747a34', '#606826', '#7b8138', '#666e28', '#848a3e', '#5a6122'],
+    speckDark: 'rgba(42,36,10,0.14)',
+    speckLight: 'rgba(228,206,120,0.12)',
+  },
+  winter: {
+    base: '#5b6c53',
+    patches: ['#627359', '#53604b', '#67775d', '#576551', '#6c7b61', '#4e5a46'],
+    speckDark: 'rgba(16,24,16,0.13)',
+    speckLight: 'rgba(216,226,202,0.11)',
+  },
+};
+
 /**
  * One tileable grass texture canvas: base green plus wrapped patches and
  * fine speckles. Created once per prerenderMap call and used as a fill
- * pattern — no per-frame noise generation.
+ * pattern — no per-frame noise generation. `palette` defaults to summer,
+ * the original untinted look.
  */
-export function makeGrassTexture(): HTMLCanvasElement {
+export function makeGrassTexture(
+  palette: GrassPalette = GRASS_PALETTES.summer,
+): HTMLCanvasElement {
   const c = document.createElement('canvas');
   c.width = c.height = GRASS_TEX;
   const g = c.getContext('2d')!;
 
-  g.fillStyle = '#3d7a2e';
+  g.fillStyle = palette.base;
   g.fillRect(0, 0, GRASS_TEX, GRASS_TEX);
 
   // Every mark is re-drawn at all 8 neighbour offsets so the pattern wraps.
@@ -49,7 +94,7 @@ export function makeGrassTexture(): HTMLCanvasElement {
   };
 
   // Soft blotches.
-  const patchColors = ['#427f31', '#36702a', '#458a34', '#38762c', '#4a8c38', '#336a28'];
+  const patchColors = palette.patches;
   for (let i = 0; i < 48; i++) {
     const x = rand01(i, 3, 11) * GRASS_TEX;
     const y = rand01(i, 7, 23) * GRASS_TEX;
@@ -71,8 +116,7 @@ export function makeGrassTexture(): HTMLCanvasElement {
     const x = rand01(i, 13, 53) * GRASS_TEX;
     const y = rand01(i, 17, 59) * GRASS_TEX;
     const s = rand01(i, 23, 67) < 0.82 ? 1 : 2;
-    g.fillStyle =
-      rand01(i, 19, 61) < 0.55 ? 'rgba(10,40,8,0.14)' : 'rgba(185,225,135,0.12)';
+    g.fillStyle = rand01(i, 19, 61) < 0.55 ? palette.speckDark : palette.speckLight;
     wrapped((ox, oy) => g.fillRect(x + ox, y + oy, s, s));
   }
 
