@@ -28,7 +28,7 @@ function memStorage(): SlotStorage & { map: Map<string, string> } {
 
 function makeState(credits: number): SaveState {
   return {
-    version: 2,
+    version: 2, // a v2-era blob — exercises the upgrade read path end to end
     seed: 1,
     credits,
     elapsed: 60,
@@ -57,7 +57,13 @@ test('save → list → load → delete full round trip', () => {
   // meta written separately from the blob, under the v2 key prefix
   assert.ok(s.map.has('redalert.save.v2.2'));
   assert.ok(s.map.has('redalert.save.v2.2.meta'));
-  assert.deepEqual(meta, { savedAt: 1700, elapsed: 60, credits: 4200, phase: 'playing' });
+  assert.deepEqual(meta, {
+    savedAt: 1700,
+    elapsed: 60,
+    credits: 4200,
+    phase: 'playing',
+    result: 'playing',
+  });
 
   // list page reads meta without needing the blob
   const slots = listSlots(s);
@@ -108,6 +114,7 @@ test('meta survives a corrupt blob; corrupt meta reads as empty', () => {
     elapsed: 60,
     credits: 100,
     phase: 'won',
+    result: 'won',
   });
 
   s.map.set('redalert.save.v2.1.meta', '{bad json');
@@ -132,5 +139,88 @@ test('saveSlot defaults phase and savedAt', () => {
   const s = memStorage();
   const meta = saveSlot(s, 1, makeState(0));
   assert.equal(meta.phase, 'playing');
+  assert.equal(meta.result, 'playing');
   assert.ok(meta.savedAt > 0);
+});
+
+test('slot meta carries difficulty + result for the menu list', () => {
+  const s = memStorage();
+  // explicit extra wins over state fields
+  const m1 = saveSlot(s, 1, makeState(100), { difficulty: 'hard', result: 'lost', savedAt: 1 });
+  assert.equal(m1.difficulty, 'hard');
+  assert.equal(m1.result, 'lost');
+  assert.equal(m1.savedAt, 1);
+
+  // difficulty falls back to the save's own label
+  const hard = { ...makeState(200), difficulty: 'normal' };
+  const m2 = saveSlot(s, 2, hard, { savedAt: 2 });
+  assert.equal(m2.difficulty, 'normal');
+  assert.equal(m2.result, 'playing'); // no stats verdict → phase label
+
+  // a finished stats block supplies the result on its own
+  const won: SaveState = {
+    ...makeState(300),
+    stats: {
+      unitsTrained: 9,
+      unitsLost: 2,
+      kills: 8,
+      buildingsBuilt: 4,
+      buildingsLost: 0,
+      oreMined: 1200,
+      wavesCleared: 3,
+      elapsed: 60,
+      over: true,
+      victory: true,
+    },
+  };
+  const m3 = saveSlot(s, 3, won, { savedAt: 3 });
+  assert.equal(m3.result, 'won');
+
+  const slots = listSlots(s);
+  assert.equal(slots[0].meta?.difficulty, 'hard');
+  assert.equal(slots[0].meta?.result, 'lost');
+  assert.equal(slots[1].meta?.difficulty, 'normal');
+  assert.equal(slots[2].meta?.result, 'won');
+});
+
+test('v2-era meta records without new fields still read', () => {
+  const s = memStorage();
+  // Hand-written old-format meta: no difficulty/result keys at all.
+  s.map.set(
+    'redalert.save.v2.1.meta',
+    JSON.stringify({ savedAt: 900, elapsed: 30, credits: 50, phase: 'playing' }),
+  );
+  assert.deepEqual(listSlots(s)[0].meta, {
+    savedAt: 900,
+    elapsed: 30,
+    credits: 50,
+    phase: 'playing',
+  });
+
+  // present-but-wrong-type optional fields corrupt the meta, not the list
+  s.map.set(
+    'redalert.save.v2.2.meta',
+    JSON.stringify({ savedAt: 900, elapsed: 30, credits: 50, phase: 'playing', difficulty: 7 }),
+  );
+  assert.equal(listSlots(s)[1].meta, null);
+});
+
+test('v2-era save blobs in a slot still load', () => {
+  const s = memStorage();
+  s.map.set(
+    slotKey(1),
+    JSON.stringify({
+      version: 2,
+      seed: 5,
+      credits: 777,
+      elapsed: 45,
+      units: [{ id: 1, kind: 'tank', x: 3, y: 4, hp: 400 }],
+      buildings: [],
+      enemyUnits: [],
+      enemyBuildings: [],
+    }),
+  );
+  const loaded = loadSlot(s, 1);
+  assert.equal(loaded?.credits, 777);
+  assert.equal(loaded?.units?.[0]?.kind, 'tank');
 });
