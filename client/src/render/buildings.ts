@@ -201,6 +201,14 @@ function drawTurret(
   ctx.moveTo(cx, cy);
   ctx.lineTo(tipX, tipY);
   ctx.stroke();
+  // Muzzle flash for the first instant of recoil, then a smoke puff.
+  if (recoil > 0.8) {
+    const f = (recoil - 0.8) / 0.2;
+    ctx.fillStyle = `rgba(255, 230, 140, ${f * 0.9})`;
+    ctx.beginPath();
+    ctx.arc(tipX + Math.cos(angle) * r * 0.12, tipY + Math.sin(angle) * r * 0.12, r * 0.2 * f + r * 0.08, 0, Math.PI * 2);
+    ctx.fill();
+  }
   if (recoil > 0.05) {
     ctx.fillStyle = `rgba(200, 200, 200, ${recoil * 0.5})`;
     ctx.beginPath();
@@ -209,7 +217,11 @@ function drawTurret(
   }
 }
 
-/** Mast + swaying boom + hanging hook above a building under construction. */
+/**
+ * Mast + swaying boom + hanging hook above a building under construction.
+ * The hoist cycles: cable pays out, a load block rides up toward the boom
+ * tip, then drops off — slower as the build nears completion (`pct`).
+ */
 function drawCrane(
   ctx: CanvasRenderingContext2D,
   x: number,
@@ -217,6 +229,7 @@ function drawCrane(
   w: number,
   now: number,
   seed: number,
+  pct: number,
 ): void {
   const mastX = x + w * 0.85;
   const topY = y - w * 0.7;
@@ -231,13 +244,28 @@ function drawCrane(
   ctx.lineTo(mastX, topY);
   ctx.lineTo(tipX, tipY);
   ctx.stroke();
-  // hoist cable + hook block
+  // Hoist cycle: the load rises along the cable, then resets — one lift
+  // every few seconds, easing off as pct → 1.
+  const cycle = (now * (0.5 - pct * 0.25) + hash(seed * 7)) % 1;
+  const cableLen = w * (0.06 + 0.3 * cycle);
+  // Load drifts with the cable sway for a touch of pendulum lag.
+  const lag = Math.sin(now * 1.7 + seed) * w * 0.03 * cycle;
+  const hookX = tipX + lag;
+  const hookY = tipY + cableLen;
   ctx.beginPath();
   ctx.moveTo(tipX, tipY);
-  ctx.lineTo(tipX, tipY + w * 0.3);
+  ctx.lineTo(hookX, hookY);
   ctx.stroke();
+  // hook block + suspended slab
   ctx.fillStyle = SCAFFOLD;
-  ctx.fillRect(tipX - w * 0.03, tipY + w * 0.3, w * 0.06, w * 0.06);
+  ctx.fillRect(hookX - w * 0.03, hookY, w * 0.06, w * 0.06);
+  if (cycle > 0.05 && cycle < 0.85) {
+    ctx.fillStyle = 'rgba(120, 110, 95, 0.95)';
+    ctx.fillRect(hookX - w * 0.1, hookY + w * 0.06, w * 0.2, w * 0.09);
+    ctx.strokeStyle = 'rgba(60, 55, 45, 0.9)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(hookX - w * 0.1, hookY + w * 0.06, w * 0.2, w * 0.09);
+  }
 }
 
 /** One-time white flash + expanding ring right after construction finishes. */
@@ -255,7 +283,11 @@ function drawCompletionBurst(
   ctx.stroke();
 }
 
-/** Jagged crack decals, deterministic per building id. */
+/**
+ * Jagged crack decals in three damage tiers, deterministic per building id:
+ * light (>55%) thin hairlines, medium (>30%) wider cracks + spall chips,
+ * heavy deep fissures with scorched patches around them.
+ */
 function drawCracks(
   ctx: CanvasRenderingContext2D,
   id: number,
@@ -263,19 +295,50 @@ function drawCracks(
   y: number,
   w: number,
   h: number,
+  ratio: number,
 ): void {
-  ctx.strokeStyle = 'rgba(15, 12, 8, 0.55)';
-  ctx.lineWidth = 1;
-  for (let i = 0; i < 3; i++) {
+  const tier = ratio < 0.3 ? 2 : ratio < 0.55 ? 1 : 0;
+  const cracks = 2 + tier * 2;
+  const segs = 3 + tier;
+  // Heavy tier: charred spall patches behind the fissures.
+  if (tier === 2) {
+    ctx.fillStyle = 'rgba(20, 16, 12, 0.35)';
+    for (let i = 0; i < 2; i++) {
+      const seed = id * 23 + i * 11;
+      ctx.beginPath();
+      ctx.ellipse(
+        x + w * hash(seed),
+        y + h * hash(seed + 1),
+        w * (0.1 + hash(seed + 2) * 0.1),
+        h * (0.08 + hash(seed + 3) * 0.08),
+        hash(seed + 4) * Math.PI,
+        0,
+        Math.PI * 2,
+      );
+      ctx.fill();
+    }
+  }
+  for (let i = 0; i < cracks; i++) {
     const seed = id * 17 + i * 7;
     let px = x + w * hash(seed);
     let py = y + h * hash(seed + 1);
+    ctx.strokeStyle = `rgba(15, 12, 8, ${0.45 + tier * 0.15})`;
+    ctx.lineWidth = 1 + tier * 0.5;
     ctx.beginPath();
     ctx.moveTo(px, py);
-    for (let s = 0; s < 3; s++) {
+    for (let s = 0; s < segs; s++) {
       px += (hash(seed + 2 + s * 2) - 0.5) * w * 0.4;
       py += (hash(seed + 3 + s * 2) - 0.2) * h * 0.3;
       ctx.lineTo(px, py);
+      // Medium/heavy: short branch fork off each segment.
+      if (tier > 0 && hash(seed + 20 + s) < 0.4) {
+        ctx.moveTo(px, py);
+        ctx.lineTo(
+          px + (hash(seed + 30 + s) - 0.5) * w * 0.15,
+          py + (hash(seed + 40 + s) - 0.3) * h * 0.12,
+        );
+        ctx.moveTo(px, py);
+      }
     }
     ctx.stroke();
   }
@@ -309,7 +372,10 @@ function drawFlames(
   }
 }
 
-/** Lit window grid; dark under low power, flickering when damaged. */
+/**
+ * Lit window grid. Powered: warm steady light, sputtering when damaged.
+ * Low power: panes go dark slate with an occasional dim brown-out flutter.
+ */
 function drawWindows(
   ctx: CanvasRenderingContext2D,
   id: number,
@@ -317,8 +383,8 @@ function drawWindows(
   y: number,
   w: number,
   h: number,
-  lit: boolean,
-  flicker: boolean,
+  powered: boolean,
+  damaged: boolean,
   now: number,
 ): void {
   const cols = Math.max(2, Math.floor(w / (14 * Math.max(0.5, w / 64))));
@@ -329,9 +395,20 @@ function drawWindows(
     for (let c = 0; c < cols; c++) {
       const wx = x + cw * c + cw * 0.25;
       const wy = y + ch * (r + 0.6);
-      let alpha = lit ? 0.75 : 0.12;
-      if (flicker && lit) alpha *= 0.3 + hash(id * 29 + r * 7 + c + Math.floor(now * 7)) * 0.7;
-      ctx.fillStyle = lit ? `rgba(255, 220, 120, ${alpha})` : `rgba(40, 45, 50, ${0.5 + alpha})`;
+      const paneSeed = id * 29 + r * 7 + c;
+      if (powered) {
+        let alpha = 0.75;
+        if (damaged) alpha *= 0.3 + hash(paneSeed + Math.floor(now * 7)) * 0.7;
+        ctx.fillStyle = `rgba(255, 220, 120, ${alpha})`;
+      } else {
+        // Brown-out flutter: rare panes briefly sputter dim amber.
+        const sputter = hash(paneSeed + Math.floor(now * 3));
+        if (sputter < 0.07) {
+          ctx.fillStyle = `rgba(255, 200, 100, ${0.25 + sputter * 2})`;
+        } else {
+          ctx.fillStyle = 'rgba(40, 45, 50, 0.65)';
+        }
+      }
       ctx.fillRect(wx, wy, cw * 0.5, ch * 0.45);
     }
   }
@@ -505,7 +582,7 @@ export function drawBuildings(
       ctx.fillRect(s.x, s.y, w, h * (1 - pct));
       drawScaffold(ctx, s.x, s.y, w, h, Math.max(3, 4 * cam.zoom));
       drawProgressRing(ctx, s.x + w / 2, s.y + h / 2, Math.min(w, h) * 0.3, pct);
-      drawCrane(ctx, s.x, s.y, w, now, b.id);
+      drawCrane(ctx, s.x, s.y, w, now, b.id, pct);
     } else if (collapsing && finishT !== undefined) {
       // One short snap: scaffold pulls in + a fading white flash.
       const t = (now - finishT) / COLLAPSE_T;
@@ -531,12 +608,13 @@ export function drawBuildings(
     }
 
     if (b.kind === 'turret' && b.done) {
-      const recoil = b.cooldownMax > 0 ? Math.max(0, Math.min(1, b.cooldown / b.cooldownMax)) : 0;
+      const raw = b.cooldownMax > 0 ? Math.max(0, Math.min(1, b.cooldown / b.cooldownMax)) : 0;
+      const recoil = raw * raw; // spring back fast, settle slow
       drawTurret(ctx, s.x + w / 2, s.y + h / 2, Math.min(w, h) * 0.42, aimAngle(b, dt), b.team === 'enemy', recoil);
     }
 
     if (b.done && b.hp > 0) {
-      if (ratio < 0.7) drawCracks(ctx, b.id, s.x, s.y, w, h);
+      if (ratio < 0.85) drawCracks(ctx, b.id, s.x, s.y, w, h, ratio);
       if (ratio < 0.4) drawDamage(ctx, b, s.x, s.y, w, h, ratio, now);
       if (ratio < 0.15) drawFlames(ctx, b.id, s.x, s.y, w, h, now);
     }
