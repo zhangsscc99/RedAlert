@@ -30,7 +30,23 @@ export interface VoicePart {
   gain: number;
   /** Envelope attack seconds. */
   attack: number;
+  /** Detune in cents applied to every oscillator (rout-layer drift). */
+  detune?: number;
   notes: NoteEvent[];
+}
+
+/**
+ * Adaptive arrangement stems blended by combat intensity. 'base' stems
+ * always play at full weight; 'calm'/'combat'/'rout' fade with intensity.
+ */
+export type MusicLayer = 'base' | 'calm' | 'combat' | 'rout';
+
+export interface LayerDef {
+  layer: MusicLayer;
+  /** Optional lowpass cutoff (Hz) muffling the whole stem. */
+  lpFreq?: number;
+  parts: VoicePart[];
+  perc: PercEvent[];
 }
 
 export interface TrackDef {
@@ -39,6 +55,8 @@ export interface TrackDef {
   bars: number;
   parts: VoicePart[];
   perc: PercEvent[];
+  /** Adaptive stems; when absent, parts/perc play as an always-on stem. */
+  layers?: LayerDef[];
 }
 
 export interface Music {
@@ -47,6 +65,10 @@ export interface Music {
   setVolume(v: number): void;
   readonly volume: number;
   crossfade(track: MusicTrack, seconds: number): void;
+  /** Combat intensity 0..1, fed per-frame; rebalances stems in place. */
+  setIntensity?(v: number): void;
+  /** Silence the bus without losing the stored volume. */
+  setMuted?(muted: boolean): void;
   dispose(): void;
 }
 
@@ -61,6 +83,31 @@ export function midiToFreq(n: number): number {
 export function trackDuration(track: MusicTrack | TrackDef): number {
   const def = typeof track === 'string' ? TRACKS[track] : track;
   return (def.bars * def.beatsPerBar * 60) / def.bpm;
+}
+
+function smooth01(a: number, b: number, x: number): number {
+  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+}
+
+/**
+ * Stem weights for combat intensity 0..1: 'calm' owns the low end,
+ * 'combat' the middle, 'rout' the top end. Exported for tuning/tests.
+ */
+export function layerWeights(
+  intensity: number,
+): Record<'calm' | 'combat' | 'rout', number> {
+  const x = Math.min(1, Math.max(0, intensity));
+  return {
+    calm: 1 - smooth01(0.25, 0.55, x),
+    combat: smooth01(0.2, 0.45, x) * (1 - smooth01(0.75, 0.95, x)),
+    rout: smooth01(0.7, 0.95, x),
+  };
+}
+
+function layerWeight(name: MusicLayer, intensity: number): number {
+  if (name === 'base') return 1;
+  return layerWeights(intensity)[name];
 }
 
 // --- Pure data tables -------------------------------------------------------
@@ -141,6 +188,52 @@ function percTrack(bars: number): PercEvent[] {
   return evs;
 }
 
+// Driving 16th-note ostinato faded in at combat intensity; the flat-2
+// pickup keeps the Phrygian edge of the battle motif.
+function sixteenthPart(roots: number[], gain: number): VoicePart {
+  const notes: NoteEvent[] = [];
+  const pattern = [0, 7, 0, 12, 0, 7, 1, 7];
+  roots.forEach((root, bar) => {
+    for (let i = 0; i < 16; i++) {
+      notes.push({
+        beat: bar * 4 + i * 0.25,
+        midi: root + 12 + pattern[i % pattern.length],
+        beats: 0.2,
+        vel: i % 4 === 0 ? 0.6 : 0.35,
+      });
+    }
+  });
+  return { wave: 'square', gain, attack: 0.004, notes };
+}
+
+// Rout pad: each chord held for two bars under a slow attack so the whole
+// arrangement reads as slowed down; per-part detune drifts it sour.
+function routPadPart(chords: number[][], detune: number, gain: number): VoicePart {
+  const notes: NoteEvent[] = [];
+  for (let bar = 0; bar < chords.length; bar += 2) {
+    for (const midi of chords[bar]) {
+      notes.push({ beat: bar * 4, midi: midi + 12, beats: 8, vel: 0.5 });
+    }
+  }
+  return { wave: 'sawtooth', gain, attack: 1.8, detune, notes };
+}
+
+// Slow sub pulse under the rout pad: one swollen root note per bar.
+function routPulsePart(roots: number[], gain: number): VoicePart {
+  return {
+    wave: 'sine',
+    gain,
+    attack: 0.5,
+    detune: -12,
+    notes: roots.map((root, bar) => ({
+      beat: bar * 4,
+      midi: root,
+      beats: 3,
+      vel: 0.55,
+    })),
+  };
+}
+
 // Am - F - C - G, two bars each: menu pad is calm and unresolved.
 const MENU_CHORDS: number[][] = [
   [45, 52, 57, 60], // A2 E3 A3 C4
@@ -155,6 +248,19 @@ const MENU_CHORDS: number[][] = [
 
 // E - E - G - A pedal-point roots under a Phrygian-flavored motif.
 const BATTLE_ROOTS = [28, 28, 28, 28, 31, 31, 33, 33]; // E1..A1
+
+// Low three-note beds matching the battle roots: Em, G, A. Calm pads sit
+// right on the roots; rout pads re-voice them an octave up (see routPadPart).
+const BATTLE_BED: number[][] = [
+  [28, 40, 47], // E1 E2 B2
+  [28, 40, 47],
+  [28, 40, 47],
+  [28, 40, 47],
+  [31, 43, 50], // G1 G2 D3
+  [31, 43, 50],
+  [33, 45, 52], // A1 A2 E3
+  [33, 45, 52],
+];
 
 const BATTLE_MOTIF: [number, number, number][] = [
   [0, 64, 0.5], // E4
@@ -183,11 +289,36 @@ export const TRACKS: Record<MusicTrack, TrackDef> = {
     bpm: 132,
     beatsPerBar: 4,
     bars: 8,
-    parts: [
-      bassPart(BATTLE_ROOTS, 0.55),
-      leadPart(BATTLE_MOTIF, 4, 0.4),
+    parts: [],
+    perc: [],
+    // Three adaptive stems on one shared loop clock, crossfaded in place
+    // by combat intensity — the graph is never rebuilt mid-fight.
+    layers: [
+      {
+        layer: 'calm',
+        parts: [padPart(BATTLE_BED, 0.45), arpPart(BATTLE_BED, 0.35)],
+        perc: [],
+      },
+      {
+        layer: 'combat',
+        parts: [
+          bassPart(BATTLE_ROOTS, 0.5),
+          sixteenthPart(BATTLE_ROOTS, 0.28),
+          leadPart(BATTLE_MOTIF, 4, 0.4),
+        ],
+        perc: percTrack(8),
+      },
+      {
+        layer: 'rout',
+        lpFreq: 750,
+        parts: [
+          routPadPart(BATTLE_BED, -28, 0.42),
+          routPadPart(BATTLE_BED, 22, 0.34),
+          routPulsePart(BATTLE_ROOTS, 0.3),
+        ],
+        perc: [],
+      },
     ],
-    perc: percTrack(8),
   },
 };
 
@@ -212,21 +343,36 @@ const TICK_MS = 60;
 export function createMusic(ac: AudioContext): Music {
   let master: GainNode | null = null;
   let volume = 0.25;
+  let muted = false;
+  let intensity = 0;
   let disposed = false;
   let noiseBuf: AudioBuffer | null = null;
 
+  interface Layer {
+    def: LayerDef;
+    /** Gain carrying the stem's intensity weight. */
+    gain: GainNode;
+    /** Input node that note envelopes feed (filter input, or gain). */
+    bus: AudioNode;
+    filter?: BiquadFilterNode;
+  }
   interface Playing {
     track: MusicTrack;
     gain: GainNode;
     timer: ReturnType<typeof setInterval>;
     sources: Set<AudioScheduledSourceNode>;
+    layers: Layer[];
   }
   let current: Playing | null = null;
+
+  function masterTarget(): number {
+    return muted ? 0 : volume;
+  }
 
   function ensureMaster(): GainNode {
     if (!master) {
       master = ac.createGain();
-      master.gain.value = volume;
+      master.gain.value = masterTarget();
       master.connect(ac.destination);
     }
     return master;
@@ -243,26 +389,34 @@ export function createMusic(ac: AudioContext): Music {
     return noiseBuf;
   }
 
-  function scheduleNote(p: Playing, part: VoicePart, ev: NoteEvent, t0: number, spb: number): void {
+  function scheduleNote(
+    p: Playing,
+    layer: Layer,
+    part: VoicePart,
+    ev: NoteEvent,
+    t0: number,
+    spb: number,
+  ): void {
     const dur = ev.beats * spb;
     const peak = part.gain * ev.vel * 0.3;
     const osc = ac.createOscillator();
     osc.type = part.wave;
     osc.frequency.value = midiToFreq(ev.midi);
+    if (part.detune) osc.detune.value = part.detune;
     const g = ac.createGain();
     const a = Math.min(part.attack, dur * 0.5);
     g.gain.setValueAtTime(0, t0);
     g.gain.linearRampToValueAtTime(peak, t0 + a);
     g.gain.setValueAtTime(peak, t0 + Math.max(a, dur - 0.08));
     g.gain.linearRampToValueAtTime(0, t0 + dur);
-    osc.connect(g).connect(p.gain);
+    osc.connect(g).connect(layer.bus);
     osc.start(t0);
     osc.stop(t0 + dur + 0.05);
     p.sources.add(osc);
     osc.onended = () => p.sources.delete(osc);
   }
 
-  function schedulePerc(p: Playing, ev: PercEvent, t0: number): void {
+  function schedulePerc(p: Playing, layer: Layer, ev: PercEvent, t0: number): void {
     const src = ac.createBufferSource();
     src.buffer = getNoise();
     src.loop = true;
@@ -275,11 +429,32 @@ export function createMusic(ac: AudioContext): Music {
     g.gain.setValueAtTime(0, t0);
     g.gain.linearRampToValueAtTime(peak, t0 + 0.005);
     g.gain.linearRampToValueAtTime(0, t0 + ev.dur);
-    src.connect(flt).connect(g).connect(p.gain);
+    src.connect(flt).connect(g).connect(layer.bus);
     src.start(t0);
     src.stop(t0 + ev.dur + 0.05);
     p.sources.add(src);
     src.onended = () => p.sources.delete(src);
+  }
+
+  /** Rout stems also close their lowpass as they fade in. */
+  function layerFilterFreq(lp: number | undefined, w: number): number {
+    if (lp === undefined) return 0;
+    return Math.min(12000, lp * (1 + 5 * (1 - w)));
+  }
+
+  /** Ramp every stem's weight toward the current intensity — in place. */
+  function applyLayers(p: Playing, when: number): void {
+    for (const l of p.layers) {
+      const w = layerWeight(l.def.layer, intensity);
+      l.gain.gain.setTargetAtTime(w, when, 0.25);
+      if (l.filter) {
+        l.filter.frequency.setTargetAtTime(
+          layerFilterFreq(l.def.lpFreq, w),
+          when,
+          0.3,
+        );
+      }
+    }
   }
 
   function startTrack(track: MusicTrack, fadeIn: number): Playing {
@@ -292,17 +467,40 @@ export function createMusic(ac: AudioContext): Music {
     gain.gain.setValueAtTime(0, now);
     gain.gain.linearRampToValueAtTime(1, now + Math.max(0.01, fadeIn));
 
-    const p: Playing = { track, gain, timer: 0 as never, sources: new Set() };
+    // One persistent weight gain per stem; tracks without explicit layers
+    // get a single always-on 'base' stem.
+    const layerDefs: LayerDef[] =
+      def.layers ?? [{ layer: 'base', parts: def.parts, perc: def.perc }];
+    const layers: Layer[] = layerDefs.map((ld) => {
+      const g = ac.createGain();
+      const w = layerWeight(ld.layer, intensity);
+      g.gain.setValueAtTime(w, now);
+      g.connect(gain);
+      let bus: AudioNode = g;
+      let filter: BiquadFilterNode | undefined;
+      if (ld.lpFreq !== undefined) {
+        filter = ac.createBiquadFilter();
+        filter.type = 'lowpass';
+        filter.frequency.value = layerFilterFreq(ld.lpFreq, w);
+        filter.connect(g);
+        bus = filter;
+      }
+      return { def: ld, gain: g, bus, filter };
+    });
+
+    const p: Playing = { track, gain, timer: 0 as never, sources: new Set(), layers };
     // Flatten all events into a beat-sorted schedule.
     interface SchedEv { beat: number; fn: (t0: number) => void }
     const events: SchedEv[] = [];
-    for (const part of def.parts) {
-      for (const ev of part.notes) {
-        events.push({ beat: ev.beat, fn: (t0) => scheduleNote(p, part, ev, t0, spb) });
+    for (const layer of layers) {
+      for (const part of layer.def.parts) {
+        for (const ev of part.notes) {
+          events.push({ beat: ev.beat, fn: (t0) => scheduleNote(p, layer, part, ev, t0, spb) });
+        }
       }
-    }
-    for (const ev of def.perc) {
-      events.push({ beat: ev.beat, fn: (t0) => schedulePerc(p, ev, t0) });
+      for (const ev of layer.def.perc) {
+        events.push({ beat: ev.beat, fn: (t0) => schedulePerc(p, layer, ev, t0) });
+      }
     }
     events.sort((a, b) => a.beat - b.beat);
     const loopBeats = def.bars * def.beatsPerBar;
@@ -370,7 +568,20 @@ export function createMusic(ac: AudioContext): Music {
         const now = ac.currentTime;
         master.gain.cancelScheduledValues(now);
         master.gain.setValueAtTime(master.gain.value, now);
-        master.gain.linearRampToValueAtTime(volume, now + 0.05);
+        master.gain.linearRampToValueAtTime(masterTarget(), now + 0.05);
+      }
+    },
+    setIntensity(v) {
+      const x = Math.min(1, Math.max(0, v));
+      if (Math.abs(x - intensity) < 1e-3) return;
+      intensity = x;
+      if (current) applyLayers(current, ac.currentTime);
+    },
+    setMuted(m) {
+      if (muted === m) return;
+      muted = m;
+      if (master) {
+        master.gain.setTargetAtTime(masterTarget(), ac.currentTime, 0.05);
       }
     },
     crossfade(track, seconds) {
