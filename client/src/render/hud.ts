@@ -1455,6 +1455,122 @@ export function drawOnboardingBar(
   ctx.textBaseline = 'alphabetic';
 }
 
+// ---------------------------------------------------------- mission panel ---
+
+/** One row of the mission objectives panel — rendered per mission objective. */
+export interface MissionObjectiveRow {
+  label: string;
+  done: boolean;
+  /** 0..1 — shown as a thin bar while the objective is unfinished. */
+  progress: number;
+  /** 行尾附加信息：survive 剩余秒数 / capture 驻守倒计时 / destroy 剩余数。 */
+  extra?: string;
+}
+
+/** Everything the panel needs — main.ts translates MissionState. */
+export interface MissionPanelModel {
+  title: string; // 关卡名，e.g. "战役 · 初露锋芒"
+  elapsed: string; // 已用时间，e.g. "T+ 02:15"
+  objectives: readonly MissionObjectiveRow[];
+}
+
+const MP_LINE_H = 24;
+const MP_PAD = 12;
+
+/**
+ * 目标面板锚在右上 T+ 计时器正下方（桌面与移动端统一）：远离左下选中卡、
+ * 底部建造栏与右下角小地图，只与转瞬即逝的进场提示条短暂共边。
+ * 左缘给左上资源面板留 8px —— 窄屏（竖屏手机）上自动收窄而不是叠上去。
+ */
+export function missionPanelLayout(l: HudLayout, rows: number): Rect {
+  const clear = l.resource.x + l.resource.w + 8;
+  const w = Math.min(240, Math.max(48, l.viewW - clear - 12));
+  return {
+    x: l.viewW - w - 12,
+    y: 44,
+    w,
+    h: MP_PAD * 2 + 22 + rows * MP_LINE_H,
+  };
+}
+
+/** fillText capped at maxW — overlong labels ellipsize instead of bleeding. */
+function fitText(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  x: number,
+  y: number,
+  maxW: number,
+): void {
+  if (ctx.measureText(text).width <= maxW) {
+    ctx.fillText(text, x, y);
+    return;
+  }
+  let t = text;
+  while (t.length > 1 && ctx.measureText(`${t}…`).width > maxW) t = t.slice(0, -1);
+  ctx.fillText(`${t}…`, x, y);
+}
+
+/** 战役目标面板：关卡名 + 用时 + 目标清单（✓ 完成 / 进度条 + 行尾信息）。 */
+export function drawMissionPanel(
+  ctx: CanvasRenderingContext2D,
+  l: HudLayout,
+  m: MissionPanelModel,
+): void {
+  if (m.objectives.length === 0) return;
+  const r = missionPanelLayout(l, m.objectives.length);
+  panel(ctx, r.x, r.y, r.w, r.h);
+
+  ctx.textBaseline = 'alphabetic';
+  ctx.font = `bold ${l.font}px ui-monospace, Menlo, Consolas, monospace`;
+  ctx.fillStyle = ACCENT;
+  const elapsedW = ctx.measureText(m.elapsed).width + 8;
+  fitText(ctx, m.title, r.x + MP_PAD, r.y + MP_PAD + 13, r.w - MP_PAD * 2 - elapsedW);
+  ctx.font = `${l.font}px ui-monospace, Menlo, Consolas, monospace`;
+  ctx.fillStyle = TEXT_DIM;
+  ctx.textAlign = 'right';
+  ctx.fillText(m.elapsed, r.x + r.w - MP_PAD, r.y + MP_PAD + 13);
+  ctx.textAlign = 'left';
+
+  m.objectives.forEach((o, i) => {
+    const cy = r.y + MP_PAD + 22 + i * MP_LINE_H;
+    // 复选框：完成打勾，未完成留空方框。
+    const bx = r.x + MP_PAD;
+    const by = cy + 4;
+    ctx.strokeStyle = o.done ? ACCENT : 'rgba(255,255,255,0.35)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(bx + 0.5, by + 0.5, 11, 11);
+    if (o.done) {
+      ctx.strokeStyle = ACCENT;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(bx + 2, by + 6);
+      ctx.lineTo(bx + 5, by + 9);
+      ctx.lineTo(bx + 10, by + 2);
+      ctx.stroke();
+    }
+
+    ctx.font = `${l.font}px ui-monospace, Menlo, Consolas, monospace`;
+    ctx.fillStyle = o.done ? TEXT_DIM : TEXT_MAIN;
+    const tx = bx + 18;
+    // 行尾预留进度条/extra 位，label 收窄省略而不是压到控件上。
+    const reserved = o.done ? 0 : o.extra !== undefined ? 92 : 66;
+    fitText(ctx, o.label, tx, cy + 13, r.x + r.w - MP_PAD - reserved - tx);
+
+    // 行尾：未完成显示 extra / 进度条，完成直接略过。
+    if (!o.done) {
+      const barW = o.extra !== undefined ? 44 : 58;
+      bar(ctx, r.x + r.w - MP_PAD - barW, cy + 9, barW, 5, o.progress, WARN);
+      if (o.extra !== undefined) {
+        ctx.font = `10px ui-monospace, Menlo, Consolas, monospace`;
+        ctx.fillStyle = WARN;
+        ctx.textAlign = 'right';
+        ctx.fillText(o.extra, r.x + r.w - MP_PAD - barW - 6, cy + 13);
+        ctx.textAlign = 'left';
+      }
+    }
+  });
+}
+
 // ----------------------------------------------------------- battle report --
 
 /**

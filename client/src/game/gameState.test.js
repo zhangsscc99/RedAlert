@@ -1377,13 +1377,22 @@ function isLowPower(power) {
 }
 
 // src/game/save.ts
-var SAVE_VERSION = 2;
-var cloneUnit = (u) => ({ id: u.id, kind: u.kind, x: u.x, y: u.y, hp: u.hp });
+var SAVE_VERSION = 3;
+var cloneUnit = (u) => {
+  const c = { id: u.id, kind: u.kind, x: u.x, y: u.y, hp: u.hp };
+  if (u.kills !== void 0) c.kills = u.kills;
+  return c;
+};
 var cloneBuilding = (b) => {
   const c = { id: b.id, kind: b.kind, gx: b.gx, gy: b.gy, hp: b.hp };
   if (b.done !== void 0) c.done = b.done;
+  if (b.level !== void 0) c.level = b.level;
+  if (b.repair !== void 0) c.repair = b.repair;
   return c;
 };
+var cloneStats = (s) => ({ ...s });
+var cloneWeather = (w) => ({ ...w });
+var cloneRadar = (r) => ({ ...r });
 function snapshot(input) {
   const s = {
     version: SAVE_VERSION,
@@ -1398,6 +1407,12 @@ function snapshot(input) {
   if (input.ai) s.ai = { ...input.ai };
   if (input.camera) s.camera = { ...input.camera };
   if (input.opts) s.opts = { ...input.opts };
+  if (input.fog) s.fog = { w: input.fog.w, h: input.fog.h, explored: Array.from(input.fog.explored) };
+  if (input.stats) s.stats = cloneStats(input.stats);
+  if (input.wave !== void 0) s.wave = input.wave;
+  if (input.difficulty !== void 0) s.difficulty = input.difficulty;
+  if (input.weather) s.weather = cloneWeather(input.weather);
+  if (input.radar) s.radar = cloneRadar(input.radar);
   return s;
 }
 
@@ -1686,7 +1701,11 @@ function createGame(seed, opts = {}) {
     enemyStrength: opts.enemyStrength ?? 1,
     waveIntervalScale: opts.waveIntervalScale ?? 1,
     deepAI: opts.deepAI ?? false,
-    aiDifficulty: opts.aiDifficulty ?? "normal"
+    aiDifficulty: opts.aiDifficulty ?? "normal",
+    playerArmy: opts.playerArmy,
+    enemyArmy: opts.enemyArmy,
+    enemyStructures: opts.enemyStructures,
+    manualEnd: opts.manualEnd ?? false
   };
   const map = generateMap(seed);
   const g = {
@@ -1718,8 +1737,12 @@ function createGame(seed, opts = {}) {
   const cy = map.h >> 1;
   const hqSpot = findBuildSpot(map, [], "hq", cx, cy);
   if (hqSpot) addBuilding(g, g.buildings, "hq", hqSpot.x, hqSpot.y, "player", true);
-  for (const t of freeTilesNear(map, g.buildings, cx, cy, o.infantry)) {
-    g.units.push(makeGUnit(g.nextId++, "infantry", t.x, t.y, "player"));
+  if (o.playerArmy) {
+    spawnArmy(g, g.units, o.playerArmy, "player", 1, cx, cy);
+  } else {
+    for (const t of freeTilesNear(map, g.buildings, cx, cy, o.infantry)) {
+      g.units.push(makeGUnit(g.nextId++, "infantry", t.x, t.y, "player"));
+    }
   }
   if (o.enemyBase) {
     const spot = findBuildSpot(map, g.buildings, "hq", g.enemyAnchor.x, g.enemyAnchor.y);
@@ -1728,11 +1751,42 @@ function createGame(seed, opts = {}) {
       g.enemyAnchor = { x: hq.gx + 2, y: hq.gy + BUILDING_DEFS.hq.h };
     }
   }
-  for (const t of freeTilesNear(map, allBuildings(g), g.enemyAnchor.x, g.enemyAnchor.y, o.enemyInfantry)) {
-    g.enemyUnits.push(makeGUnit(g.nextId++, "infantry", t.x, t.y, "enemy", o.enemyStrength));
+  let anchored = o.enemyBase;
+  for (const kind of o.enemyStructures ?? []) {
+    const spot = findBuildSpot(map, allBuildings(g), kind, g.enemyAnchor.x, g.enemyAnchor.y);
+    if (!spot) continue;
+    const b = addBuilding(g, g.enemyBuildings, kind, spot.x, spot.y, "enemy", true);
+    if (!anchored) {
+      g.enemyAnchor = { x: b.gx + (BUILDING_DEFS[kind].w >> 1), y: b.gy + BUILDING_DEFS[kind].h };
+      anchored = true;
+    }
+  }
+  if (o.enemyArmy) {
+    spawnArmy(g, g.enemyUnits, o.enemyArmy, "enemy", o.enemyStrength, g.enemyAnchor.x, g.enemyAnchor.y);
+  } else {
+    for (const t of freeTilesNear(map, allBuildings(g), g.enemyAnchor.x, g.enemyAnchor.y, o.enemyInfantry)) {
+      g.enemyUnits.push(makeGUnit(g.nextId++, "infantry", t.x, t.y, "enemy", o.enemyStrength));
+    }
   }
   g.ai.army = g.enemyUnits.length;
   return g;
+}
+function spawnArmy(g, list, spec, team, strength, cx, cy) {
+  const total = spec.reduce((n, s) => n + Math.max(0, s.count), 0);
+  const tiles = freeTilesNear(g.map, allBuildings(g), cx, cy, total, 24);
+  let i = 0;
+  for (const s of spec) {
+    for (let k = 0; k < s.count; k++) {
+      const t = tiles[i++];
+      if (!t) return;
+      const u = makeGUnit(g.nextId++, s.kind, t.x, t.y, team, team === "enemy" ? strength : 1);
+      if (s.tag !== void 0) u.tag = s.tag;
+      list.push(u);
+      if (s.kind === "harvester" && s.tag === void 0 && team === "player") {
+        g.harvesters.push(createHarvester(u));
+      }
+    }
+  }
 }
 function buildAt(g, kind, gx, gy) {
   if (g.phase !== "playing") return { ok: false, reason: "ended" };
@@ -2007,8 +2061,10 @@ function tickGame(g, dt) {
     const aliveB = new Set(g.buildings.map((b) => b.id));
     g.upgradeJobs = g.upgradeJobs.filter((j) => aliveB.has(j.buildingId));
   }
-  if (!g.buildings.some((b) => b.kind === "hq")) g.phase = "lost";
-  else if (g.enemyUnits.length === 0 && g.enemyBuildings.length === 0) g.phase = "won";
+  if (!g.opts.manualEnd) {
+    if (!g.buildings.some((b) => b.kind === "hq")) g.phase = "lost";
+    else if (g.enemyUnits.length === 0 && g.enemyBuildings.length === 0) g.phase = "won";
+  }
   return ev;
 }
 var savedUnit = (u) => ({ id: u.id, kind: u.kind, x: u.x, y: u.y, hp: u.hp });

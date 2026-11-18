@@ -4,6 +4,7 @@
 import "./balance.test.js";
 import "./buildings.test.js";
 import "./camera.test.js";
+import "./campaign.test.js";
 import "./combat.test.js";
 import "./commands.test.js";
 import "./economy.test.js";

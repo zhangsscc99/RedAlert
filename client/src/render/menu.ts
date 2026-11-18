@@ -7,7 +7,7 @@ import type { Rect } from '../game/index.ts';
 
 // ------------------------------------------------------------ geometry ----
 
-export type MenuButton = 'start' | 'continue' | 'settings';
+export type MenuButton = 'start' | 'campaign' | 'continue' | 'settings';
 export type MenuHit =
   | { kind: 'button'; id: MenuButton }
   | { kind: 'difficulty'; difficulty: Difficulty };
@@ -19,6 +19,8 @@ export interface MenuLayout {
   subtitleY: number;
   /** Difficulty toggle row, in easy/normal/hard order. */
   difficulty: { d: Difficulty; rect: Rect }[];
+  /** 战役入口：与「遭遇战」(start) 并列第一行的右半格。 */
+  campaign: Rect;
   buttons: { id: MenuButton; rect: Rect }[];
 }
 
@@ -57,6 +59,8 @@ export function menuLayout(viewW: number, viewH: number): MenuLayout {
   const top = Math.round(viewH * 0.44);
   const y0 = top + DIFF_H + 22;
   const ids: MenuButton[] = ['start', 'continue', 'settings'];
+  // 「战役」与「遭遇战」并列第一行：start 占左半，campaign 占右半。
+  const half = (bw - DIFF_GAP) / 2;
   return {
     titleY: Math.round(viewH * 0.24),
     subtitleY: Math.round(viewH * 0.24) + 30,
@@ -64,9 +68,13 @@ export function menuLayout(viewW: number, viewH: number): MenuLayout {
       d,
       rect: { x: cx - bw / 2 + i * (dw + DIFF_GAP), y: top, w: dw, h: DIFF_H },
     })),
+    campaign: { x: cx - bw / 2 + half + DIFF_GAP, y: y0, w: half, h: bh },
     buttons: ids.map((id, i) => ({
       id,
-      rect: { x: cx - bw / 2, y: y0 + i * (bh + BTN_GAP), w: bw, h: bh },
+      rect:
+        id === 'start'
+          ? { x: cx - bw / 2, y: y0, w: half, h: bh }
+          : { x: cx - bw / 2, y: y0 + i * (bh + BTN_GAP), w: bw, h: bh },
     })),
   };
 }
@@ -75,6 +83,7 @@ export function menuHit(l: MenuLayout, x: number, y: number): MenuHit | null {
   for (const b of l.buttons) {
     if (inRect(b.rect, x, y)) return { kind: 'button', id: b.id };
   }
+  if (inRect(l.campaign, x, y)) return { kind: 'button', id: 'campaign' };
   for (const d of l.difficulty) {
     if (inRect(d.rect, x, y)) return { kind: 'difficulty', difficulty: d.d };
   }
@@ -135,7 +144,8 @@ const BAD = '#ff6b5e';
 const FONT = 'ui-monospace, Menlo, Consolas, monospace';
 
 const MENU_BUTTON_LABEL: Record<MenuButton, string> = {
-  start: '开始战役',
+  start: '遭遇战',
+  campaign: '战役',
   continue: '继续',
   settings: '设置',
 };
@@ -225,6 +235,9 @@ export function drawMenu(
       hover: !disabled && sameHit(state.hover, { kind: 'button', id: b.id }),
     });
   }
+  button(ctx, l.campaign, MENU_BUTTON_LABEL.campaign, {
+    hover: sameHit(state.hover, { kind: 'button', id: 'campaign' }),
+  });
 
   ctx.font = `12px ${FONT}`;
   ctx.fillStyle = TEXT_DIM;

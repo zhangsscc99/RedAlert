@@ -148,6 +148,7 @@ import {
   drawHud,
   drawMessages,
   drawMinimap,
+  drawMissionPanel,
   drawOnboardingBar,
   drawSelectBox,
   drawSelectionCard,
@@ -156,6 +157,7 @@ import {
   drawTouchMenu,
   guideHit,
   minimapToWorld,
+  missionPanelLayout,
   onboardingBarLayout,
   onboardingSkipHit,
   pushMessage,
@@ -171,6 +173,8 @@ import {
   type HudLayout,
   type HudMessage,
   type MenuCmd,
+  type MissionObjectiveRow,
+  type MissionPanelModel,
   type ProductionItem,
   type TouchMenu,
 } from './render/hud.js';
@@ -185,6 +189,36 @@ import {
   settingsHit,
   settingsLayout,
 } from './render/menu.js';
+import {
+  campaignHit,
+  campaignLayout,
+  drawCampaign,
+  drawMissionEnd,
+  missionEndHit,
+  missionEndLayout,
+  type CampaignModel,
+} from './render/campaign.js';
+import {
+  MISSIONS,
+  createMissionState,
+  rateMission,
+  updateMission,
+  type MissionReport,
+  type MissionState,
+  type ObjectiveState,
+  type Stars,
+} from './game/missions.js';
+import {
+  bestStars,
+  isUnlocked,
+  loadProgress,
+  missionCtx,
+  missionFailText,
+  missionGameOpts,
+  nextMissionIndex,
+  recordWin,
+  saveProgress,
+} from './game/campaign.js';
 import { createGestureRecognizer, type Gesture } from './input/gestures.js';
 import { createSfx } from './audio/sfx.js';
 import { createMusic, type Music, type MusicTrack } from './audio/music.js';
@@ -209,7 +243,7 @@ let fogT = 0;
 
 // --------------------------------------------------------- shell state ----
 
-type Screen = 'menu' | 'settings' | 'playing';
+type Screen = 'menu' | 'settings' | 'campaign' | 'playing';
 let screen: Screen = 'menu';
 const settings = loadSettings();
 let difficulty: Difficulty = settings.difficulty;
@@ -346,6 +380,20 @@ const ONBOARD_KEY = 'ra.onboarded';
 /** Throttle for the "repair paused — no funds" warning. */
 let repairBrokeWarnT = -1e9;
 
+// ------------------------------------------------ wired modules (F801) ----
+
+/**
+ * 战役：active mission 的 MissionState；null = 遭遇战（行为完全不变）。
+ * manualEnd 让 phase 由 updateMission 的目标判定接管。
+ */
+let mission: MissionState | null = null;
+let missionIdx = -1;
+/** Latest updateMission snapshot — drives the HUD objectives panel. */
+let missionReport: MissionReport | null = null;
+let missionT = 0; // 0.2s throttle accumulator for updateMission
+let missionStars: Stars = 0; // rateMission result shown on the mission-end screen
+const MISSION_TICK = 0.2;
+
 const BUILDING_LABEL: Record<BuildingKind, string> = {
   hq: '指挥部',
   barracks: '兵营',
@@ -399,6 +447,8 @@ interface RaDebug {
   readonly guideStep: number;
   readonly screen: Screen;
   readonly touchMenu: TouchMenu | null;
+  readonly game: GameState;
+  readonly mission: MissionState | null;
 }
 
 declare global {
@@ -431,6 +481,12 @@ window.__raDebug = {
   },
   get touchMenu() {
     return touchMenu;
+  },
+  get game() {
+    return game;
+  },
+  get mission() {
+    return mission;
   },
 };
 
@@ -466,7 +522,8 @@ function storage(): SlotStorage | null {
 /** Archive the live match into the session slot. Never throws. */
 function persist(): void {
   const s = storage();
-  if (!s || game.phase !== 'playing') return;
+  // 战役对局不写遭遇战存档槽 —— restoreGame 还原不出 MissionState。
+  if (!s || game.phase !== 'playing' || mission) return;
   try {
     saveSlot(s, activeSlot, snapshotGame(game, camera), { phase: game.phase });
   } catch {
@@ -516,6 +573,11 @@ function applyGame(g: GameState): void {
   sellRefunded = 0;
   repairBrokeWarnT = -1e9;
   onboarding = null;
+  mission = null;
+  missionIdx = -1;
+  missionReport = null;
+  missionT = 0;
+  missionStars = 0;
   refreshFog();
 }
 
@@ -607,6 +669,131 @@ function continueGame(): void {
   if (guideStep < 0) showHint();
 }
 
+// ------------------------------------------------------------- campaign ---
+
+/** mm:ss clock for the objectives panel and the debrief lines. */
+function fmtClock(t: number): string {
+  const s = Math.max(0, Math.floor(t));
+  return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+}
+
+/** Start mission `index`. applyGame resets per-match UI — rebind mission after. */
+function startMission(index: number): void {
+  const def = MISSIONS[index];
+  if (!def) return;
+  applyGame(createGame(MAP_SEED, missionGameOpts(def)));
+  mission = createMissionState(def);
+  missionIdx = index;
+  recenterCamera();
+  screen = 'playing';
+  if (guideStep < 0) showHint();
+}
+
+/** Card data for the campaign screen; progress re-read so refresh is current. */
+function campaignModel(): CampaignModel {
+  const p = loadProgress(storage());
+  return {
+    missions: MISSIONS.map((def, index) => ({
+      index,
+      name: def.name,
+      briefing: def.briefing,
+      objective: `目标：${def.objectives.map((o) => o.label).join('；')}`,
+      unlocked: isUnlocked(p, index),
+      stars: bestStars(p, def.id),
+    })),
+    cleared: p.cleared.length,
+    totalStars: MISSIONS.reduce((n, def) => n + bestStars(p, def.id), 0),
+    hover: campaignHit(campaignLayout(viewW, viewH, MISSIONS.length), mouse.x, mouse.y),
+  };
+}
+
+function onCampaignTap(p: Point): void {
+  const hit = campaignHit(campaignLayout(viewW, viewH, MISSIONS.length), p.x, p.y);
+  if (!hit) return;
+  if (hit.kind === 'back') {
+    screen = 'menu';
+    return;
+  }
+  // 未解锁关卡置灰不可点 —— 必须先通关上一关。
+  if (!isUnlocked(loadProgress(storage()), hit.index)) return;
+  startMission(hit.index);
+}
+
+/** The debrief offers 下一关 only after winning a non-final mission. */
+function missionHasNext(): boolean {
+  return mission?.status === 'won' && missionIdx + 1 < MISSIONS.length;
+}
+
+/** Rate the win, merge + persist campaign progress, freeze the match. */
+function endMission(): void {
+  if (!mission) return;
+  const won = mission.status === 'won';
+  if (won) {
+    missionStars = rateMission(mission, {
+      elapsed: game.elapsed,
+      unitsLost: stats.unitsLost,
+    });
+    const s = storage();
+    saveProgress(s, recordWin(loadProgress(s), mission.def.id, missionStars));
+  }
+  game.phase = won ? 'won' : 'lost';
+}
+
+function onMissionEndTap(p: Point): void {
+  const hit = missionEndHit(missionEndLayout(viewW, viewH, missionHasNext()), p.x, p.y);
+  if (hit === 'next' && missionHasNext()) startMission(missionIdx + 1);
+  else if (hit === 'retry') startMission(missionIdx);
+  else if (hit === 'menu') screen = 'menu';
+}
+
+/** Row-tail info: survive countdown / capture hold-left / destroy remaining. */
+function objectiveExtra(o: ObjectiveState): string | undefined {
+  switch (o.def.kind) {
+    case 'survive':
+      return `${Math.max(0, Math.ceil(o.def.seconds - o.t))}s`;
+    case 'capture': {
+      const hold = o.def.hold ?? 0;
+      return hold > 0 && o.t > 0 ? `${Math.max(0, Math.ceil(hold - o.t))}s` : undefined;
+    }
+    case 'destroy': {
+      const left =
+        (o.def.target !== 'buildings' ? game.enemyUnits.length : 0) +
+        (o.def.target !== 'units' ? game.enemyBuildings.length : 0);
+      return `余 ${left}`;
+    }
+    default:
+      return undefined; // escort: the progress bar speaks for itself
+  }
+}
+
+function missionPanelModel(): MissionPanelModel {
+  const m = mission!;
+  return {
+    title: `战役 · ${m.def.name}`,
+    elapsed: `T+ ${fmtClock(m.elapsed)}`,
+    objectives: m.objectives.map(
+      (o): MissionObjectiveRow => ({
+        label: o.def.label,
+        done: o.done,
+        progress: o.progress,
+        extra: o.done ? undefined : objectiveExtra(o),
+      }),
+    ),
+  };
+}
+
+/** 目标面板是只读 HUD —— 落在其上的点击不穿透给世界拾取/右键移动。 */
+function missionPanelHit(p: Point): boolean {
+  if (!mission) return false;
+  const r = missionPanelLayout(hudLayout(), mission.objectives.length);
+  return pointInRect(p, r);
+}
+
+/** buildable 白名单只约束战役；遭遇战（mission=null）全放行。 */
+function missionAllows(kind: BuildingKind): boolean {
+  return !mission || mission.def.buildable.includes(kind);
+}
+
 function onMenuTap(p: Point): void {
   const hit = menuHit(menuLayout(viewW, viewH), p.x, p.y);
   if (!hit) return;
@@ -619,6 +806,9 @@ function onMenuTap(p: Point): void {
   switch (hit.id) {
     case 'start':
       startGame();
+      break;
+    case 'campaign':
+      screen = 'campaign';
       break;
     case 'continue':
       continueGame();
@@ -644,6 +834,10 @@ function onSettingsTap(p: Point): void {
 }
 
 function onGameOverTap(p: Point): void {
+  if (mission) {
+    onMissionEndTap(p);
+    return;
+  }
   const hit = gameoverHit(gameoverLayout(viewW, viewH), p.x, p.y);
   if (hit === 'retry') startGame();
   else if (hit === 'menu') screen = 'menu';
@@ -675,7 +869,14 @@ function barItems(): BuildBarItem[] {
   const credits = game.economy.credits;
   return BAR_DEFS.map((d) => {
     const isUnit = UNIT_KINDS.includes(d.kind);
-    const reason = isUnit && !rax ? '需要兵营' : credits < d.cost ? '资金不足' : undefined;
+    const reason =
+      isUnit && !rax
+        ? '需要兵营'
+        : !isUnit && !missionAllows(d.kind as BuildingKind)
+          ? '本关不可用'
+          : credits < d.cost
+            ? '资金不足'
+            : undefined;
     return {
       id: d.id,
       label: d.label,
@@ -1033,6 +1234,8 @@ function onTap(p: Point): void {
     return;
   }
 
+  if (missionPanelHit(p)) return; // 目标面板是只读 HUD，不吞世界命令
+
   const bi = buildBarHit(lay, BAR_DEFS.length, p.x, p.y);
   if (bi >= 0) {
     activateBarItem(bi);
@@ -1092,6 +1295,7 @@ function handleGesture(g: Gesture): void {
     const p = { x: g.x, y: g.y };
     if (screen === 'menu') onMenuTap(p);
     else if (screen === 'settings') onSettingsTap(p);
+    else if (screen === 'campaign') onCampaignTap(p);
     else if (game.phase !== 'playing') onGameOverTap(p);
     else onTap(p);
     return;
@@ -1360,8 +1564,18 @@ canvas.addEventListener('pointerdown', (e) => {
     if (e.button === 0) onSettingsTap(p);
     return;
   }
+  if (screen === 'campaign') {
+    if (e.button === 0) onCampaignTap(p);
+    return;
+  }
   if (game.phase !== 'playing') {
     if (e.button === 0) onGameOverTap(p);
+    return;
+  }
+
+  // 战役目标面板只读 —— 其上的点击不进入框选/右键移动。
+  if (missionPanelHit(p)) {
+    dragMode = 'none';
     return;
   }
 
@@ -1601,16 +1815,15 @@ function dispatchAction(id: string, e: KeyboardEvent): void {
     pushMessage(msgs, `${entry.label}: ${entry.reason ?? '无法执行'}`);
     return;
   }
+  if (id.startsWith('build.')) {
+    const kind = id.slice('build.'.length) as BuildingKind;
+    if (kind in BUILDING_DEFS) {
+      if (missionAllows(kind)) pendingBuild = kind;
+      else pushMessage(msgs, `${BUILDING_LABEL[kind]}：本关不可用`);
+    }
+    return;
+  }
   switch (id) {
-    case 'build.barracks':
-      pendingBuild = 'barracks';
-      break;
-    case 'build.refinery':
-      pendingBuild = 'refinery';
-      break;
-    case 'build.turret':
-      pendingBuild = 'turret';
-      break;
     case 'train.infantry':
       tryTrain('infantry');
       break;
@@ -1641,7 +1854,23 @@ window.addEventListener('keydown', (e) => {
     }
     return;
   }
+  if (screen === 'campaign') {
+    if (k === 'escape') {
+      screen = 'menu';
+      e.preventDefault();
+    } else if (k === 'enter') {
+      // Enter starts the first unlocked-but-uncleared mission.
+      startMission(nextMissionIndex(loadProgress(storage())));
+    }
+    return;
+  }
   if (game.phase !== 'playing') {
+    if (mission) {
+      if (k === 'enter' && missionHasNext()) startMission(missionIdx + 1);
+      else if (k === 'enter' || k === 'r') startMission(missionIdx);
+      else if (k === 'escape') screen = 'menu';
+      return;
+    }
     if (k === 'enter' || k === 'r') startGame();
     else if (k === 'escape') screen = 'menu';
     return;
@@ -1790,6 +2019,31 @@ function drawPaused(): void {
 
 function drawBanner(): void {
   if (game.phase === 'playing') return;
+  if (mission) {
+    const won = mission.status === 'won';
+    const lines = won
+      ? [
+          `第 ${missionIdx + 1} 关 · ${mission.def.name}`,
+          `用时 ${fmtClock(mission.elapsed)} · 损失 ${stats.unitsLost}`,
+        ]
+      : [
+          `第 ${missionIdx + 1} 关 · ${mission.def.name}`,
+          missionFailText(mission.failReason),
+        ];
+    drawMissionEnd(ctx, viewW, viewH, {
+      won,
+      heading: won ? '任务完成' : '任务失败',
+      lines,
+      stars: missionStars,
+      hasNext: missionHasNext(),
+      hover: missionEndHit(
+        missionEndLayout(viewW, viewH, missionHasNext()),
+        mouse.x,
+        mouse.y,
+      ),
+    });
+    return;
+  }
   const hover = gameoverHit(gameoverLayout(viewW, viewH), mouse.x, mouse.y);
   drawGameOver(ctx, viewW, viewH, game.phase, hover);
   drawBattleReport(ctx, viewW, viewH, reportCard);
@@ -1861,6 +2115,8 @@ function frame(now: number): void {
         continueLabel: info.label,
         hover: menuHit(menuLayout(viewW, viewH), mouse.x, mouse.y),
       });
+    } else if (screen === 'campaign') {
+      drawCampaign(ctx, viewW, viewH, campaignModel());
     } else {
       drawSettings(ctx, viewW, viewH, {
         mute: settings.mute,
@@ -1950,31 +2206,45 @@ function frame(now: number): void {
       fogT %= FOG_REFRESH;
       refreshFog();
     }
+    // 战役目标推进：0.2s 节流，胜负由 updateMission 判定（manualEnd 模式
+    // 下 tickGame 不再接管 phase）。
+    if (mission) {
+      missionT += gameDt;
+      if (missionT >= MISSION_TICK) {
+        const step = missionT;
+        missionT = 0;
+        missionReport = updateMission(mission, missionCtx(game), step);
+        if (missionReport.status !== 'active') endMission();
+      }
+    }
   }
   if (game.phase !== prevPhase) {
     if (game.phase !== 'playing') {
       sfx.play(game.phase === 'won' ? 'fanfare' : 'defeat');
-      // 战报：结算本局、合并历史最佳并落盘，遮罩渲染 stats 的文本块。
-      record(stats, {
-        type: 'gameOver',
-        victory: game.phase === 'won',
-        elapsed: game.elapsed,
-      });
-      const store = storage();
-      const prevBest = store ? loadBest(store) : defaultBest();
-      statsBest = mergeBest(prevBest, summary(stats));
-      if (store) {
-        try {
-          saveBest(store, statsBest);
-        } catch {
-          /* storage may be unavailable */
+      // 遭遇战才记战报/历史最佳；战役结果走 recordWin 星评，互不污染。
+      if (!mission) {
+        // 战报：结算本局、合并历史最佳并落盘，遮罩渲染 stats 的文本块。
+        record(stats, {
+          type: 'gameOver',
+          victory: game.phase === 'won',
+          elapsed: game.elapsed,
+        });
+        const store = storage();
+        const prevBest = store ? loadBest(store) : defaultBest();
+        statsBest = mergeBest(prevBest, summary(stats));
+        if (store) {
+          try {
+            saveBest(store, statsBest);
+          } catch {
+            /* storage may be unavailable */
+          }
         }
+        reportCard = [
+          ...reportLines(stats),
+          ...(statsBest.score > prevBest.score && statsBest.score > 0 ? ['★ 新纪录！'] : []),
+          ...bestLines(statsBest),
+        ];
       }
-      reportCard = [
-        ...reportLines(stats),
-        ...(statsBest.score > prevBest.score && statsBest.score > 0 ? ['★ 新纪录！'] : []),
-        ...bestLines(statsBest),
-      ];
       selectedBuilding = null;
     }
     prevPhase = game.phase;
@@ -2045,6 +2315,7 @@ function frame(now: number): void {
   );
   drawBuildBar(ctx, lay, barItems(), pressedBuild);
   drawTimer();
+  if (mission) drawMissionPanel(ctx, lay, missionPanelModel());
   drawMessages(ctx, msgs, lay);
   drawSelectionCard(ctx, game.units, lay);
   if (selectedBuilding && game.phase === 'playing') {
