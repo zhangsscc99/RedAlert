@@ -12,6 +12,7 @@ import {
   buildingAt,
   buildingSource,
   canBuildAt,
+  cancelOrder,
   clampToMap,
   commandMove,
   createCamera,
@@ -23,10 +24,13 @@ import {
   findPath,
   guard,
   isExplored,
+  missingTrainRequirements,
   normRect,
   panBy,
   pointInRect,
+  productionRate,
   screenToWorld,
+  setRally,
   selectGroup,
   selectUnits,
   SIGHT_RADIUS,
@@ -160,6 +164,7 @@ import {
   missionPanelLayout,
   onboardingBarLayout,
   onboardingSkipHit,
+  productionOrderAt,
   pushMessage,
   TOUCH_GUIDE_STEPS,
   touchGuideLayout,
@@ -175,7 +180,7 @@ import {
   type MenuCmd,
   type MissionObjectiveRow,
   type MissionPanelModel,
-  type ProductionItem,
+  type ProdLane,
   type TouchMenu,
 } from './render/hud.js';
 import {
@@ -491,14 +496,14 @@ window.__raDebug = {
 };
 
 function hudLayout(): HudLayout {
-  const prod = productionItems();
+  const prod = productionLanes();
   return computeHudLayout(viewW, viewH, {
     isTouch,
     minimapCollapsed,
     buildBarOpen,
     fullscreen: fullscreenOK,
     hasSelection: selectedIds().size > 0 || selectedBuilding !== null,
-    prodCount: prod.length,
+    prodLanes: prod.map((l) => l.orders.length),
   });
 }
 
@@ -865,13 +870,13 @@ const BAR_DEFS: BarDef[] = [
 const UNIT_KINDS: readonly string[] = ['infantry', 'tank', 'harvester'];
 
 function barItems(): BuildBarItem[] {
-  const rax = game.buildings.some((b) => b.kind === 'barracks' && b.done);
   const credits = game.economy.credits;
   return BAR_DEFS.map((d) => {
     const isUnit = UNIT_KINDS.includes(d.kind);
+    const missing = isUnit ? missingTrainRequirements(game, d.kind as UnitKind) : [];
     const reason =
-      isUnit && !rax
-        ? '需要兵营'
+      missing.length > 0
+        ? requireReason(missing)
         : !isUnit && !missionAllows(d.kind as BuildingKind)
           ? '本关不可用'
           : credits < d.cost
@@ -1251,6 +1256,14 @@ function onTap(p: Point): void {
     }
   }
 
+  // 生产面板行：点击取消该订单（按进度退款）。
+  const qi = productionOrderAt(lay, productionLanes(), p.x, p.y);
+  if (qi !== null) {
+    const r = cancelOrder(game, qi);
+    pushMessage(msgs, r.ok ? `已取消（返还 $${r.refund}）` : '无法取消');
+    return;
+  }
+
   const mm = minimapToWorld(map, lay, p.x, p.y);
   if (mm) {
     camera.x = mm.x - viewW / camera.zoom / 2;
@@ -1511,7 +1524,16 @@ function failText(reason: string): string {
 
 function tryTrain(kind: UnitKind): void {
   const r = trainUnit(game, kind);
-  pushMessage(msgs, r.ok ? `${kind} 已入队` : failText(r.ok ? '' : r.reason));
+  if (r.ok) {
+    pushMessage(msgs, `${BAR_DEFS.find((d) => d.kind === kind)?.label ?? kind} 已入队`);
+    return;
+  }
+  pushMessage(
+    msgs,
+    r.reason === 'requires' && r.missing?.length
+      ? requireReason(r.missing)
+      : failText(r.reason),
+  );
 }
 
 /** Shared by the mouse placement path and touch tap: charge + drop + sfx. */
@@ -1608,6 +1630,14 @@ canvas.addEventListener('pointerdown', (e) => {
         dragMode = 'none';
         return;
       }
+    }
+    // Production panel rows cancel their order (progress-scaled refund).
+    const qi = productionOrderAt(lay, productionLanes(), p.x, p.y);
+    if (qi !== null) {
+      const r = cancelOrder(game, qi);
+      pushMessage(msgs, r.ok ? `已取消（返还 $${r.refund}）` : '无法取消');
+      dragMode = 'none';
+      return;
     }
   }
 
@@ -1718,10 +1748,23 @@ canvas.addEventListener('pointerup', (e) => {
     }
   } else if (dragMode === 'maybeOrder') {
     const w = screenToWorld(camera, p.x, p.y);
-    // Right-click a visible enemy to focus fire; empty ground stays "move".
-    const target = enemyTargetAt(w);
-    if (target) issueAttack(target);
-    else issueMove(w);
+    if (selectedBuilding?.kind === 'barracks' && selectedBuilding.done) {
+      // Selected barracks: right-click plants its rally point and
+      // re-stamps pending orders; new units walk there on spawn.
+      const goal = snapToPassable(map, worldToTile(w.x), worldToTile(w.y));
+      const to = goal && { x: tileCenter(goal.x), y: tileCenter(goal.y) };
+      if (to && setRally(game, selectedBuilding.id, to)) {
+        pushMessage(msgs, '集结点已设置');
+        moveMarker = { x: to.x, y: to.y, t: performance.now() };
+      } else {
+        pushMessage(msgs, '此处无法设集结点');
+      }
+    } else {
+      // Right-click a visible enemy to focus fire; empty ground stays "move".
+      const target = enemyTargetAt(w);
+      if (target) issueAttack(target);
+      else issueMove(w);
+    }
   }
   dragMode = 'none';
 });
@@ -1962,6 +2005,50 @@ function drawMoveMarker(now: number): void {
   ctx.stroke();
 }
 
+/**
+ * Rally flags for player barracks: a small pole + pennant at each rally
+ * point; while its barracks is selected a dashed line links the two.
+ */
+function drawRallyMarkers(): void {
+  if (game.rally.size === 0) return;
+  for (const [id, p] of game.rally) {
+    const sx = (p.x - camera.x) * camera.zoom;
+    const sy = (p.y - camera.y) * camera.zoom;
+    if (sx < -20 || sy < -20 || sx > viewW + 20 || sy > viewH + 20) continue;
+    const b = game.buildings.find((x) => x.id === id);
+    if (!b) continue;
+    if (selectedBuilding?.id === id) {
+      ctx.strokeStyle = 'rgba(255, 217, 77, 0.55)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      ctx.moveTo((b.x - camera.x) * camera.zoom, (b.y - camera.y) * camera.zoom);
+      ctx.lineTo(sx, sy);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    const s = camera.zoom;
+    ctx.strokeStyle = '#ffd94d';
+    ctx.lineWidth = Math.max(1, 1.5 * s);
+    ctx.beginPath();
+    ctx.moveTo(sx, sy);
+    ctx.lineTo(sx, sy - 12 * s);
+    ctx.stroke();
+    ctx.fillStyle = '#ffd94d';
+    ctx.beginPath();
+    ctx.moveTo(sx, sy - 12 * s);
+    ctx.lineTo(sx + 9 * s, sy - 9 * s);
+    ctx.lineTo(sx, sy - 6 * s);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255, 217, 77, 0.6)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(sx, sy, 4 * s, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+}
+
 /** 200ms shrinking rings at select taps — touch confirm feedback. */
 function drawTapRings(now: number): void {
   for (let i = tapRings.length - 1; i >= 0; i--) {
@@ -2049,23 +2136,60 @@ function drawBanner(): void {
   drawBattleReport(ctx, viewW, viewH, reportCard);
 }
 
-function productionItems(): ProductionItem[] {
-  const items: ProductionItem[] = [];
-  for (const q of game.queue) {
-    const label = BAR_DEFS.find((d) => d.id === q.key)?.label ?? q.key;
-    const top = items[items.length - 1];
-    if (top && top.label === label) {
-      top.count = (top.count ?? 1) + 1;
-    } else {
-      items.push({
-        label,
-        progress: q.buildTime > 0 ? q.elapsed / q.buildTime : 0,
-        count: 1,
-        ready: q.elapsed >= q.buildTime,
-      });
+/** 前置建筑未满足时的显示名（指挥部自带雷达 → 雷达站）。 */
+const REQUIRE_LABEL: Record<BuildingKind, string> = {
+  hq: '雷达站',
+  barracks: '兵营',
+  refinery: '矿厂',
+  power: '电厂',
+  turret: '炮塔',
+  wall: '围墙',
+};
+
+function requireReason(missing: readonly BuildingKind[]): string {
+  return `需要${missing.map((k) => REQUIRE_LABEL[k]).join('、')}`;
+}
+
+/**
+ * Group the production queue into per-producer lanes for the HUD panel:
+ * unit orders file under their barracks, upgrade orders under the building
+ * being upgraded. Only each lane's head order advances — the rest queue.
+ */
+function productionLanes(): ProdLane[] {
+  const rate = productionRate(game);
+  const raxCount = game.buildings.filter((b) => b.kind === 'barracks' && b.done).length;
+  const lanes = new Map<number | 'shared', ProdLane>();
+  const headSeen = new Set<number | 'shared'>();
+  game.queue.forEach((o, i) => {
+    const laneId = o.type === 'upgrade' ? o.buildingId : (o.barracksId ?? 'shared');
+    let lane = lanes.get(laneId);
+    if (!lane) {
+      const b =
+        typeof laneId === 'number' ? game.buildings.find((x) => x.id === laneId) : undefined;
+      lane = {
+        name: b
+          ? b.kind === 'barracks' && raxCount > 1
+            ? `${BUILDING_LABEL[b.kind]} #${b.id}`
+            : BUILDING_LABEL[b.kind]
+          : '生产',
+        orders: [],
+      };
+      lanes.set(laneId, lane);
     }
-  }
-  return items;
+    const head = !headSeen.has(laneId);
+    headSeen.add(laneId);
+    lane.orders.push({
+      queueIndex: i,
+      label:
+        o.type === 'upgrade'
+          ? `升级 → Lv${o.to}`
+          : (BAR_DEFS.find((d) => d.id === o.kind)?.label ?? o.kind),
+      progress: o.buildTime > 0 ? Math.min(1, o.elapsed / o.buildTime) : 0,
+      eta: head ? Math.max(0, o.buildTime - o.elapsed) / Math.max(0.001, rate) : undefined,
+      queued: !head,
+    });
+  });
+  return [...lanes.values()];
 }
 
 let last = performance.now();
@@ -2271,6 +2395,7 @@ function frame(now: number): void {
   drawEffects(ctx, camera, effects);
   drawFog(ctx, camera, fogLayer, viewW, viewH);
   drawMoveMarker(now);
+  drawRallyMarkers();
   drawUnits(ctx, camera, game.units, now);
   drawUnitsColored(ctx, camera, visibleEnemies, '#e8765a', '#5a2018');
   drawRadarContacts();
@@ -2311,7 +2436,7 @@ function frame(now: number): void {
       buildings: game.buildings.length,
     },
     lay,
-    { production: productionItems() },
+    { production: productionLanes() },
   );
   drawBuildBar(ctx, lay, barItems(), pressedBuild);
   drawTimer();
