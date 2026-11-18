@@ -4,7 +4,9 @@ import { GRASS, WATER, generateMap, isPassable, type GameMap, type Tile } from '
 import {
   findPath,
   findPathAvoiding,
+  findPathGroup,
   findPathSmooth,
+  formationSlots,
   snapToPassable,
   type Blocker,
 } from './pathfind.js';
@@ -400,4 +402,138 @@ test('generated map: center is pathable to a distant grass tile', () => {
       }
     }
   }
+});
+
+// ---------------------------------------------------------------- group --
+
+test('formationSlots returns the requested count of unique walkable slots', () => {
+  const m = makeMap(16, 16);
+  const slots = formationSlots({ x: 8, y: 8 }, 12, m, 0);
+  assert.equal(slots.length, 12);
+  assert.equal(new Set(slots.map((s) => `${s.x},${s.y}`)).size, 12);
+  for (const s of slots) {
+    assert.ok(isPassable(m, s.x, s.y));
+    assert.ok(Math.max(Math.abs(s.x - 8), Math.abs(s.y - 8)) <= 3);
+  }
+});
+
+test('formationSlots around obstacles stays walkable and unique', () => {
+  // Water on 6 of the 8 ring-1 neighbours of the target.
+  const m = makeMap(9, 9, [
+    [4, 3],
+    [3, 4],
+    [5, 4],
+    [4, 5],
+    [3, 3],
+    [5, 5],
+  ]);
+  const slots = formationSlots({ x: 4, y: 4 }, 8, m, 0);
+  assert.equal(slots.length, 8);
+  assert.equal(new Set(slots.map((s) => `${s.x},${s.y}`)).size, 8);
+  for (const s of slots) assert.ok(isPassable(m, s.x, s.y));
+});
+
+test('formationSlots honors the clearance radius against terrain', () => {
+  // Full-width water wall on row 4; radius 1 seals the row right above it.
+  const wall: [number, number][] = [];
+  for (let x = 0; x < 10; x++) wall.push([x, 4]);
+  const m = makeMap(10, 10, wall);
+  const slots = formationSlots({ x: 5, y: 2 }, 6, m, 1);
+  assert.equal(slots.length, 6);
+  for (const s of slots) {
+    assert.ok(isPassable(m, s.x, s.y));
+    assert.ok(s.y <= 2, `slot ${s.x},${s.y} sits inside the radius band`);
+  }
+});
+
+test('formationSlots reuses the nearest walkable cell when short on space', () => {
+  // Only two grass tiles exist on the whole map.
+  const water: [number, number][] = [];
+  for (let y = 0; y < 4; y++) {
+    for (let x = 0; x < 4; x++) {
+      if (!(x === 1 && y === 1) && !(x === 2 && y === 1)) water.push([x, y]);
+    }
+  }
+  const m = makeMap(4, 4, water);
+  const slots = formationSlots({ x: 1, y: 1 }, 5, m, 0);
+  assert.equal(slots.length, 5);
+  for (const s of slots) assert.ok(isPassable(m, s.x, s.y));
+  assert.ok(new Set(slots.map((s) => `${s.x},${s.y}`)).size <= 2);
+});
+
+test('findPathGroup spreads ten units onto distinct endpoints', () => {
+  const m = makeMap(20, 20);
+  const starts: Tile[] = [];
+  for (let i = 0; i < 10; i++) starts.push({ x: 2 + i, y: 2 });
+  const res = findPathGroup(m, starts, { x: 15, y: 15 });
+  assert.equal(res.degraded, false);
+  assert.equal(res.paths.length, 10);
+  assert.equal(res.slots.length, 10);
+  const ends = new Set<string>();
+  for (let i = 0; i < 10; i++) {
+    const p = res.paths[i];
+    assert.ok(p, `unit ${i} reached its slot`);
+    const end = p.length ? p.at(-1)! : starts[i]!;
+    ends.add(`${end.x},${end.y}`);
+  }
+  assert.equal(ends.size, 10);
+});
+
+test('findPathGroup routes around a wall to distinct slots', () => {
+  // Vertical wall at x=10 for y=0..13; gap at y>=14.
+  const wall: [number, number][] = [];
+  for (let y = 0; y <= 13; y++) wall.push([10, y]);
+  const m = makeMap(20, 20, wall);
+  const starts: Tile[] = [
+    { x: 2, y: 5 },
+    { x: 3, y: 5 },
+    { x: 4, y: 5 },
+    { x: 2, y: 6 },
+    { x: 3, y: 6 },
+  ];
+  const res = findPathGroup(m, starts, { x: 15, y: 5 });
+  assert.equal(res.degraded, false);
+  const ends = new Set<string>();
+  for (let i = 0; i < starts.length; i++) {
+    const p = res.paths[i];
+    assert.ok(p, `unit ${i} reached its slot`);
+    assertSegmentsPassable(m, [], starts[i]!, p);
+    const end = p.length ? p.at(-1)! : starts[i]!;
+    ends.add(`${end.x},${end.y}`);
+  }
+  assert.equal(ends.size, starts.length);
+});
+
+test('findPathGroup degrades to per-unit findPathSmooth over budget', () => {
+  const m = makeMap(20, 20);
+  const starts: Tile[] = [
+    { x: 1, y: 1 },
+    { x: 2, y: 1 },
+    { x: 3, y: 1 },
+  ];
+  const res = findPathGroup(m, starts, { x: 15, y: 15 }, { nodeBudget: 1 });
+  assert.equal(res.degraded, true);
+  for (let i = 0; i < starts.length; i++) {
+    const s = starts[i]!;
+    const g = res.slots[i]!;
+    assert.deepEqual(res.paths[i], findPathSmooth(m, s.x, s.y, g.x, g.y));
+  }
+});
+
+test('findPathGroup returns null for a sealed-off unit without throwing', () => {
+  // (2,2) is a grass cell sealed inside a water ring.
+  const m = makeMap(7, 7, [
+    [1, 1],
+    [2, 1],
+    [3, 1],
+    [1, 2],
+    [3, 2],
+    [1, 3],
+    [2, 3],
+    [3, 3],
+  ]);
+  const res = findPathGroup(m, [{ x: 2, y: 2 }, { x: 0, y: 0 }], { x: 5, y: 5 });
+  assert.equal(res.paths.length, 2);
+  assert.equal(res.paths[0], null);
+  assert.ok(res.paths[1]);
 });

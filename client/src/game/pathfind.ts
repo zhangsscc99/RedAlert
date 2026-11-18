@@ -93,7 +93,10 @@ export function findPath(
 /**
  * Shared A* core. Callers supply the occupancy predicate and, optionally, a
  * per-step clearance check evaluated on the segment between the current and
- * candidate tile centers (used by radius avoidance).
+ * candidate tile centers (used by radius avoidance). `enterCost` adds a soft
+ * penalty for stepping onto a tile (used by group pathing to spread units);
+ * `budget`, when given, is decremented per expanded node and aborts the
+ * search with null once it hits zero.
  */
 function astar(
   map: GameMap,
@@ -103,6 +106,8 @@ function astar(
   gy: number,
   passable: Passable,
   stepClear?: (cx: number, cy: number, nx: number, ny: number) => boolean,
+  enterCost?: (nx: number, ny: number) => number,
+  budget?: { left: number },
 ): Tile[] | null {
   const n = map.w * map.h;
   const g = new Float64Array(n).fill(Infinity);
@@ -118,10 +123,12 @@ function astar(
   open.push(start);
 
   while (open.size > 0) {
+    if (budget && budget.left <= 0) return null;
     const cur = open.pop();
     if (cur === goal) return reconstruct(map, came, start, goal);
     if (closed[cur]) continue;
     closed[cur] = 1;
+    if (budget) budget.left--;
 
     const cx = cur % map.w;
     const cy = (cur / map.w) | 0;
@@ -136,7 +143,7 @@ function astar(
       }
       if (stepClear && !stepClear(cx, cy, nx, ny)) continue;
       const ni = idx(map, nx, ny);
-      const ng = g[cur]! + cost;
+      const ng = g[cur]! + cost + (enterCost ? enterCost(nx, ny) : 0);
       if (ng < g[ni]!) {
         g[ni] = ng;
         f[ni] = ng + octile(nx, ny, gx, gy);
@@ -269,29 +276,49 @@ export function findPathSmooth(
   if (sx === gx && sy === gy) return [];
 
   const blocked = blockedMask(map, opts.blockers ?? []);
-  const radius = opts.radius ?? 0;
-  const clear: Passable =
-    radius > 0
-      ? (x, y) =>
-          inBounds(map, x, y) &&
-          !blocked[idx(map, x, y)]! &&
-          cellStaysClear(map, blocked, x, y, radius)
-      : (x, y) => inBounds(map, x, y) && !blocked[idx(map, x, y)]!;
-  if (!clear(gx, gy)) return null;
+  const nav = navFns(map, blocked, opts.radius ?? 0);
+  if (!nav.clear(gx, gy)) return null;
 
-  const step =
-    radius > 0
-      ? (cx: number, cy: number, nx: number, ny: number) =>
-          segStaysClear(map, blocked, cx, cy, nx, ny, radius)
-      : undefined;
-  const raw = astar(map, sx, sy, gx, gy, clear, step);
+  const raw = astar(map, sx, sy, gx, gy, nav.clear, nav.step);
   if (!raw) return null;
+  return pullString({ x: sx, y: sy }, raw, nav.los);
+}
 
-  const pts: Tile[] = [{ x: sx, y: sy }, ...raw];
-  const los =
-    radius > 0
-      ? (a: Tile, b: Tile) => segStaysClear(map, blocked, a.x, a.y, b.x, b.y, radius)
-      : (a: Tile, b: Tile) => supercoverClear(map, blocked, a.x, a.y, b.x, b.y);
+/** The three walkability checks every search/smoothing pair shares. */
+interface NavFns {
+  /** Tile-level predicate used by A*. */
+  clear: Passable;
+  /** Per-step segment clearance (radius avoidance); undefined when off. */
+  step?: (cx: number, cy: number, nx: number, ny: number) => boolean;
+  /** Line-of-sight check used by string pulling. */
+  los: (a: Tile, b: Tile) => boolean;
+}
+
+function navFns(map: GameMap, blocked: Uint8Array, radius: number): NavFns {
+  if (radius > 0) {
+    return {
+      clear: (x, y) =>
+        inBounds(map, x, y) &&
+        !blocked[idx(map, x, y)]! &&
+        cellStaysClear(map, blocked, x, y, radius),
+      step: (cx, cy, nx, ny) => segStaysClear(map, blocked, cx, cy, nx, ny, radius),
+      los: (a, b) => segStaysClear(map, blocked, a.x, a.y, b.x, b.y, radius),
+    };
+  }
+  return {
+    clear: (x, y) => inBounds(map, x, y) && !blocked[idx(map, x, y)]!,
+    step: undefined,
+    los: (a, b) => supercoverClear(map, blocked, a.x, a.y, b.x, b.y),
+  };
+}
+
+/**
+ * String pulling over a raw A* path: waypoints with clear line of sight to a
+ * later waypoint are dropped, so units walk straight segments instead of the
+ * raw staircase. `los` must match the rules the path was searched with.
+ */
+function pullString(start: Tile, raw: readonly Tile[], los: (a: Tile, b: Tile) => boolean): Tile[] {
+  const pts: Tile[] = [start, ...raw];
   const out: Tile[] = [];
   let i = 0;
   while (i < pts.length - 1) {
@@ -529,4 +556,235 @@ function segBoxDist(
     segSegDist(px, py, qx, qy, x1, y1, bx, y1),
     segSegDist(px, py, qx, qy, bx, y1, bx, by),
   );
+}
+
+// ------------------------------------------------- group pathing ---------
+
+/** Default total node expansions one findPathGroup call may spend. */
+const GROUP_NODE_BUDGET = 200_000;
+/** Default soft cost of stepping onto a tile another group path occupies. */
+const GROUP_AVOID_COST = 1.5;
+
+/**
+ * Formation destinations around a rally point: Chebyshev rings scanned
+ * outward from `target`, nearest cells first. Impassable cells are skipped
+ * and slots never repeat — unless the map lacks `count` walkable cells
+ * altogether, in which case the nearest found slots are reused so the result
+ * still lines up with the requested count. `radius` keeps slots the same
+ * clearance from blocked terrain as findPathSmooth's radius option.
+ */
+export function formationSlots(
+  target: Tile,
+  count: number,
+  map: GameMap,
+  radius = 0,
+): Tile[] {
+  if (count <= 0) return [];
+  const blocked = blockedMask(map, []);
+  const nav = navFns(map, blocked, radius);
+  return ringSlots(map, target, count, nav.clear);
+}
+
+/**
+ * Ring-by-ring scan for `count` unique cells near `target` satisfying
+ * `passable`. When the scan can't fill `count` distinct cells, the nearest
+ * found cells repeat (nearest first) so the output length is `count` whenever
+ * at least one walkable cell exists; returns [] when none do.
+ */
+function ringSlots(map: GameMap, target: Tile, count: number, passable: Passable): Tile[] {
+  const out: Tile[] = [];
+  const maxR = Math.max(map.w, map.h);
+  for (let r = 0; out.length < count && r <= maxR; r++) {
+    const ring: Tile[] = [];
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue; // ring only
+        const x = target.x + dx;
+        const y = target.y + dy;
+        if (!inBounds(map, x, y) || !passable(x, y)) continue;
+        ring.push({ x, y });
+      }
+    }
+    ring.sort(
+      (a, b) =>
+        (a.x - target.x) ** 2 +
+          (a.y - target.y) ** 2 -
+          ((b.x - target.x) ** 2 + (b.y - target.y) ** 2) ||
+        a.y - b.y ||
+        a.x - b.x,
+    );
+    for (const t of ring) {
+      if (out.length >= count) break;
+      out.push(t);
+    }
+  }
+  // Not enough distinct walkable cells: reuse the nearest ones.
+  const have = out.length;
+  for (let i = 0; out.length < count && have > 0; i++) out.push(out[i % have]!);
+  return out;
+}
+
+/** Options for {@link findPathGroup}; extends the findPathSmooth options. */
+export interface GroupPathOptions extends SmoothPathOptions {
+  /**
+   * Soft cost added when a path enters a tile an earlier group path already
+   * occupies. Positive values spread units across lanes without ever making
+   * a busy tile truly impassable. Default {@link GROUP_AVOID_COST}.
+   */
+  avoidCost?: number;
+  /**
+   * Shared node-expansion budget for every A* search in the call. When it
+   * runs out the whole group degrades to per-unit findPathSmooth and the
+   * result is flagged `degraded`. Default {@link GROUP_NODE_BUDGET}.
+   */
+  nodeBudget?: number;
+}
+
+/** Result of {@link findPathGroup}. */
+export interface GroupPaths {
+  /**
+   * One path per start, aligned with `starts`, same contract as
+   * findPathSmooth ([] when the unit already stands on its slot, null when
+   * unreachable).
+   */
+  paths: (Tile[] | null)[];
+  /** Formation slot each start was assigned to, aligned with `starts`. */
+  slots: Tile[];
+  /** True when the node budget ran out and paths fell back to findPathSmooth. */
+  degraded: boolean;
+}
+
+/**
+ * Path a group of units toward one rally point without piling onto it: every
+ * unit is assigned a distinct {@link formationSlots} destination, then routed
+ * one after another through the shared A* core. Tiles a committed path sweeps
+ * add a soft `avoidCost` penalty for later units so columns pick different
+ * lanes instead of stacking on one corridor. A single node budget covers the
+ * whole call; exceeding it discards the coordinated search and re-routes each
+ * unit with plain findPathSmooth to its slot (`degraded: true`). No entry is
+ * ever thrown — unreachable units get null.
+ */
+export function findPathGroup(
+  map: GameMap,
+  starts: readonly Tile[],
+  target: Tile,
+  opts: GroupPathOptions = {},
+): GroupPaths {
+  const n = starts.length;
+  if (n === 0) return { paths: [], slots: [], degraded: false };
+  const none = (slots: Tile[]): GroupPaths => ({
+    paths: starts.map(() => null),
+    slots,
+    degraded: false,
+  });
+  if (!inBounds(map, target.x, target.y)) return none([]);
+
+  const blocked = blockedMask(map, opts.blockers ?? []);
+  const nav = navFns(map, blocked, opts.radius ?? 0);
+  const slots = ringSlots(map, target, n, nav.clear);
+  if (slots.length === 0) return none([]);
+
+  // Assign each unit its nearest free slot.
+  const free = slots.slice();
+  const assigned = starts.map((s) => {
+    let bi = 0;
+    let bd = Infinity;
+    for (let i = 0; i < free.length; i++) {
+      const d = (free[i]!.x - s.x) ** 2 + (free[i]!.y - s.y) ** 2;
+      if (d < bd) {
+        bd = d;
+        bi = i;
+      }
+    }
+    return free.splice(bi, 1)[0]!;
+  });
+
+  const avoid = opts.avoidCost ?? GROUP_AVOID_COST;
+  const budget = { left: opts.nodeBudget ?? GROUP_NODE_BUDGET };
+  const occupied = new Uint16Array(map.w * map.h);
+  const enterCost = (x: number, y: number) => occupied[idx(map, x, y)]! * avoid;
+  const paths: (Tile[] | null)[] = new Array(n).fill(null);
+  let degraded = false;
+
+  for (let i = 0; i < n; i++) {
+    const s = starts[i]!;
+    let g = assigned[i]!;
+    if (!inBounds(map, s.x, s.y)) continue;
+    let raw: Tile[] | null = null;
+    if (s.x === g.x && s.y === g.y) {
+      raw = [];
+    } else {
+      raw = astar(map, s.x, s.y, g.x, g.y, nav.clear, nav.step, enterCost, budget);
+      if (!raw && budget.left > 0) {
+        // Slot sits in a pocket the unit can't reach: retry the walkable
+        // tile nearest the original target.
+        const alt = nearestPassable(map, target.x, target.y, nav.clear);
+        if (alt && (alt.x !== g.x || alt.y !== g.y)) {
+          raw = astar(map, s.x, s.y, alt.x, alt.y, nav.clear, nav.step, enterCost, budget);
+          if (raw) {
+            g = alt;
+            assigned[i] = alt;
+          }
+        }
+      }
+    }
+    if (!raw) {
+      if (budget.left <= 0) {
+        degraded = true;
+        break;
+      }
+      continue;
+    }
+    const path = pullString(s, raw, nav.los);
+    paths[i] = path;
+    markPathTiles(map, occupied, s, path);
+  }
+
+  if (degraded) {
+    for (let i = 0; i < n; i++) {
+      const s = starts[i]!;
+      paths[i] = inBounds(map, s.x, s.y)
+        ? findPathSmooth(map, s.x, s.y, assigned[i]!.x, assigned[i]!.y, opts)
+        : null;
+    }
+  }
+  return { paths, slots: assigned, degraded };
+}
+
+/**
+ * Bump every tile a smoothed path sweeps through, sampled finely enough that
+ * a long straight segment marks each cell it crosses. A stationary unit
+ * (empty path) still occupies its own tile.
+ */
+function markPathTiles(
+  map: GameMap,
+  occupied: Uint16Array,
+  from: Tile,
+  path: readonly Tile[],
+): void {
+  if (path.length === 0) {
+    occupied[idx(map, from.x, from.y)]++;
+    return;
+  }
+  let px = from.x + 0.5;
+  let py = from.y + 0.5;
+  for (const wp of path) {
+    const qx = wp.x + 0.5;
+    const qy = wp.y + 0.5;
+    const steps = Math.max(1, Math.ceil(Math.hypot(qx - px, qy - py) / 0.25));
+    let last = -1;
+    for (let s = 0; s <= steps; s++) {
+      const i = idx(
+        map,
+        Math.floor(px + ((qx - px) * s) / steps),
+        Math.floor(py + ((qy - py) * s) / steps),
+      );
+      if (i !== last) {
+        occupied[i]!++;
+        last = i;
+      }
+    }
+    px = qx;
+    py = qy;
+  }
 }
