@@ -15,6 +15,15 @@ function rand01(x: number, y: number, k: number): number {
   return tileHash(x, y, k) / 4294967296;
 }
 
+/**
+ * Deterministic per-tile brightness tier: -1 darker, 0 base, +1 lighter.
+ * Used by prerenderMap for a 3-level shade pass so grass/ore don't read
+ * as one flat fill.
+ */
+export function tileShadeTier(x: number, y: number): number {
+  return (tileHash(x, y, 91) % 3) - 1;
+}
+
 // ---------------------------------------------------------------- grass ----
 
 const GRASS_TEX = 128; // pattern tile size in px

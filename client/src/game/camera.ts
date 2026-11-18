@@ -1,7 +1,7 @@
 // Camera: world-space viewport with pan + zoom. Pure logic, no DOM.
 
 import { TILE_SIZE, type GameMap } from './grid.js';
-import type { Point } from './selection.js';
+import type { Point, Rect } from './selection.js';
 
 export const MIN_ZOOM = 0.5;
 export const MAX_ZOOM = 2.5;
@@ -91,4 +91,23 @@ export function smoothPan(cam: Camera, target: { x: number; y: number }, dt: num
   cam.y += (target.y - cam.y) * t;
   if (Math.abs(target.x - cam.x) < 0.5) cam.x = target.x;
   if (Math.abs(target.y - cam.y) < 0.5) cam.y = target.y;
+}
+
+/**
+ * Camera's visible region projected into an on-screen minimap rect.
+ * Pure geometry: world size comes from the map, view size from
+ * cam.bounds (createCamera fills it; resize keeps it in sync — without
+ * bounds we assume the whole map is in view). Edges are clipped to the
+ * minimap so panning past a map border can never spill the frame out.
+ */
+export function minimapViewRect(cam: Camera, map: GameMap, rect: Rect): Rect {
+  const sx = rect.w / (map.w * TILE_SIZE);
+  const sy = rect.h / (map.h * TILE_SIZE);
+  const vw = (cam.bounds ? cam.bounds.viewW : map.w * TILE_SIZE) / cam.zoom;
+  const vh = (cam.bounds ? cam.bounds.viewH : map.h * TILE_SIZE) / cam.zoom;
+  const x0 = Math.max(rect.x, rect.x + cam.x * sx);
+  const y0 = Math.max(rect.y, rect.y + cam.y * sy);
+  const x1 = Math.min(rect.x + rect.w, rect.x + (cam.x + vw) * sx);
+  const y1 = Math.min(rect.y + rect.h, rect.y + (cam.y + vh) * sy);
+  return { x: x0, y: y0, w: Math.max(0, x1 - x0), h: Math.max(0, y1 - y0) };
 }

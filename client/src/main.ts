@@ -25,6 +25,7 @@ import {
   isExplored,
   normRect,
   panBy,
+  pointInRect,
   screenToWorld,
   selectGroup,
   selectUnits,
@@ -77,6 +78,7 @@ import { bakeFog, createFogLayer, drawFog, type FogLayer } from './render/fog.js
 import {
   actionButtonAt,
   buildBarHit,
+  buildBarRect,
   computeHudLayout,
   drawActionBar,
   drawBuildBar,
@@ -86,6 +88,7 @@ import {
   drawSelectBox,
   drawSelectionCard,
   drawTouchGuide,
+  drawTouchHint,
   drawTouchMenu,
   guideHit,
   minimapToWorld,
@@ -201,7 +204,20 @@ const gestures = createGestureRecognizer();
 let buildBarOpen = !isTouch;
 let minimapCollapsed = false;
 let touchMenu: TouchMenu | null = null;
+let touchMenuT = 0; // when it opened — drives the 4s auto-dismiss
 let guideStep = -1; // -1 = hidden
+/** Finger-down press state for HUD buttons (cleared on up/cancel). */
+let pressedAction: ActionId | null = null;
+let pressedBuild = -1;
+let pressedMenu: MenuCmd | null = null;
+/** 进场提示条 deadline (performance.now ms); 0 = hidden. */
+let hintUntil = 0;
+const TOUCH_HINT = '选中单位 → 点地面移动 · 双指缩放视野';
+const MENU_AUTO_CLOSE_MS = 4000;
+/** 200ms shrink rings at successful select taps (fixed pool, no per-frame alloc). */
+const TAP_RING_MS = 200;
+const TAP_RING_MAX = 8;
+const tapRings: { x: number; y: number; t: number }[] = [];
 const fullscreenOK = typeof document.documentElement.requestFullscreen === 'function';
 let fullscreenOn = false;
 
@@ -224,6 +240,7 @@ interface RaDebug {
   readonly isTouch: boolean;
   readonly guideStep: number;
   readonly screen: Screen;
+  readonly touchMenu: TouchMenu | null;
 }
 
 declare global {
@@ -253,6 +270,9 @@ window.__raDebug = {
   },
   get screen() {
     return screen;
+  },
+  get touchMenu() {
+    return touchMenu;
   },
 };
 
@@ -335,6 +355,11 @@ function recenterCamera(): void {
   camera.bounds = c.bounds;
 }
 
+/** Show the 3s entry hint — touch only, and only when it can be seen. */
+function showHint(): void {
+  if (isTouch) hintUntil = performance.now() + 3000;
+}
+
 function startGame(): void {
   const d = DIFFICULTY[difficulty];
   applyGame(
@@ -349,6 +374,7 @@ function startGame(): void {
   activeSlot = 1; // new campaign occupies slot 1
   persist();
   screen = 'playing';
+  if (guideStep < 0) showHint(); // guide path shows it on guide completion
 }
 
 function continueGame(): void {
@@ -368,6 +394,7 @@ function continueGame(): void {
   }
   activeSlot = latest.id; // archive back into the slot we loaded from
   screen = 'playing';
+  if (guideStep < 0) showHint();
 }
 
 function onMenuTap(p: Point): void {
@@ -569,6 +596,7 @@ function guideAdvance(skip: boolean): void {
     } catch {
       /* storage may be unavailable */
     }
+    showHint(); // 进场 3 秒提示 once the guide card is gone
   } else {
     guideStep++;
   }
@@ -614,6 +642,12 @@ function runMenuCmd(cmd: MenuCmd, at: Point): void {
       guardSelected();
       break;
   }
+}
+
+/** 200ms 收缩圆环 at a successful tap-select point (screen coords). */
+function spawnTapRing(p: Point): void {
+  if (tapRings.length >= TAP_RING_MAX) tapRings.shift();
+  tapRings.push({ x: p.x, y: p.y, t: performance.now() });
 }
 
 /** Touch tap: HUD → placement → world pick (select / attack / move). */
@@ -663,6 +697,7 @@ function onTap(p: Point): void {
   const mine = unitAt(game.units, w, (UNIT_RADIUS + 10) / camera.zoom);
   if (mine) {
     selectUnits(game.units, mine, false);
+    spawnTapRing(p);
     return;
   }
   const target = enemyTargetAt(w);
@@ -685,12 +720,22 @@ function handleGesture(g: Gesture): void {
   }
   if (screen !== 'playing' || guideStep >= 0 || game.phase !== 'playing') return;
   switch (g.type) {
-    case 'longpress':
-      touchMenu = touchMenuLayout({ x: g.x, y: g.y }, hudLayout());
+    case 'longpress': {
+      const p = { x: g.x, y: g.y };
+      const lay = hudLayout();
+      // Long-press on HUD chrome does nothing — a menu docked under a panel
+      // would be unreachable.
+      if (lay.actionBar && pointInRect(p, lay.actionBar)) break;
+      if (lay.minimap && pointInRect(p, lay.minimap)) break;
+      if (lay.buildBarOpen && pointInRect(p, buildBarRect(lay, BAR_DEFS.length))) break;
+      touchMenu = touchMenuLayout(p, lay);
+      touchMenuT = performance.now();
+      buildBarOpen = false; // the command strip docks in the same band
       break;
+    }
     case 'dragbox':
-      // A box drag starting on the open radial menu dismisses it instead of
-      // selecting through the menu items.
+      // A box drag starting on the open command strip dismisses it instead
+      // of selecting through the menu items.
       if (touchMenu) touchMenu = null;
       else boxSelect(g.from, g.to, false);
       break;
@@ -897,6 +942,18 @@ canvas.addEventListener('pointerdown', (e) => {
 
   // Touch fingers go to the gesture recognizer; mouse keeps the logic below.
   if (e.pointerType === 'touch') {
+    // Press-in feedback for any HUD button under this finger.
+    pressedAction = null;
+    pressedBuild = -1;
+    pressedMenu = null;
+    if (screen === 'playing' && game.phase === 'playing' && guideStep < 0) {
+      const lay = hudLayout();
+      if (touchMenu) pressedMenu = touchMenuHit(touchMenu, p.x, p.y);
+      else {
+        pressedAction = actionButtonAt(lay, p.x, p.y);
+        pressedBuild = buildBarHit(lay, BAR_DEFS.length, p.x, p.y);
+      }
+    }
     gestures.down(e.pointerId, p.x, p.y, performance.now());
     e.preventDefault();
     return;
@@ -921,6 +978,7 @@ canvas.addEventListener('pointerdown', (e) => {
 
   // HUD build bar swallows clicks before anything else.
   const bi = buildBarHit(hudLayout(), BAR_DEFS.length, p.x, p.y);
+  pressedBuild = bi; // press-in feedback (−1 clears)
   if (bi >= 0) {
     if (e.button === 0) activateBarItem(bi);
     dragMode = 'none';
@@ -999,6 +1057,9 @@ canvas.addEventListener('pointermove', (e) => {
 
 canvas.addEventListener('pointerup', (e) => {
   const p = canvasPos(e);
+  pressedAction = null;
+  pressedBuild = -1;
+  pressedMenu = null;
 
   if (e.pointerType === 'touch') {
     for (const g of gestures.up(e.pointerId, p.x, p.y, performance.now())) handleGesture(g);
@@ -1030,10 +1091,16 @@ canvas.addEventListener('pointerup', (e) => {
 
 canvas.addEventListener('pointercancel', (e) => {
   if (e.pointerType === 'touch') gestures.cancel(e.pointerId);
+  pressedAction = null;
+  pressedBuild = -1;
+  pressedMenu = null;
   dragMode = 'none';
 });
 canvas.addEventListener('pointerleave', () => {
   mouseInside = false;
+  pressedAction = null;
+  pressedBuild = -1;
+  pressedMenu = null;
 });
 
 canvas.addEventListener(
@@ -1163,6 +1230,23 @@ function drawMoveMarker(now: number): void {
   ctx.stroke();
 }
 
+/** 200ms shrinking rings at select taps — touch confirm feedback. */
+function drawTapRings(now: number): void {
+  for (let i = tapRings.length - 1; i >= 0; i--) {
+    const r = tapRings[i]!;
+    const t = (now - r.t) / TAP_RING_MS;
+    if (t >= 1) {
+      tapRings.splice(i, 1);
+      continue;
+    }
+    ctx.strokeStyle = `rgba(93,255,93,${(0.85 * (1 - t)).toFixed(3)})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, 6 + 18 * (1 - t), 0, Math.PI * 2);
+    ctx.stroke();
+  }
+}
+
 function drawTimer(): void {
   const t = Math.floor(game.elapsed);
   const tag = paused ? '  PAUSED' : SPEEDS[speedIdx]! > 1 ? `  ×${SPEEDS[speedIdx]}` : '';
@@ -1246,6 +1330,15 @@ function frame(now: number): void {
   // routed to whatever screen is up; world gestures only reach 'playing'.
   for (const g of gestures.tick(now)) handleGesture(g);
 
+  // A box-select drag or a two-finger gesture isn't a button press.
+  if (gestures.dragBox || gestures.activePointers >= 2) {
+    pressedAction = null;
+    pressedBuild = -1;
+    pressedMenu = null;
+  }
+  // Command strip auto-dismiss after 4s idle.
+  if (touchMenu && now - touchMenuT > MENU_AUTO_CLOSE_MS) touchMenu = null;
+
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = '#0b0e0a';
   ctx.fillRect(0, 0, viewW, viewH);
@@ -1318,7 +1411,7 @@ function frame(now: number): void {
   drawEffects(ctx, camera, effects);
   drawFog(ctx, camera, fogLayer, viewW, viewH);
   drawMoveMarker(now);
-  drawUnits(ctx, camera, game.units);
+  drawUnits(ctx, camera, game.units, now);
   drawUnitsColored(ctx, camera, visibleEnemies, '#e8765a', '#5a2018');
 
   if (pendingBuild) {
@@ -1349,7 +1442,7 @@ function frame(now: number): void {
     lay,
     { production: productionItems() },
   );
-  drawBuildBar(ctx, lay, barItems());
+  drawBuildBar(ctx, lay, barItems(), pressedBuild);
   drawTimer();
   drawMessages(ctx, msgs, lay);
   drawSelectionCard(ctx, game.units, lay);
@@ -1358,11 +1451,17 @@ function frame(now: number): void {
     buildOpen: buildBarOpen,
     minimapOn: lay.minimap !== null,
     fullscreenOn,
+    menuOpen: touchMenu !== null,
+    pressed: pressedAction,
   });
   drawPaused();
   drawBanner();
-  if (touchMenu) drawTouchMenu(ctx, touchMenu);
+  drawTapRings(now);
+  if (touchMenu) drawTouchMenu(ctx, touchMenu, pressedMenu);
   if (guideStep >= 0) drawTouchGuide(ctx, viewW, viewH, guideStep);
+  if (isTouch && now < hintUntil) {
+    drawTouchHint(ctx, lay, TOUCH_HINT, Math.min(1, (hintUntil - now) / 600));
+  }
 
   rafId = requestAnimationFrame(frame);
 }
