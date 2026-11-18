@@ -25,6 +25,7 @@ import "./production.test.js";
 import "./radar.test.js";
 import "./repair.test.js";
 import "./replay.test.js";
+import "./replayStore.test.js";
 import "./save.test.js";
 import "./saveload.test.js";
 import "./selection.test.js";

@@ -1693,3 +1693,119 @@ export function drawBattleReport(
     ctx.fillText(line, x + pad, y + pad + 12 + i * lineH);
   });
 }
+
+// ------------------------------------------------------------- replay bar --
+
+/** Transport-control strip shown while a replay is playing back. */
+export interface ReplayBarLayout {
+  bar: Rect;
+  toggle: Rect; // play / pause
+  speed: Rect; // cycles 1x → 2x → 4x
+  track: Rect; // progress scrubber — click seeks
+  time: Rect; // "mm:ss / mm:ss" readout (display only)
+  exit: Rect;
+}
+
+export type ReplayBarHit = 'toggle' | 'speed' | 'exit' | { kind: 'seek'; frac: number };
+
+export interface ReplayBarModel {
+  playing: boolean;
+  /** Playback multiplier label — 1, 2 or 4. */
+  speed: number;
+  /** 0..1 fill of the progress track. */
+  frac: number;
+  /** Pre-rendered "cur / total" clock. */
+  timeText: string;
+  /** Stream checksum disagreed with the recording — warn, don't crash. */
+  mismatch: boolean;
+  hover?: ReplayBarHit | null;
+}
+
+export function replayBarLayout(viewW: number, _viewH: number): ReplayBarLayout {
+  const w = Math.min(600, Math.max(280, viewW - 24));
+  const bar: Rect = { x: (viewW - w) / 2, y: 10, w, h: 44 };
+  const pad = 8;
+  const bh = 32;
+  const by = bar.y + (bar.h - bh) / 2;
+  const toggle: Rect = { x: bar.x + pad, y: by, w: 44, h: bh };
+  const speed: Rect = { x: toggle.x + toggle.w + 6, y: by, w: 52, h: bh };
+  const exit: Rect = { x: bar.x + bar.w - pad - 56, y: by, w: 56, h: bh };
+  const time: Rect = { x: exit.x - 8 - 92, y: by, w: 92, h: bh };
+  const track: Rect = {
+    x: speed.x + speed.w + 10,
+    y: bar.y + bar.h / 2 - 6,
+    w: Math.max(24, time.x - 10 - (speed.x + speed.w + 10)),
+    h: 12,
+  };
+  return { bar, toggle, speed, track, time, exit };
+}
+
+export function replayBarHit(l: ReplayBarLayout, x: number, y: number): ReplayBarHit | null {
+  const inR = (r: Rect) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+  if (inR(l.toggle)) return 'toggle';
+  if (inR(l.speed)) return 'speed';
+  if (inR(l.exit)) return 'exit';
+  if (inR(l.track)) {
+    return { kind: 'seek', frac: Math.min(1, Math.max(0, (x - l.track.x) / l.track.w)) };
+  }
+  return null;
+}
+
+export function drawReplayBar(
+  ctx: CanvasRenderingContext2D,
+  l: ReplayBarLayout,
+  m: ReplayBarModel,
+): void {
+  const btn = (r: Rect, label: string, on = false, hover = false) => {
+    ctx.fillStyle = on
+      ? 'rgba(93,255,93,0.14)'
+      : hover
+        ? 'rgba(255,255,255,0.12)'
+        : 'rgba(255,255,255,0.07)';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeStyle = on ? ACCENT : PANEL_BORDER;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+    ctx.fillStyle = on ? ACCENT : TEXT_MAIN;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, r.x + r.w / 2, r.y + r.h / 2 + 1);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+  };
+
+  panel(ctx, l.bar.x, l.bar.y, l.bar.w, l.bar.h);
+  ctx.font = 'bold 13px ui-monospace, Menlo, Consolas, monospace';
+  btn(l.toggle, m.playing ? '‖' : '▶', false, m.hover === 'toggle');
+  btn(l.speed, `${m.speed}x`, m.speed > 1, m.hover === 'speed');
+  btn(l.exit, '退出', false, m.hover === 'exit');
+
+  // Progress track: dim rail, accent fill, knob at the playhead.
+  ctx.fillStyle = 'rgba(255,255,255,0.10)';
+  ctx.fillRect(l.track.x, l.track.y, l.track.w, l.track.h);
+  const frac = Math.min(1, Math.max(0, m.frac));
+  if (frac > 0) {
+    ctx.fillStyle = 'rgba(93,255,93,0.45)';
+    ctx.fillRect(l.track.x, l.track.y, l.track.w * frac, l.track.h);
+  }
+  ctx.strokeStyle = PANEL_BORDER;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(l.track.x + 0.5, l.track.y + 0.5, l.track.w - 1, l.track.h - 1);
+  ctx.fillStyle = ACCENT;
+  ctx.fillRect(l.track.x + l.track.w * frac - 1.5, l.track.y - 2, 3, l.track.h + 4);
+
+  ctx.fillStyle = TEXT_DIM;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(m.timeText, l.time.x + l.time.w / 2, l.time.y + l.time.h / 2 + 1);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+
+  if (m.mismatch) {
+    ctx.font = 'bold 12px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillStyle = WARN;
+    ctx.textAlign = 'center';
+    ctx.fillText('⚠ 回放与原局不一致', l.bar.x + l.bar.w / 2, l.bar.y - 8);
+    ctx.textAlign = 'left';
+  }
+}

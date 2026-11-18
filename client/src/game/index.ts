@@ -11,3 +11,5 @@ export * from './fog.js';
 export * from './effects.js';
 export * from './commands.js';
 export * from './gameState.js';
+export * from './replay.js';
+export * from './replayStore.js';
