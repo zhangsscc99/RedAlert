@@ -11,7 +11,7 @@ function tileHash(x: number, y: number, k: number): number {
 }
 
 /** Deterministic pseudo-random in [0, 1) from tile coords + a stream index. */
-function rand01(x: number, y: number, k: number): number {
+export function rand01(x: number, y: number, k: number): number {
   return tileHash(x, y, k) / 4294967296;
 }
 
