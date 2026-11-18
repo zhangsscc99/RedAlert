@@ -11,18 +11,44 @@ export type CampaignHit = { kind: 'mission'; index: number } | { kind: 'back' };
 export interface CampaignLayout {
   titleY: number;
   subtitleY: number;
+  /** 当前页可见的卡片；index 为全局关卡序号。 */
   cards: { index: number; rect: Rect }[];
   back: Rect;
+  /** 当前页（0 起，已钳制到 [0, pageCount)）。 */
+  page: number;
+  /** 总页数；>1 时调用方应提供翻页/滚动入口。 */
+  pageCount: number;
+  /** 每页卡片数（rows × cols）。 */
+  perPage: number;
+  /** 列数：viewW ≥ 900 两列，否则一列。 */
+  cols: number;
+  /** 第一行卡片顶缘 y —— 按页/滚动绘制时的网格原点。 */
+  offsetY: number;
+  /** 翻页按钮；不可翻向该方向时为 null（pageCount ≤1 时两者皆 null）。 */
+  pager: { prev: Rect | null; next: Rect | null };
 }
 
 export type MissionEndButton = 'next' | 'retry' | 'menu';
 
 export interface MissionEndLayout {
+  /** 结算横幅（深色带）的垂直中心。 */
   bandY: number;
+  /** 深色带高度，随内容伸缩。 */
+  bandH: number;
+  /** 标题（任务完成/失败）基线 y。 */
+  headingY: number;
+  /** 星级排中心 y —— 绘制星级用，保证不与目标文案重叠。 */
+  starsY: number;
+  /** 第一行说明文案基线 y；后续行 +lineGap。 */
+  objectiveY: number;
+  /** 说明文案行距。 */
+  lineGap: number;
   buttons: { id: MissionEndButton; rect: Rect }[];
 }
 
 const CARD_GAP = 12;
+const CARD_MIN_H = 64;
+const CARD_MAX_H = 84;
 const BTN_H = 52;
 const BTN_GAP = 14;
 
@@ -30,29 +56,78 @@ const inRect = (r: Rect, x: number, y: number): boolean =>
   x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
 
 /**
- * 单列关卡卡：标题下顺序排开，卡高随可用高度伸缩（小屏收紧到 56）。
- * `count` 注入而不是读 MISSIONS，保证布局函数纯几何。
+ * 关卡卡网格：宽屏（≥900）两列、窄屏一列；行高随可用高度伸缩，
+ * 最低 64px。放不下时按页展示 —— cards 只含当前页，pageCount /
+ * offsetY / pager 供调用方做翻页或滚动。`count` 注入而不是读
+ * MISSIONS，保证布局函数纯几何。
  */
-export function campaignLayout(viewW: number, viewH: number, count: number): CampaignLayout {
-  const w = Math.min(viewW - 32, 620);
-  const x = (viewW - w) / 2;
-  const top = Math.round(viewH * 0.22);
+export function campaignLayout(
+  viewW: number,
+  viewH: number,
+  count: number,
+  page = 0,
+): CampaignLayout {
+  const cols = viewW >= 900 ? 2 : 1;
+  const totalW = Math.min(viewW - 32, cols === 2 ? 1080 : 620);
+  const w = (totalW - CARD_GAP * (cols - 1)) / cols;
+  const x0 = (viewW - (w * cols + CARD_GAP * (cols - 1))) / 2;
+  const titleY = Math.round(viewH * 0.11);
+  const subtitleY = titleY + 28;
+  // 网格顶缘不能压到副标题（小视口 0.22·h 会挤上来）。
+  const offsetY = Math.max(Math.round(viewH * 0.22), subtitleY + 14);
   const bh = viewH < 480 ? 40 : BTN_H;
-  // 给返回按钮预留 bh + 上下空隙，其余高度均分给卡片。
-  const avail = Math.max(120, viewH - top - bh - CARD_GAP * 3 - 16);
-  const cardH = Math.max(56, Math.min(84, (avail - CARD_GAP * (count - 1)) / count));
-  const cards = Array.from({ length: count }, (_, i) => ({
-    index: i,
-    rect: { x, y: top + i * (cardH + CARD_GAP), w, h: cardH },
-  }));
-  const last = cards[cards.length - 1];
-  const backY = last ? last.rect.y + last.rect.h + CARD_GAP * 1.5 : top;
-  return {
-    titleY: Math.round(viewH * 0.11),
-    subtitleY: Math.round(viewH * 0.11) + 28,
-    cards,
-    back: { x: (viewW - 200) / 2, y: Math.min(viewH - bh - 12, backY), w: 200, h: bh },
+  // 给返回按钮（兼翻页行）预留 bh + 上下空隙，其余高度均分给卡片行。
+  const avail = Math.max(CARD_MIN_H, viewH - offsetY - bh - CARD_GAP * 3 - 16);
+  const need = Math.max(1, Math.ceil(count / cols));
+  const rows = Math.max(
+    1,
+    Math.min(need, Math.floor((avail + CARD_GAP) / (CARD_MIN_H + CARD_GAP))),
+  );
+  const cardH = Math.min(
+    CARD_MAX_H,
+    Math.max(CARD_MIN_H, (avail - CARD_GAP * (rows - 1)) / rows),
+  );
+  const perPage = rows * cols;
+  const pageCount = Math.max(1, Math.ceil(count / perPage));
+  const cur = Math.min(Math.max(0, page), pageCount - 1);
+  const start = cur * perPage;
+  const visible = Math.min(count - start, perPage);
+  const cards = Array.from({ length: Math.max(0, visible) }, (_, i) => {
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    return {
+      index: start + i,
+      rect: {
+        x: x0 + col * (w + CARD_GAP),
+        y: offsetY + row * (cardH + CARD_GAP),
+        w,
+        h: cardH,
+      },
+    };
+  });
+  const rowsUsed = Math.max(1, Math.ceil(Math.max(0, visible) / cols));
+  const gridBottom =
+    visible > 0 ? offsetY + rowsUsed * cardH + (rowsUsed - 1) * CARD_GAP : offsetY;
+  const backY = Math.min(viewH - bh - 12, gridBottom + CARD_GAP * 1.5);
+  const back: Rect = { x: (viewW - 200) / 2, y: backY, w: 200, h: bh };
+  // 翻页钮贴着返回钮左右排，只在可翻方向出现；命中走 campaignPageHit。
+  const pw = 72;
+  const pager = {
+    prev:
+      cur > 0
+        ? { x: Math.max(8, back.x - CARD_GAP - pw), y: back.y, w: pw, h: bh }
+        : null,
+    next:
+      cur < pageCount - 1
+        ? {
+            x: Math.min(viewW - pw - 8, back.x + back.w + CARD_GAP),
+            y: back.y,
+            w: pw,
+            h: bh,
+          }
+        : null,
   };
+  return { titleY, subtitleY, cards, back, page: cur, pageCount, perPage, cols, offsetY, pager };
 }
 
 export function campaignHit(l: CampaignLayout, x: number, y: number): CampaignHit | null {
@@ -63,24 +138,61 @@ export function campaignHit(l: CampaignLayout, x: number, y: number): CampaignHi
   return null;
 }
 
-/** 结算按钮行：胜利给 下一关/重玩/返回菜单，失败给 重试/返回菜单。 */
+/** 翻页命中测试：'prev' | 'next' | null；与 campaignHit 互不抢点。 */
+export function campaignPageHit(
+  l: CampaignLayout,
+  x: number,
+  y: number,
+): 'prev' | 'next' | null {
+  if (l.pager.prev && inRect(l.pager.prev, x, y)) return 'prev';
+  if (l.pager.next && inRect(l.pager.next, x, y)) return 'next';
+  return null;
+}
+
+/**
+ * 结算屏：标题 → 星级 → 说明文案 → 按钮 自上而下排布，整体在视口内
+ * 垂直居中；小屏（<480 高）压缩行距与按钮高，保证 380px 高也不溢出。
+ * 按钮行锚在内容下缘与视口底之间，绝不与文案重叠。
+ */
 export function missionEndLayout(
   viewW: number,
   viewH: number,
   next: boolean,
 ): MissionEndLayout {
   const ids: MissionEndButton[] = next ? ['next', 'retry', 'menu'] : ['retry', 'menu'];
-  const gap = 16;
-  const bw = Math.max(110, Math.min(170, (viewW - 96 - gap * (ids.length - 1)) / ids.length));
-  const bh = viewH < 480 ? 40 : 48;
+  const compact = viewH < 480;
+  const gap = viewW < 480 ? 10 : 16;
+  const bw = Math.max(
+    96,
+    Math.min(170, (viewW - 64 - gap * (ids.length - 1)) / ids.length),
+  );
+  const bh = compact ? 40 : 48;
   const totalW = ids.length * bw + (ids.length - 1) * gap;
   const x0 = (viewW - totalW) / 2;
-  const y = viewH / 2 + 92; // 信息行排到 cy+66，按钮让到其下
+  const lineGap = compact ? 18 : 20;
+  const starGap = compact ? 24 : 30;
+  const maxLines = 3; // lines 由调用方给，布局按上界预留。
+  // 内容总高：标题升部 ~34 + 星距 + 星半径 14 + 文案块 + 间距 + 按钮。
+  const contentH = 34 + starGap + 14 + 30 + lineGap * (maxLines - 1) + 20 + bh;
+  const top = Math.max(8, Math.round((viewH - contentH) / 2));
+  const headingY = top + 34;
+  const starsY = headingY + starGap;
+  const objectiveY = starsY + 30;
+  const buttonsY = Math.min(
+    objectiveY + lineGap * (maxLines - 1) + 20,
+    viewH - bh - 12,
+  );
+  const bandH = buttonsY + bh + 16 - top;
   return {
-    bandY: viewH / 2,
+    bandY: Math.round(top + bandH / 2),
+    bandH,
+    headingY,
+    starsY,
+    objectiveY,
+    lineGap,
     buttons: ids.map((id, i) => ({
       id,
-      rect: { x: x0 + i * (bw + gap), y, w: bw, h: bh },
+      rect: { x: x0 + i * (bw + gap), y: buttonsY, w: bw, h: bh },
     })),
   };
 }
@@ -287,11 +399,20 @@ export function drawCampaign(
   }
 
   button(ctx, l.back, '返回菜单', { hover: model.hover?.kind === 'back' });
+  if (l.pageCount > 1) {
+    if (l.pager.prev) button(ctx, l.pager.prev, '‹ 上一页');
+    if (l.pager.next) button(ctx, l.pager.next, '下一页 ›');
+    ctx.font = `11px ${FONT}`;
+    ctx.fillStyle = TEXT_DIM;
+    ctx.textAlign = 'center';
+    ctx.fillText(`${l.page + 1}/${l.pageCount}`, viewW / 2, l.back.y - 8);
+    ctx.textAlign = 'left';
+  }
 
   ctx.font = `12px ${FONT}`;
   ctx.fillStyle = TEXT_DIM;
   ctx.textAlign = 'center';
-  ctx.fillText('Esc 返回主菜单', viewW / 2, viewH - 24);
+  ctx.fillText('Esc 返回主菜单', viewW / 2, viewH < 480 ? viewH - 8 : viewH - 24);
   ctx.textAlign = 'left';
 }
 
@@ -317,21 +438,20 @@ export function drawMissionEnd(
   m: MissionEndModel,
 ): void {
   const l = missionEndLayout(viewW, viewH, m.won && m.hasNext);
-  const cy = l.bandY;
 
   ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-  ctx.fillRect(0, cy - 80, viewW, 236);
+  ctx.fillRect(0, l.bandY - l.bandH / 2, viewW, l.bandH);
   ctx.textAlign = 'center';
-  ctx.font = `bold 40px ${FONT}`;
+  ctx.font = `bold ${viewH < 480 ? 30 : 40}px ${FONT}`;
   ctx.fillStyle = m.won ? '#7dff7d' : BAD;
-  ctx.fillText(m.heading, viewW / 2, cy - 24);
+  ctx.fillText(m.heading, viewW / 2, l.headingY);
 
-  if (m.won) drawStars(ctx, viewW / 2, cy + 16, 14, m.stars);
+  if (m.won) drawStars(ctx, viewW / 2, l.starsY, 14, m.stars);
 
   ctx.font = `14px ${FONT}`;
   ctx.fillStyle = TEXT_MAIN;
   m.lines.forEach((line, i) => {
-    ctx.fillText(line, viewW / 2, cy + 46 + i * 20);
+    ctx.fillText(line, viewW / 2, l.objectiveY + i * l.lineGap);
   });
   ctx.textAlign = 'left';
 
