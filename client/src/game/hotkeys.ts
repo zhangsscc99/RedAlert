@@ -38,6 +38,7 @@ export const DEFAULT_BINDINGS: Binding[] = [
   { id: 'train.infantry', label: '训练步兵', keys: ['q'], ctx: 'game', hint: 'Q' },
   { id: 'train.tank', label: '生产坦克', keys: ['w'], ctx: 'game', hint: 'W' },
   { id: 'train.harvester', label: '生产采矿车', keys: ['e'], ctx: 'game', hint: 'E' },
+  { id: 'build.power', label: '建造电厂', keys: ['p'], ctx: 'game', hint: 'P' },
   // 指令
   { id: 'cmd.attackMove', label: '攻击移动', keys: ['a'], ctx: 'game', hint: 'A + 左键' },
   { id: 'cmd.stop', label: '停止', keys: ['s'], ctx: 'game', hint: 'S' },
@@ -121,6 +122,50 @@ export function detectConflicts(bindings: Binding[]): KeyConflict[] {
   return out;
 }
 
+/**
+ * Conflict check over the real table: reports any key that can fire more
+ * than one command in the same effective context. 'always' bindings are
+ * reserved keys — they expand into every context, so a production-panel
+ * key shadowing one of them (e.g. a panel key on 'f' vs fullscreen) is a
+ * conflict too. Empty array = no conflicts.
+ */
+export function validateHotkeys(
+  bindings: readonly Binding[] = DEFAULT_BINDINGS,
+): KeyConflict[] {
+  // effective ctx: 'always' occupies 'always' itself plus 'game' and 'menu'
+  const slots = new Map<string, { ctx: BindingCtx; ids: string[] }>();
+  const add = (ctx: BindingCtx, key: string, id: string): void => {
+    const mk = `${ctx}:${key}`;
+    const slot = slots.get(mk) ?? { ctx, ids: [] };
+    if (!slot.ids.includes(id)) slot.ids.push(id);
+    slots.set(mk, slot);
+  };
+  for (const b of bindings) {
+    for (const k of b.keys) {
+      if (b.ctx === 'always') {
+        add('always', k, b.id);
+        add('game', k, b.id);
+        add('menu', k, b.id);
+      } else {
+        add(b.ctx, k, b.id);
+      }
+    }
+  }
+  const out: KeyConflict[] = [];
+  for (const [mk, slot] of slots) {
+    if (slot.ids.length <= 1) continue;
+    const key = mk.slice(slot.ctx.length + 1);
+    if (slot.ctx !== 'always') {
+      // all-'always' collision already reported under ctx 'always'
+      const a = slots.get(`always:${key}`);
+      if (a && a.ids.length === slot.ids.length && slot.ids.every((i) => a.ids.includes(i)))
+        continue;
+    }
+    out.push({ key, ctx: slot.ctx, ids: slot.ids });
+  }
+  return out;
+}
+
 /** Display string for the HUD, e.g. 'B — 建造兵营'. */
 export function hintText(b: Binding): string {
   return `${b.hint} — ${b.label}`;
@@ -153,6 +198,7 @@ const REQUIREMENTS: Record<string, Requirement> = {
   'build.barracks': { cost: 500, needsPower: true },
   'build.refinery': { cost: 2000, needsPower: true },
   'build.turret': { cost: 700, needsPower: true },
+  'build.power': { cost: 300 },
   'train.infantry': { cost: 100, needsBarracks: true },
   'train.tank': { cost: 800, needsBarracks: true },
   'train.harvester': { cost: 1400, needsBarracks: true },

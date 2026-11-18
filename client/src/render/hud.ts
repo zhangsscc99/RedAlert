@@ -1557,16 +1557,47 @@ export function onboardingSkipHit(lay: OnboardingBarLayout, px: number, py: numb
   return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
 }
 
-/** 新手引导条：步骤 x/y + 标题 + 说明 + 「跳过」按钮（桌面端）。 */
+/** Greedy word/char wrap for canvas text (CJK breaks anywhere). */
+function wrapLines(ctx: CanvasRenderingContext2D, text: string, maxW: number): string[] {
+  const lines: string[] = [];
+  let cur = '';
+  for (const ch of text) {
+    if (ch === '\n' || ctx.measureText(cur + ch).width > maxW) {
+      if (cur) lines.push(cur);
+      cur = ch === '\n' ? '' : ch;
+    } else {
+      cur += ch;
+    }
+  }
+  if (cur || lines.length === 0) lines.push(cur);
+  return lines;
+}
+
+const OB_LINE_H = 14;
+const OB_PAGE_LINES = 3;
+const OB_PAGE_MS = 5000; // auto-advance when the body needs >1 page
+
+/** 新手引导条：步骤 x/y + 标题 + 说明（按宽度折行，至多 3 行/页，超出自动翻页）+「跳过」（桌面端）。 */
 export function drawOnboardingBar(
   ctx: CanvasRenderingContext2D,
   l: HudLayout,
   m: OnboardingBarModel,
+  now = Date.now(),
 ): void {
   const ol = onboardingBarLayout(l);
   if (!ol) return;
   const { rect, skip } = ol;
-  panel(ctx, rect.x, rect.y, rect.w, rect.h);
+
+  const text = m.hint ? `${m.body} — ${m.hint}` : m.body;
+  const maxW = skip.x - rect.x - 24;
+  ctx.font = '11px ui-monospace, Menlo, Consolas, monospace';
+  const lines = wrapLines(ctx, text, maxW);
+  const pages = Math.max(1, Math.ceil(lines.length / OB_PAGE_LINES));
+  const page = pages > 1 ? Math.floor(now / OB_PAGE_MS) % pages : 0;
+  const shown = lines.slice(page * OB_PAGE_LINES, page * OB_PAGE_LINES + OB_PAGE_LINES);
+  const bodyH = (shown.length - 1) * OB_LINE_H + (pages > 1 ? 10 : 0);
+
+  panel(ctx, rect.x, rect.y, rect.w, rect.h + bodyH);
 
   ctx.textBaseline = 'alphabetic';
   ctx.font = '10px ui-monospace, Menlo, Consolas, monospace';
@@ -1579,10 +1610,14 @@ export function drawOnboardingBar(
 
   ctx.font = '11px ui-monospace, Menlo, Consolas, monospace';
   ctx.fillStyle = TEXT_MAIN;
-  const text = m.hint ? `${m.body} — ${m.hint}` : m.body;
-  // Crude clip: keep the body line inside the strip.
-  const maxW = skip.x - rect.x - 24;
-  ctx.fillText(text.length * 11 > maxW ? `${text.slice(0, Math.max(8, Math.floor(maxW / 11)))}…` : text, rect.x + 14, rect.y + 49);
+  shown.forEach((line, i) => ctx.fillText(line, rect.x + 14, rect.y + 49 + i * OB_LINE_H));
+  if (pages > 1) {
+    ctx.font = '9px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillStyle = TEXT_DIM;
+    ctx.textAlign = 'right';
+    ctx.fillText(`${page + 1}/${pages}`, rect.x + rect.w - 10, rect.y + rect.h + bodyH - 6);
+    ctx.textAlign = 'left';
+  }
 
   ctx.fillStyle = 'rgba(255,255,255,0.06)';
   ctx.fillRect(skip.x, skip.y, skip.w, skip.h);
