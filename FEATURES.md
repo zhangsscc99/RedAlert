@@ -92,3 +92,22 @@
 - [x] F508 快捷键与指令卡：新增 game/hotkeys.ts（键位表、冲突检测、按上下文过滤可用指令、提示文案数据，纯逻辑）｜verify: bash scripts/build-tests.sh && node --test client/src/game/hotkeys.test.js && (cd client && npx tsc --noEmit)｜risk: low
 - [x] F509 战斗回放：新增 game/replay.ts（按 tick 记录指令流、序列化/反序列化、确定性回放校验、快进倍率）｜verify: bash scripts/build-tests.sh && node --test client/src/game/replay.test.js && (cd client && npx tsc --noEmit)｜risk: med
 - [x] F510 天气与昼夜：新增 game/weather.ts（雨/沙尘状态机随时间演进，影响视野与移速倍率，可确定性测试）+ render/weather.ts（Canvas 雨丝/暗角绘制）｜verify: bash scripts/build-tests.sh && node --test client/src/game/weather.test.js && (cd client && npx tsc --noEmit)｜risk: low
+
+## M6 并行车道批（2026-11-18 17:45 UTC）— 把孤儿模块接进产品 + 手感深化
+
+> 现状判断（本轮 grep 实测）：M5 造了 upgrades/repair/radar/stats/replay/weather/music/hotkeys/unitRoles/onboarding/panel
+> 十一块，但 `grep -c` 在 `main.ts` / `gameState.ts` 里对它们全部为 **0**——功能造好了没上线，玩家一条都用不到；
+> 同时已上线的 render/*、combat、harvest、enemyAI 还是 M2 的粗版（无行走动画、无建造进度环、矿车会抢矿、AI 不会撤退）。
+> 本批 F601 是**唯一**允许改 `main.ts` / `index.html` / `render/hud.ts` 的车道（接线 hotkeys/radar/weather/music）；
+> 其余九条各自独占一个已上线模块的文件，只加功能不改旧签名、不改 FEATURES.md，互不重叠。
+
+- [ ] F601 上线触达层接线：main.ts 接 hotkeys（空格暂停、1-9 编队、H 快捷键提示卡）、radar 侦查脉冲（按 tick 扫描、接触点画面上淡出标记、无雷达降级）、weather（雨/沙尘影响视野与移速并叠层渲染）、music（开局 BGM、暂停/静音联动，与 sfx 共存不抢音量）｜verify: bash scripts/build-tests.sh && node --test client/src/game/radar.test.js && node --test client/src/game/weather.test.js && node --test client/src/game/hotkeys.test.js && (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: med
+- [ ] F602 地形视觉细化：render/terrain.ts 加水岸泡沫线、矿脉晶簇高光与跳动、草地噪点分块、可选网格叠加更克制（保持 drawTerrain/prerenderMap/prerenderGrid 签名）｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F603 单位表现升级：render/units.ts 按 UnitKind 区分外观（步兵/矿车/坦克/火箭兵），加行走摆动动画、朝向、选中圈脉冲、血条与受损变色（drawUnits 签名不变）｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F604 建筑表现升级：render/buildings.ts 加建造脚手架与进度环、受损冒烟/火花、炮塔朝最近敌人转向、等级角标（签名不变）｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F605 迷雾质感：render/fog.ts 边缘柔化、未探索纯黑幕、已探明半透明灰、可见区随 tick 平滑过渡（不重算 fog 逻辑）｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F606 寻路手感：pathfind.ts 加路径平滑（拉直冗余拐点）与单位半径避让，findPath 旧签名与语义不变，新增 findPathSmooth 供单位使用｜verify: bash scripts/build-tests.sh && node --test client/src/game/pathfind.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F607 矿车调度：harvest.ts 加矿脉储量与枯竭、多矿车就近分配不抢同一格、回程走 findPathAvoiding 绕建筑、被堵超时自动换矿｜verify: bash scripts/build-tests.sh && node --test client/src/game/harvest.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F608 敌方 AI 深度：enemyAI.ts 加侦察试探、集结后进攻、血量低撤退、多兵种搭配与难度缩放（默认行为与现有一致，新行为按参数开启）｜verify: bash scripts/build-tests.sh && node --test client/src/game/enemyAI.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F609 战斗深度：combat.ts 加护甲类型与克制（复用 unitRoles 矩阵）、溅射伤害、集火目标保持、射击遮挡判定，纯函数可测，旧导出签名不变｜verify: bash scripts/build-tests.sh && node --test client/src/game/combat.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F610 生产队列深度：production.ts 加多兵营并行队列、集结点（rally point）、取消退款按进度折算、升级任务排队（复用 upgrades 表，不改旧签名）｜verify: bash scripts/build-tests.sh && node --test client/src/game/production.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
