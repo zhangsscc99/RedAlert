@@ -44,16 +44,61 @@ const SEASON_TINT: Record<Season, string> = {
   winter: 'rgba(185,205,225,0.22)', // pale cold blue-grey
 };
 
+export type TimeOfDay = 'dawn' | 'day' | 'dusk' | 'night';
+
+/**
+ * Time-of-day grade, applied after the season tint. Each entry is a stop
+ * colour for a diagonal light gradient: the first colour falls on the
+ * lit (top-left) corner, the second on the shadowed (bottom-right) one.
+ */
+const TIME_OF_DAY_TINT: Record<TimeOfDay, [string, string]> = {
+  dawn: ['rgba(255,190,120,0.14)', 'rgba(70,80,140,0.12)'], // warm east light
+  day: ['rgba(255,255,235,0.05)', 'rgba(30,40,20,0.05)'], // near-neutral sun
+  dusk: ['rgba(235,140,80,0.16)', 'rgba(40,50,110,0.16)'], // low orange sun
+  night: ['rgba(70,90,160,0.18)', 'rgba(8,14,40,0.30)'], // cold moonlight
+};
+
 export interface PrerenderOptions {
   /** Season palette; defaults to a season derived from the map seed. */
   season?: Season;
+  /** Time-of-day light grade; omitted → neutral daylight. */
+  timeOfDay?: TimeOfDay;
   /**
    * Remaining ore fraction (0..1) for a tile, if the game tracks reserves.
-   * Omitted → fixed per-tile crystal layout driven by vein density.
+   * Omitted → a `map.oreReserves` array-like field is consulted (values ≤1
+   * are fractions, larger values are absolute credits normalized by the
+   * array max); missing either way → draw at full reserve.
    */
   oreReserve?: (x: number, y: number) => number | undefined;
   /** Building footprints in tile coords, for foundation shadow + dirt skirt. */
   foundations?: { x: number; y: number; w: number; h: number }[];
+}
+
+/** Optional reserve table a GameMap may carry: remaining ore per tile index. */
+interface ReserveBearingMap {
+  oreReserves?: ArrayLike<number>;
+}
+
+/**
+ * Resolve the remaining-ore fraction for tile (x, y). Priority: the explicit
+ * callback, then a reserve array attached to the map, then full reserve.
+ * `tableMax` is the fullest entry in the map's table (for absolute credit
+ * counts); pass 1 when values are already fractions or no table exists.
+ */
+function oreReserveAt(
+  map: GameMap,
+  opts: PrerenderOptions,
+  tableMax: number,
+  x: number,
+  y: number,
+): number {
+  const fromCb = opts.oreReserve?.(x, y);
+  if (fromCb !== undefined) return Math.max(0, Math.min(1, fromCb));
+  const table = (map as GameMap & ReserveBearingMap).oreReserves;
+  if (!table) return 1;
+  const v = table[y * map.w + x];
+  if (v === undefined || v === null || Number.isNaN(v)) return 1;
+  return Math.max(0, Math.min(1, v / tableMax));
 }
 
 export function prerenderMap(map: GameMap, opts: PrerenderOptions = {}): HTMLCanvasElement {
@@ -88,6 +133,17 @@ export function prerenderMap(map: GameMap, opts: PrerenderOptions = {}): HTMLCan
   ctx.fillStyle = ctx.createPattern(grassTex, 'repeat')!;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+  // Fullest entry in the map's reserve table (1 when the table holds
+  // fractions or is absent), so absolute credit counts normalize to 0..1.
+  const reserveField = (map as GameMap & ReserveBearingMap).oreReserves;
+  let tableMax = 1;
+  if (reserveField) {
+    for (let i = 0; i < reserveField.length; i++) {
+      const v = reserveField[i]!;
+      if (v > tableMax) tableMax = v;
+    }
+  }
+
   for (let y = 0; y < map.h; y++) {
     for (let x = 0; x < map.w; x++) {
       const t = map.tiles[y * map.w + x];
@@ -111,16 +167,21 @@ export function prerenderMap(map: GameMap, opts: PrerenderOptions = {}): HTMLCan
           }
         }
         drawOreTile(ctx, x, y, density);
-        // Reserve visualization: when the game reports a remaining fraction,
-        // depleted cells sink back toward bare cracked earth; rich ones keep
-        // full crystal brightness. No data → the density-based look above.
-        const reserve = opts.oreReserve?.(x, y);
-        if (reserve !== undefined) {
-          const r = Math.max(0, Math.min(1, reserve));
-          if (r < 0.66) {
-            ctx.fillStyle = `rgba(52,42,24,${((0.66 - r) * 0.75).toFixed(3)})`;
+        // Reserve visualization: near-depleted cells sink back toward bare
+        // cracked earth, full ones get a warm sheen so rich veins read
+        // brighter. No data → the density-based look above.
+        const r = oreReserveAt(map, opts, tableMax, x, y);
+        if (r < 0.66) {
+          ctx.fillStyle = `rgba(52,42,24,${((0.66 - r) * 0.75).toFixed(3)})`;
+          ctx.fillRect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+          if (r < 0.2) {
+            // Nearly spent: grey the bed out, crystals read as dust.
+            ctx.fillStyle = `rgba(70,70,66,${((0.2 - r) * 1.5).toFixed(3)})`;
             ctx.fillRect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE);
           }
+        } else if (r > 0.92) {
+          ctx.fillStyle = `rgba(255,232,150,${((r - 0.92) * 1.6).toFixed(3)})`;
+          ctx.fillRect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE);
         }
         // One twinkle point per crystal, deterministic per tile.
         const n = 1 + Math.min(2, Math.floor(density / 3));
@@ -232,10 +293,16 @@ export function prerenderMap(map: GameMap, opts: PrerenderOptions = {}): HTMLCan
     if (rand01(x, y, 310) < 0.25) continue; // breaks in the road
     const px = x * TILE_SIZE;
     const py = y * TILE_SIZE;
+    // Jittered insets per side so neighbouring path tiles don't line up into
+    // visible seams and lone path tiles aren't hard-edged squares.
+    const iL = 1 + Math.floor(rand01(x, y, 311) * 3);
+    const iR = 1 + Math.floor(rand01(x, y, 312) * 3);
+    const iT = 1 + Math.floor(rand01(x, y, 313) * 3);
+    const iB = 1 + Math.floor(rand01(x, y, 314) * 3);
     ctx.fillStyle = 'rgba(72,56,34,0.32)';
-    ctx.fillRect(px + 1, py + 1, TILE_SIZE - 2, TILE_SIZE - 2);
+    ctx.fillRect(px + iL, py + iT, TILE_SIZE - iL - iR, TILE_SIZE - iT - iB);
     ctx.fillStyle = 'rgba(104,86,56,0.25)';
-    ctx.fillRect(px + 3, py + 3, TILE_SIZE - 6, TILE_SIZE - 6);
+    ctx.fillRect(px + iL + 2, py + iT + 2, TILE_SIZE - iL - iR - 4, TILE_SIZE - iT - iB - 4);
     // Pebbles and ruts along the road surface.
     for (let i = 0; i < 5; i++) {
       const gx = px + 3 + rand01(x, y, 320 + i) * (TILE_SIZE - 6);
@@ -276,6 +343,21 @@ export function prerenderMap(map: GameMap, opts: PrerenderOptions = {}): HTMLCan
       grad.addColorStop(1, 'rgba(30,22,12,0)');
       ctx.fillStyle = grad;
       ctx.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+      // Matching feather on the land side: a faint dust halo so the seam
+      // reads as worn ground, not a cut edge.
+      const nx0 = nx * TILE_SIZE;
+      const ny0 = ny * TILE_SIZE;
+      const fade = ctx.createLinearGradient(
+        horiz ? nx0 : d === 0 ? nx0 : nx0 + TILE_SIZE,
+        horiz ? (d === 2 ? ny0 : ny0 + TILE_SIZE) : ny0,
+        horiz ? nx0 : d === 0 ? nx0 + 4 : nx0 + TILE_SIZE - 4,
+        horiz ? (d === 2 ? ny0 + 4 : ny0 + TILE_SIZE - 4) : ny0,
+      );
+      fade.addColorStop(0, 'rgba(70,54,32,0.18)');
+      fade.addColorStop(1, 'rgba(70,54,32,0)');
+      ctx.fillStyle = fade;
+      if (horiz) ctx.fillRect(nx0, d === 2 ? ny0 : ny0 + TILE_SIZE - 4, TILE_SIZE, 4);
+      else ctx.fillRect(d === 0 ? nx0 : nx0 + TILE_SIZE - 4, ny0, 4, TILE_SIZE);
       // Gravel: a few gritty specks kicked onto the shoulder edge.
       for (let i = 0; i < 6; i++) {
         const t = rand01(x * 4 + d, y, 350 + i) * (TILE_SIZE - 2);
@@ -305,6 +387,29 @@ export function prerenderMap(map: GameMap, opts: PrerenderOptions = {}): HTMLCan
     ctx.beginPath();
     ctx.ellipse(bx + bw / 2 + 3, by + bh - 2, bw / 2 + 4, 6, 0, 0, Math.PI * 2);
     ctx.fill();
+    // Soft churned-earth apron around the whole footprint: a gradient ring
+    // fading outward on all four sides so the pad blends into the grass.
+    const APRON = 6;
+    const apron = (
+      x0: number,
+      y0: number,
+      x1: number,
+      y1: number,
+      rx: number,
+      ry: number,
+      rw: number,
+      rh: number,
+    ): void => {
+      const g = ctx.createLinearGradient(x0, y0, x1, y1);
+      g.addColorStop(0, 'rgba(88,70,44,0.34)');
+      g.addColorStop(1, 'rgba(88,70,44,0)');
+      ctx.fillStyle = g;
+      ctx.fillRect(rx, ry, rw, rh);
+    };
+    apron(bx, by, bx, by - APRON, bx - APRON, by - APRON, bw + APRON * 2, APRON); // top
+    apron(bx, by + bh, bx, by + bh + APRON, bx - APRON, by + bh, bw + APRON * 2, APRON); // bottom
+    apron(bx, by, bx - APRON, by, bx - APRON, by, APRON, bh); // left
+    apron(bx + bw, by, bx + bw + APRON, by, bx + bw, by, APRON, bh); // right
     ctx.fillStyle = 'rgba(88,70,44,0.30)';
     for (let i = 0; i < bw; i += 5) {
       ctx.fillRect(bx + i, by + bh - 3 - rand01(f.x + i, f.y, 380) * 3, 4, 4);
@@ -448,6 +553,17 @@ export function prerenderMap(map: GameMap, opts: PrerenderOptions = {}): HTMLCan
         2,
       );
     }
+  }
+
+  // Time-of-day grade: a diagonal light gradient over the whole map, baked
+  // once here so nothing is recomputed per frame.
+  if (opts.timeOfDay) {
+    const [lit, shadow] = TIME_OF_DAY_TINT[opts.timeOfDay];
+    const g = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
+    g.addColorStop(0, lit);
+    g.addColorStop(1, shadow);
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
   }
 
   overlays.set(canvas, { water, shore, sparkle, glints });
