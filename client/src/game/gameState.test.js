@@ -1087,8 +1087,8 @@ function counterWeights(forces) {
     const count = forces[key] ?? 0;
     if (count <= 0) continue;
     const armor = armorOfKind(key);
-    w.infantry += count * damageMultiplier("bullet", armor);
-    w.tank += count * damageMultiplier("rocket", armor);
+    w.infantry += count * damageMultiplier2("bullet", armor);
+    w.tank += count * damageMultiplier2("rocket", armor);
   }
   return w;
 }

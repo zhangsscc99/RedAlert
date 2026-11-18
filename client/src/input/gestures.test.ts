@@ -224,3 +224,56 @@ test('custom thresholds are honored', () => {
   const out = g.up(1, 15, 0, T0 + 100);
   assert.equal(out[0]!.type, 'tap'); // quick + under threshold
 });
+
+test('longpress → keep holding and drag emits a box anchored at the press point', () => {
+  const g = createGestureRecognizer();
+  g.down(1, 50, 50, T0);
+  g.tick(T0 + 520); // longpress fires, phase consumed
+  g.move(1, 55, 52, T0 + 560); // ~5.8px, still inside tolerance → no drag yet
+  assert.equal(g.dragBox, null);
+  g.move(1, 90, 80, T0 + 600); // past tolerance → box select from the anchor
+  assert.deepEqual(g.dragBox, { from: { x: 50, y: 50 }, to: { x: 90, y: 80 } });
+  const out = g.up(1, 90, 80, T0 + 650);
+  assert.equal(out.length, 1);
+  assert.deepEqual(out[0], {
+    type: 'dragbox',
+    from: { x: 50, y: 50 },
+    to: { x: 90, y: 80 },
+  });
+});
+
+test('longpress → release without dragging still emits nothing extra', () => {
+  const g = createGestureRecognizer();
+  g.down(1, 50, 50, T0);
+  g.tick(T0 + 520);
+  assert.deepEqual(g.up(1, 55, 52, T0 + 560), []); // small drift, no dragbox
+});
+
+test('doubletap: second quick tap at the same spot emits doubletap, not tap', () => {
+  const g = createGestureRecognizer();
+  g.down(1, 100, 100, T0);
+  assert.equal(g.up(1, 100, 100, T0 + 80)[0]!.type, 'tap');
+  g.down(1, 105, 98, T0 + 150); // within window + distance
+  const out = g.up(1, 104, 99, T0 + 220);
+  assert.equal(out.length, 1);
+  assert.deepEqual(out[0], { type: 'doubletap', x: 104, y: 99 });
+});
+
+test('doubletap: too slow or too far apart stays two taps', () => {
+  const g = createGestureRecognizer();
+  g.down(1, 0, 0, T0);
+  assert.equal(g.up(1, 0, 0, T0 + 50)[0]!.type, 'tap');
+  g.down(1, 0, 0, T0 + 500); // > 300ms gap
+  assert.equal(g.up(1, 0, 0, T0 + 560)[0]!.type, 'tap');
+  g.down(1, 100, 0, T0 + 600); // > 24px away from last tap
+  assert.equal(g.up(1, 100, 0, T0 + 650)[0]!.type, 'tap');
+});
+
+test('doubletap: a third quick tap starts a fresh pair', () => {
+  const g = createGestureRecognizer();
+  for (const [i, want] of ['tap', 'doubletap', 'tap'].entries()) {
+    g.down(1, 10, 10, T0 + i * 200);
+    const out = g.up(1, 10, 10, T0 + i * 200 + 60);
+    assert.equal(out[0]!.type, want);
+  }
+});
