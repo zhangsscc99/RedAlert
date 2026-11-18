@@ -6,3 +6,4 @@ export * from './pathfind.js';
 export * from './units.js';
 export * from './selection.js';
 export * from './camera.js';
+export * from './gameState.js';
