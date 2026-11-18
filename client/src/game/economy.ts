@@ -1,6 +1,19 @@
 // Pure economy logic: credits account + production queue. No DOM access —
 // safe to run under node --test.
 
+/** 贫矿收入梯度：基准品位，入账不放大。 */
+export const ORE_GRADE_POOR = 1;
+/** 富矿收入梯度：同等矿量入账翻倍。 */
+export const ORE_GRADE_RICH = 2;
+/** 接近上限阈值：credits ≥ cap × 该比例视为 nearCap。 */
+export const NEAR_CAP_FRACTION = 0.9;
+/** 低资金告警阈值：credits 低于此值时 pollAlerts 报 low-funds。 */
+export const LOW_FUNDS_AT = 500;
+/** 同类告警的最小重发间隔（秒），防止每 tick 刷屏。 */
+export const ALERT_COOLDOWN = 30;
+
+export type EconomyAlert = 'low-funds' | 'near-cap' | 'storage-full';
+
 export interface Economy {
   credits: number;
   earned: number;
@@ -15,14 +28,24 @@ export interface Economy {
   storageFull?: boolean;
   /** 资金告急：credits < 0 时为 true（只标记，不做额外惩罚）。 */
   broke?: boolean;
+  /** 接近上限：credits ≥ cap × nearCapFraction（含已满）。 */
+  nearCap?: boolean;
+  /** 自定义接近上限比例，缺省 NEAR_CAP_FRACTION。 */
+  nearCapFraction?: number;
+  /** 自定义低资金告警阈值，缺省 LOW_FUNDS_AT。 */
+  lowFundsAt?: number;
   /** 因 cap 被丢弃的累计资金，便于统计/测试。 */
   lostToCap?: number;
+  /** 各类告警最近一次发出的时刻，供 pollAlerts 节流。 */
+  alertLog?: Record<string, number>;
 }
 
 export interface EconomyOptions {
   cap?: number;
   maintenanceRate?: number;
   passiveRate?: number;
+  nearCapFraction?: number;
+  lowFundsAt?: number;
 }
 
 export function createEconomy(start = 5000, opts?: EconomyOptions): Economy {
@@ -36,8 +59,13 @@ export function createEconomy(start = 5000, opts?: EconomyOptions): Economy {
     passiveRate: opts?.passiveRate,
     storageFull: false,
     broke: false,
+    nearCap: false,
+    nearCapFraction: opts?.nearCapFraction,
+    lowFundsAt: opts?.lowFundsAt,
     lostToCap: 0,
+    alertLog: {},
   };
+  refreshFlags(e);
   return e;
 }
 
@@ -53,6 +81,8 @@ export function afford(e: Economy, cost: number): boolean {
 function refreshFlags(e: Economy): void {
   e.broke = e.credits < 0;
   if (e.cap === undefined || e.credits < e.cap) e.storageFull = false;
+  e.nearCap =
+    e.cap !== undefined && e.credits >= e.cap * (e.nearCapFraction ?? NEAR_CAP_FRACTION);
 }
 
 /** 扣款；余额不足或金额非法时返回 false 且不改状态。 */
@@ -65,21 +95,25 @@ export function spend(e: Economy, amount: number): boolean {
 }
 
 /**
- * 入账；累加 earned。非法金额忽略。设了 cap 时超出部分不入账：
- * 置 storageFull 并累加 lostToCap。返回实际入账金额。
+ * 入账；累加 earned。非法金额忽略。`grade` 是矿脉品位系数（富矿
+ * ORE_GRADE_RICH 入账翻倍，缺省 ORE_GRADE_POOR），按放大后的金额入账。
+ * 设了 cap 时超出部分不入账：置 storageFull 并累加 lostToCap。
+ * 返回实际入账金额。
  */
-export function credit(e: Economy, amount: number): number {
-  if (!(amount > 0)) return 0;
-  const room = e.cap !== undefined ? Math.max(0, e.cap - e.credits) : amount;
-  const accepted = Math.min(amount, room);
+export function credit(e: Economy, amount: number, grade = ORE_GRADE_POOR): number {
+  const scaled = amount * (grade > 0 ? grade : 0);
+  if (!(scaled > 0)) return 0;
+  const room = e.cap !== undefined ? Math.max(0, e.cap - e.credits) : scaled;
+  const accepted = Math.min(scaled, room);
   if (accepted > 0) {
     e.credits += accepted;
     e.earned += accepted;
   }
-  if (accepted < amount) {
+  if (accepted < scaled) {
     e.storageFull = true;
-    e.lostToCap = (e.lostToCap ?? 0) + (amount - accepted);
+    e.lostToCap = (e.lostToCap ?? 0) + (scaled - accepted);
   }
+  refreshFlags(e);
   return accepted;
 }
 
@@ -94,6 +128,28 @@ export function incomeTick(e: Economy, dt: number, buildingCount = 0): void {
   const upkeep = (e.maintenanceRate ?? 0) * Math.max(0, buildingCount) * dt;
   if (upkeep > 0) e.credits -= upkeep;
   refreshFlags(e);
+}
+
+/**
+ * 汇总当前应发出的告警，供 UI/日志层展示。同一类告警在 ALERT_COOLDOWN
+ * 秒内最多发一次（`now` 用秒，调用方传游戏内时钟或 Date.now()/1000），
+ * 条件持续存在也只是低频重发，不会每 tick 刷屏。返回本次应发出的告警。
+ */
+export function pollAlerts(e: Economy, now: number): EconomyAlert[] {
+  const log = (e.alertLog ??= {});
+  const out: EconomyAlert[] = [];
+  const fire = (kind: EconomyAlert, cond: boolean): void => {
+    if (!cond) return;
+    const last = log[kind];
+    if (last === undefined || now - last >= ALERT_COOLDOWN) {
+      log[kind] = now;
+      out.push(kind);
+    }
+  };
+  fire('low-funds', e.broke === true || e.credits < (e.lowFundsAt ?? LOW_FUNDS_AT));
+  fire('near-cap', e.nearCap === true);
+  fire('storage-full', e.storageFull === true);
+  return out;
 }
 
 export interface QueueItem {

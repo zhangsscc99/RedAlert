@@ -582,6 +582,8 @@ function updateUnits(units, dt) {
 }
 
 // src/game/economy.ts
+var ORE_GRADE_POOR = 1;
+var NEAR_CAP_FRACTION = 0.9;
 function createEconomy(start = 5e3, opts) {
   const cap = opts?.cap;
   const e = {
@@ -593,8 +595,13 @@ function createEconomy(start = 5e3, opts) {
     passiveRate: opts?.passiveRate,
     storageFull: false,
     broke: false,
-    lostToCap: 0
+    nearCap: false,
+    nearCapFraction: opts?.nearCapFraction,
+    lowFundsAt: opts?.lowFundsAt,
+    lostToCap: 0,
+    alertLog: {}
   };
+  refreshFlags(e);
   return e;
 }
 function canAfford(e, amount) {
@@ -603,6 +610,7 @@ function canAfford(e, amount) {
 function refreshFlags(e) {
   e.broke = e.credits < 0;
   if (e.cap === void 0 || e.credits < e.cap) e.storageFull = false;
+  e.nearCap = e.cap !== void 0 && e.credits >= e.cap * (e.nearCapFraction ?? NEAR_CAP_FRACTION);
 }
 function spend(e, amount) {
   if (!canAfford(e, amount)) return false;
@@ -611,18 +619,20 @@ function spend(e, amount) {
   refreshFlags(e);
   return true;
 }
-function credit(e, amount) {
-  if (!(amount > 0)) return 0;
-  const room = e.cap !== void 0 ? Math.max(0, e.cap - e.credits) : amount;
-  const accepted = Math.min(amount, room);
+function credit(e, amount, grade = ORE_GRADE_POOR) {
+  const scaled = amount * (grade > 0 ? grade : 0);
+  if (!(scaled > 0)) return 0;
+  const room = e.cap !== void 0 ? Math.max(0, e.cap - e.credits) : scaled;
+  const accepted = Math.min(scaled, room);
   if (accepted > 0) {
     e.credits += accepted;
     e.earned += accepted;
   }
-  if (accepted < amount) {
+  if (accepted < scaled) {
     e.storageFull = true;
-    e.lostToCap = (e.lostToCap ?? 0) + (amount - accepted);
+    e.lostToCap = (e.lostToCap ?? 0) + (scaled - accepted);
   }
+  refreshFlags(e);
   return accepted;
 }
 function createQueue() {
@@ -1449,6 +1459,11 @@ function createHarvester(unit) {
   };
 }
 var reservesByMap = /* @__PURE__ */ new WeakMap();
+var gradesByMap = /* @__PURE__ */ new WeakMap();
+function oreGrade(map, i) {
+  const g = gradesByMap.get(map)?.[i];
+  return g !== void 0 && g > 0 ? g : ORE_GRADE_POOR;
+}
 function reserveTable(map) {
   let r = reservesByMap.get(map);
   if (!r) {
@@ -1484,6 +1499,14 @@ function buildingBlockers(buildings) {
     const def = BUILDING_DEFS[b.kind];
     return { gx: b.gx, gy: b.gy, w: def.w, h: def.h };
   });
+}
+function unitBlockers(hs, self) {
+  const out = [];
+  for (const o of hs) {
+    if (o === self || o.unit.kind !== "harvester") continue;
+    out.push({ gx: worldToTile(o.unit.x), gy: worldToTile(o.unit.y), w: 1, h: 1 });
+  }
+  return out;
 }
 function blockedTiles(map, blockers) {
   const out = new Uint8Array(map.w * map.h);
@@ -1648,17 +1671,20 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles) {
       h.lastY = h.unit.y;
       if (stuckT >= STUCK_SECONDS) {
         h.unit.path = [];
+        const avoid = [...blockers, ...unitBlockers(hs, h)];
+        const avoidBlocked = blockedTiles(map, avoid);
         let ok;
         if (h.state === "toOre") {
           h.replans = (h.replans ?? 0) + 1;
           const cur = h.target !== null ? idx(map, h.target.x, h.target.y) : -1;
           ok = false;
           if (h.replans > REPLAN_BEFORE_SWITCH && cur >= 0) {
-            ok = sendToOre(h, map, reserves, claims, blockers, blocked, /* @__PURE__ */ new Set([cur]));
+            ok = sendToOre(h, map, reserves, claims, avoid, avoidBlocked, /* @__PURE__ */ new Set([cur]));
           }
+          if (!ok) ok = sendToOre(h, map, reserves, claims, avoid, avoidBlocked);
           if (!ok) ok = sendToOre(h, map, reserves, claims, blockers, blocked);
         } else {
-          ok = sendToRefinery(h, map, buildings, blockers);
+          ok = sendToRefinery(h, map, buildings, avoid) || sendToRefinery(h, map, buildings, blockers);
         }
         if (!ok) toIdle(h);
         continue;
@@ -1697,8 +1723,13 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles) {
           break;
         }
         const i = idx(map, h.target.x, h.target.y);
-        const take = Math.min(HARVEST_RATE * dt, HARVEST_CAPACITY - h.cargo, reserves[i]);
-        h.cargo += take;
+        const grade = oreGrade(map, i);
+        const take = Math.min(
+          HARVEST_RATE * dt,
+          (HARVEST_CAPACITY - h.cargo) / grade,
+          reserves[i]
+        );
+        h.cargo += take * grade;
         reserves[i] = reserves[i] - take;
         if (reserves[i] <= 0) {
           reserves[i] = 0;

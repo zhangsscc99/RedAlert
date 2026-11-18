@@ -3,6 +3,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 // src/game/economy.ts
+var ORE_GRADE_POOR = 1;
+var NEAR_CAP_FRACTION = 0.9;
 function createEconomy(start = 5e3, opts) {
   const cap = opts?.cap;
   const e = {
@@ -14,8 +16,13 @@ function createEconomy(start = 5e3, opts) {
     passiveRate: opts?.passiveRate,
     storageFull: false,
     broke: false,
-    lostToCap: 0
+    nearCap: false,
+    nearCapFraction: opts?.nearCapFraction,
+    lowFundsAt: opts?.lowFundsAt,
+    lostToCap: 0,
+    alertLog: {}
   };
+  refreshFlags(e);
   return e;
 }
 function canAfford(e, amount) {
@@ -24,6 +31,7 @@ function canAfford(e, amount) {
 function refreshFlags(e) {
   e.broke = e.credits < 0;
   if (e.cap === void 0 || e.credits < e.cap) e.storageFull = false;
+  e.nearCap = e.cap !== void 0 && e.credits >= e.cap * (e.nearCapFraction ?? NEAR_CAP_FRACTION);
 }
 function spend(e, amount) {
   if (!canAfford(e, amount)) return false;
@@ -32,18 +40,20 @@ function spend(e, amount) {
   refreshFlags(e);
   return true;
 }
-function credit(e, amount) {
-  if (!(amount > 0)) return 0;
-  const room = e.cap !== void 0 ? Math.max(0, e.cap - e.credits) : amount;
-  const accepted = Math.min(amount, room);
+function credit(e, amount, grade = ORE_GRADE_POOR) {
+  const scaled = amount * (grade > 0 ? grade : 0);
+  if (!(scaled > 0)) return 0;
+  const room = e.cap !== void 0 ? Math.max(0, e.cap - e.credits) : scaled;
+  const accepted = Math.min(scaled, room);
   if (accepted > 0) {
     e.credits += accepted;
     e.earned += accepted;
   }
-  if (accepted < amount) {
+  if (accepted < scaled) {
     e.storageFull = true;
-    e.lostToCap = (e.lostToCap ?? 0) + (amount - accepted);
+    e.lostToCap = (e.lostToCap ?? 0) + (scaled - accepted);
   }
+  refreshFlags(e);
   return accepted;
 }
 function enqueue(q, e, item) {

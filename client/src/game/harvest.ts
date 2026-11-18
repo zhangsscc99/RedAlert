@@ -12,7 +12,11 @@
 // - Travel legs path with findPathAvoiding so building footprints deflect
 //   the route instead of being driven through.
 // - A watchdog re-plans whenever a traveling harvester has not moved for
-//   STUCK_SECONDS, so it can never spin in place forever.
+//   STUCK_SECONDS, so it can never spin in place forever. The re-plan
+//   first detours around tiles occupied by other harvesters (congestion
+//   lane-change), then retries the plain route, then abandons the vein.
+// - Per-tile ore grade (setOreGrade) marks rich veins: cargo is credited
+//   grade× per ore unit mined, so a rich tile pays more per round trip.
 
 import {
   idx,
@@ -27,7 +31,7 @@ import {
 import { findPathAvoiding, type Blocker } from './pathfind.js';
 import { UNIT_STATS, type Unit } from './units.js';
 import { BUILDING_DEFS, type Building } from './buildings.js';
-import { credit, type Economy } from './economy.js';
+import { credit, ORE_GRADE_POOR, type Economy } from './economy.js';
 import type { Point } from './selection.js';
 
 export const HARVEST_RATE = 140; // credits/sec pulled from the vein
@@ -100,6 +104,25 @@ export function harvesterStatus(h: Harvester): HarvesterStatus {
 // is treated as exhausted even before the caller rewrites it to GRASS.
 const reservesByMap = new WeakMap<GameMap, Float64Array>();
 
+// Per-tile ore grade (富矿/贫矿品位). Absent table or 0 → ORE_GRADE_POOR.
+// The map layer marks rich fields via setOreGrade; mining multiplies the
+// credits loaded per ore unit by the tile's grade.
+const gradesByMap = new WeakMap<GameMap, Float64Array>();
+
+export function setOreGrade(map: GameMap, x: number, y: number, grade: number): void {
+  let g = gradesByMap.get(map);
+  if (!g) {
+    g = new Float64Array(map.w * map.h).fill(ORE_GRADE_POOR);
+    gradesByMap.set(map, g);
+  }
+  g[idx(map, x, y)] = grade;
+}
+
+function oreGrade(map: GameMap, i: number): number {
+  const g = gradesByMap.get(map)?.[i];
+  return g !== undefined && g > 0 ? g : ORE_GRADE_POOR;
+}
+
 function reserveTable(map: GameMap): Float64Array {
   let r = reservesByMap.get(map);
   if (!r) {
@@ -139,6 +162,20 @@ function buildingBlockers(buildings: readonly Building[]): Blocker[] {
     const def = BUILDING_DEFS[b.kind];
     return { gx: b.gx, gy: b.gy, w: def.w, h: def.h };
   });
+}
+
+/**
+ * Congestion blockers: every other harvester's current tile, so a stuck
+ * harvester can lane-change around the traffic jam instead of queuing
+ * into it. Self is excluded or it could never path anywhere.
+ */
+function unitBlockers(hs: readonly Harvester[], self: Harvester): Blocker[] {
+  const out: Blocker[] = [];
+  for (const o of hs) {
+    if (o === self || o.unit.kind !== 'harvester') continue;
+    out.push({ gx: worldToTile(o.unit.x), gy: worldToTile(o.unit.y), w: 1, h: 1 });
+  }
+  return out;
 }
 
 /** Flat lookup matching the blocker list; used to veto stand tiles. */
@@ -401,6 +438,11 @@ export function updateHarvesters(
       h.lastY = h.unit.y;
       if (stuckT >= STUCK_SECONDS) {
         h.unit.path = [];
+        // 避堵换道：re-plan first treats tiles held by other harvesters as
+        // blocked, so a jammed corridor is routed around; plain routes are
+        // the fallback when the detour finds nothing.
+        const avoid = [...blockers, ...unitBlockers(hs, h)];
+        const avoidBlocked = blockedTiles(map, avoid);
         let ok: boolean;
         if (h.state === 'toOre') {
           // First strike: re-plan a route to the same vein. Repeated strikes
@@ -409,11 +451,14 @@ export function updateHarvesters(
           const cur = h.target !== null ? idx(map, h.target.x, h.target.y) : -1;
           ok = false;
           if (h.replans > REPLAN_BEFORE_SWITCH && cur >= 0) {
-            ok = sendToOre(h, map, reserves, claims, blockers, blocked, new Set([cur]));
+            ok = sendToOre(h, map, reserves, claims, avoid, avoidBlocked, new Set([cur]));
           }
+          if (!ok) ok = sendToOre(h, map, reserves, claims, avoid, avoidBlocked);
           if (!ok) ok = sendToOre(h, map, reserves, claims, blockers, blocked);
         } else {
-          ok = sendToRefinery(h, map, buildings, blockers);
+          ok =
+            sendToRefinery(h, map, buildings, avoid) ||
+            sendToRefinery(h, map, buildings, blockers);
         }
         if (!ok) toIdle(h);
         continue;
@@ -456,8 +501,15 @@ export function updateHarvesters(
           break;
         }
         const i = idx(map, h.target.x, h.target.y);
-        const take = Math.min(HARVEST_RATE * dt, HARVEST_CAPACITY - h.cargo, reserves[i]!);
-        h.cargo += take;
+        const grade = oreGrade(map, i);
+        // take is ore units; cargo is credits — a rich vein pays grade×
+        // per unit, so it fills the hold (and the wallet) faster.
+        const take = Math.min(
+          HARVEST_RATE * dt,
+          (HARVEST_CAPACITY - h.cargo) / grade,
+          reserves[i]!,
+        );
+        h.cargo += take * grade;
         reserves[i] = reserves[i]! - take;
         if (reserves[i]! <= 0) {
           reserves[i] = 0;

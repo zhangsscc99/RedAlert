@@ -12,11 +12,12 @@ import {
 } from './grid.js';
 import { UNIT_STATS, type Unit } from './units.js';
 import { BUILDING_DEFS, type Building, type BuildingKind } from './buildings.js';
-import { createEconomy, type Economy } from './economy.js';
+import { createEconomy, ORE_GRADE_RICH, type Economy } from './economy.js';
 import {
   createHarvester,
   updateHarvesters,
   harvesterStatus,
+  setOreGrade,
   HARVEST_CAPACITY,
   ORE_RESERVE,
   STUCK_SECONDS,
@@ -437,4 +438,140 @@ test('a harvester waiting behind a claimed vein stays standby, not depleted', ()
   assert.equal(h1.state, 'mining');
   assert.equal(h2.state, 'idle');
   assert.equal(harvesterStatus(h2), 'standby');
+});
+
+test('a rich vein pays grade× credits per round trip', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  setOreGrade(map, 10, 8, ORE_GRADE_RICH);
+  const h = createHarvester(unitAt('harvester', 8, 8));
+  const econ = createEconomy(0);
+
+  const depleted = drive([h], map, [refinery], econ, 400);
+
+  assert.deepEqual(depleted, [{ x: 10, y: 8 }]);
+  // 350 矿量 × 富矿 2 倍品位 = 700 = 一整舱
+  assert.equal(econ.credits, ORE_RESERVE * ORE_GRADE_RICH);
+  assert.equal(h.cargo, 0);
+  assert.equal(h.state, 'idle');
+});
+
+test('a stuck harvester lane-changes around a tile held by another harvester', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2); // covers (2..5, 2..4)
+  // 3-wide channel: water rows 9 and 13, passable rows 10-12 for x 4..16.
+  for (let x = 4; x <= 16; x++) {
+    setTerrain(map, x, 9, WATER);
+    setTerrain(map, x, 13, WATER);
+  }
+  setTerrain(map, 9, 12, ORE); // h1's vein inside the channel
+  setTerrain(map, 14, 11, ORE); // h2's goal at the far end
+  const h1 = createHarvester(unitAt('harvester', 9, 11)); // parked mid-channel
+  const h2 = createHarvester(unitAt('harvester', 5, 11));
+  h2.unit.id = 2;
+  const econ = createEconomy(0);
+
+  const speed = UNIT_STATS.harvester.speed;
+  UNIT_STATS.harvester.speed = 0;
+  try {
+    updateHarvesters([h1, h2], map, [refinery], econ, 0.2);
+    assert.equal(h1.state, 'mining'); // already on its vein's edge
+    assert.equal(h2.state, 'toOre');
+    assert.deepEqual(h2.target, { x: 14, y: 11 });
+    // The naive route cuts straight through the occupied lane.
+    assert.ok(
+      h2.unit.path.some((p) => worldToTile(p.x) === 9 && worldToTile(p.y) === 11),
+      'initial path should cross the jammed tile',
+    );
+
+    const ticks = Math.ceil(STUCK_SECONDS / 0.2) + 2;
+    for (let i = 0; i < ticks; i++) updateHarvesters([h1, h2], map, [refinery], econ, 0.2);
+
+    assert.equal(h2.state, 'toOre');
+    assert.deepEqual(h2.target, { x: 14, y: 11 });
+    assert.ok(h2.unit.path.length > 0);
+    assert.ok(
+      h2.unit.path.every((p) => !(worldToTile(p.x) === 9 && worldToTile(p.y) === 11)),
+      're-planned path must detour around the jammed tile',
+    );
+  } finally {
+    UNIT_STATS.harvester.speed = speed;
+  }
+});
+
+test('a vein that dries mid-travel retargets the nearest live ore', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  setTerrain(map, 12, 8, ORE); // first claim
+  setTerrain(map, 20, 8, ORE); // fallback
+  const h = createHarvester(unitAt('harvester', 8, 8));
+  const econ = createEconomy(0);
+
+  updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, 'toOre');
+  assert.deepEqual(h.target, { x: 12, y: 8 });
+
+  // Vein dies while the harvester is still en route.
+  setTerrain(map, 12, 8, GRASS);
+  for (let i = 0; i < 3; i++) updateHarvesters([h], map, [refinery], econ, 0.2);
+
+  assert.ok(h.state === 'toOre' || h.state === 'mining');
+  assert.deepEqual(h.target, { x: 20, y: 8 });
+});
+
+test('a full hold heads home even while veins still hold ore', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  setTerrain(map, 9, 8, ORE);
+  setTerrain(map, 10, 8, ORE);
+  setTerrain(map, 11, 8, ORE); // more reserve than one hold can carry
+  const h = createHarvester(unitAt('harvester', 8, 8));
+  const econ = createEconomy(0);
+
+  let sawHauling = false;
+  for (let i = 0; i < 400 && !sawHauling; i++) {
+    for (const t of updateHarvesters([h], map, [refinery], econ, 0.2)) {
+      setTerrain(map, t.x, t.y, GRASS);
+    }
+    if (h.cargo >= HARVEST_CAPACITY && h.state === 'toRefinery') sawHauling = true;
+  }
+  assert.ok(sawHauling, 'full hold switched to the return leg while ore remained');
+});
+
+test('a full hold goes home instead of chasing new ore when its vein dies en route', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  setTerrain(map, 12, 8, ORE);
+  setTerrain(map, 20, 8, ORE);
+  const h = createHarvester(unitAt('harvester', 8, 8));
+  const econ = createEconomy(0);
+
+  updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, 'toOre');
+  assert.deepEqual(h.target, { x: 12, y: 8 });
+
+  // Vein dies mid-travel while the hold is already full: 满载优先回程。
+  h.cargo = HARVEST_CAPACITY;
+  setTerrain(map, 12, 8, GRASS);
+  for (let i = 0; i < 3; i++) updateHarvesters([h], map, [refinery], econ, 0.2);
+
+  assert.equal(h.state, 'toRefinery');
+  assert.notDeepEqual(h.target, { x: 20, y: 8 });
+});
+
+test('each harvester claims the vein nearest to it', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  setTerrain(map, 16, 8, ORE);
+  const h1 = createHarvester(unitAt('harvester', 8, 7)); // nearer to (10,8)
+  const h2 = createHarvester(unitAt('harvester', 14, 9)); // nearer to (16,8)
+  h2.unit.id = 2;
+  const econ = createEconomy(0);
+
+  drive([h1, h2], map, [refinery], econ, 3);
+
+  assert.deepEqual(h1.target, { x: 10, y: 8 });
+  assert.deepEqual(h2.target, { x: 16, y: 8 });
 });
