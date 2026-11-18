@@ -15,7 +15,9 @@ import {
 import type { SlotStorage } from './saveload.js';
 
 export const REPLAYS_KEY = 'ra.replays.v1';
-export const REPLAY_MAX = 5;
+/** Default caps: newest 10 replays AND at most 256KB serialized total. */
+export const REPLAY_MAX = 10;
+export const REPLAY_MAX_BYTES = 256 * 1024;
 
 export interface ReplayMeta {
   /** Unique within the list — derived from savedAt + stream checksum. */
@@ -99,17 +101,36 @@ export interface ReplaySaveInfo {
   durationSec: number;
 }
 
+export interface ReplayLimits {
+  maxEntries?: number; // default REPLAY_MAX
+  maxBytes?: number; // default REPLAY_MAX_BYTES, measured on the JSON payload
+}
+
+export type ReplaySaveResult =
+  | { ok: true; metas: ReplayMeta[] }
+  | { ok: false; reason: 'quota' };
+
+/** Drop oldest entries until the list fits both caps (always keeps ≥1). */
+function trimToLimits(list: StoredReplay[], maxEntries: number, maxBytes: number): void {
+  while (list.length > maxEntries) list.pop();
+  while (list.length > 1 && JSON.stringify(list).length > maxBytes) list.pop();
+}
+
 /**
- * Serialize `rec` into the library ahead of older entries, capped at
- * REPLAY_MAX. Returns the updated metadata list, or null when storage
- * rejects the write (quota/private mode) — the caller just skips the entry.
+ * Serialize `rec` into the library ahead of older entries, evicting oldest
+ * first so the list stays within the entry/byte caps. If the write itself is
+ * rejected (QuotaExceeded/private mode) one more eviction + retry runs; a
+ * second rejection reports { ok:false, reason:'quota' } instead of throwing.
  */
 export function saveReplay(
   storage: SlotStorage,
   info: ReplaySaveInfo,
   rec: Replay,
   savedAt = Date.now(),
-): ReplayMeta[] | null {
+  limits: ReplayLimits = {},
+): ReplaySaveResult {
+  const maxEntries = limits.maxEntries ?? REPLAY_MAX;
+  const maxBytes = limits.maxBytes ?? REPLAY_MAX_BYTES;
   const sum = checksum(rec);
   const entry: StoredReplay = {
     ...info,
@@ -118,13 +139,20 @@ export function saveReplay(
     checksum: sum,
     data: serializeReplay(rec, { compress: true }),
   };
-  const list = [entry, ...readAll(storage)].slice(0, REPLAY_MAX);
+  const list = [entry, ...readAll(storage)];
+  trimToLimits(list, maxEntries, maxBytes);
   try {
     writeAll(storage, list);
   } catch {
-    return null;
+    // Quota rejection: sacrifice the oldest entry and retry exactly once.
+    if (list.length > 0) list.pop();
+    try {
+      writeAll(storage, list);
+    } catch {
+      return { ok: false, reason: 'quota' };
+    }
   }
-  return list.map(metaOf);
+  return { ok: true, metas: list.map(metaOf) };
 }
 
 /**

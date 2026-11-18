@@ -215,6 +215,7 @@ function parseRadar(v) {
   if (r.time !== void 0) out.time = time;
   return out;
 }
+var MAX_SAFE = Number.MAX_SAFE_INTEGER;
 var fail = (reason) => ({ ok: false, reason });
 function parseResult(text) {
   let raw;
@@ -319,8 +320,21 @@ function readMeta(storage, id) {
   if (m.result !== void 0) meta.result = m.result;
   return meta;
 }
+function inspectSlots(storage) {
+  return SLOT_IDS.map((id) => {
+    const text = storage.getItem(slotKey(id));
+    let status;
+    if (text === null) {
+      status = "empty";
+    } else {
+      const r = parseResult(text);
+      status = r.ok ? "ok" : r.reason === "bad-version" ? "version" : "corrupt";
+    }
+    return { id, meta: readMeta(storage, id), status };
+  });
+}
 function listSlots(storage) {
-  return SLOT_IDS.map((id) => ({ id, meta: readMeta(storage, id) }));
+  return inspectSlots(storage);
 }
 function resultOf(state, extra) {
   if (extra.result !== void 0) return extra.result;
@@ -389,7 +403,7 @@ test("empty storage lists three empty slots in order", () => {
   const s = memStorage();
   assert.deepEqual(
     listSlots(s),
-    SLOT_IDS.map((id) => ({ id, meta: null }))
+    SLOT_IDS.map((id) => ({ id, meta: null, status: "empty" }))
   );
   assert.equal(latestSlot(s), null);
   assert.equal(loadSlot(s, 1), null);
@@ -416,7 +430,7 @@ test("save \u2192 list \u2192 load \u2192 delete full round trip", () => {
   assert.equal(s.map.has("redalert.save.v2.2"), false);
   assert.equal(s.map.has("redalert.save.v2.2.meta"), false);
   assert.equal(loadSlot(s, 2), null);
-  assert.deepEqual(listSlots(s)[1], { id: 2, meta: null });
+  assert.deepEqual(listSlots(s)[1], { id: 2, meta: null, status: "empty" });
 });
 test("three slots are independent and never overwrite each other", () => {
   const s = memStorage();
@@ -537,4 +551,41 @@ test("v2-era save blobs in a slot still load", () => {
   const loaded = loadSlot(s, 1);
   assert.equal(loaded?.credits, 777);
   assert.equal(loaded?.units?.[0]?.kind, "tank");
+});
+test("inspectSlots reports empty/ok/corrupt/version per slot", () => {
+  const s = memStorage();
+  saveSlot(s, 1, makeState(100), { savedAt: 10 });
+  s.map.set(slotKey(2), "not json{");
+  s.map.set(slotKey(3), JSON.stringify({ version: 99, seed: 1 }));
+  const infos = inspectSlots(s);
+  assert.deepEqual(
+    infos.map((i) => i.status),
+    ["ok", "corrupt", "version"]
+  );
+  assert.equal(infos[0].meta?.credits, 100);
+  assert.equal(infos[1].meta, null);
+  assert.equal(loadSlot(s, 2), null);
+  assert.equal(loadSlot(s, 3), null);
+  assert.equal(loadSlot(s, 1)?.credits, 100);
+});
+test("a corrupt slot can be overwritten by a fresh save", () => {
+  const s = memStorage();
+  s.map.set(slotKey(1), "garbage{");
+  s.map.set(`${slotKey(1)}.meta`, "{bad");
+  assert.equal(inspectSlots(s)[0].status, "corrupt");
+  saveSlot(s, 1, makeState(777), { savedAt: 5 });
+  const info = inspectSlots(s)[0];
+  assert.equal(info.status, "ok");
+  assert.equal(info.meta?.credits, 777);
+  assert.equal(loadSlot(s, 1)?.credits, 777);
+});
+test("empty and meta-only slots read as empty status", () => {
+  const s = memStorage();
+  s.map.set(
+    `${slotKey(2)}.meta`,
+    JSON.stringify({ savedAt: 1, elapsed: 0, credits: 5, phase: "playing" })
+  );
+  const infos = inspectSlots(s);
+  assert.equal(infos[1].status, "empty");
+  assert.equal(infos[1].meta?.credits, 5);
 });

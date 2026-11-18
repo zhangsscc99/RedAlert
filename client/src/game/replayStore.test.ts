@@ -46,8 +46,9 @@ const INFO: ReplaySaveInfo = {
 test('save → list → load round-trips the stream and metadata', () => {
   const s = memStorage();
   const rec = sampleRec();
-  const list = saveReplay(s, INFO, rec, 1000);
-  assert.equal(list?.length, 1);
+  const res = saveReplay(s, INFO, rec, 1000);
+  assert.ok(res.ok);
+  assert.equal(res.metas.length, 1);
   const meta = listReplays(s)[0]!;
   assert.equal(meta.label, '遭遇战');
   assert.equal(meta.result, 'won');
@@ -129,4 +130,60 @@ test('missing id reports a readable error', () => {
   const r = loadReplay(s, 'nope');
   assert.equal(r.ok, false);
   if (!r.ok) assert.match(r.error, /回放/);
+});
+
+test('byte cap evicts oldest entries ahead of the write', () => {
+  const s = memStorage();
+  // Each entry ~250 bytes of payload; a 600-byte cap keeps at most two.
+  const big = (seed: number): Replay => {
+    const rec = createRecorder({ seed, tickMs: 50 });
+    for (let i = 0; i < 20; i++) record(rec, i, { type: 'move', unitIds: [i], x: i, y: i });
+    return rec;
+  };
+  for (let i = 0; i < 4; i++) {
+    const r = saveReplay(s, { ...INFO, label: `g${i}` }, big(i), i, {
+      maxEntries: 100,
+      maxBytes: 700,
+    });
+    assert.ok(r.ok);
+  }
+  const list = listReplays(s);
+  assert.ok(list.length < 4); // oldest evicted to fit the byte cap
+  assert.equal(list[0]!.label, 'g3'); // newest always kept
+});
+
+test('quota rejection evicts oldest and retries once', () => {
+  const s = memStorage();
+  let calls = 0;
+  const flaky: SlotStorage = {
+    getItem: (k) => (s.map.has(k) ? s.map.get(k)! : null),
+    setItem: (k, v) => {
+      calls++;
+      if (calls === 1) throw new Error('QuotaExceeded');
+      s.map.set(k, v);
+    },
+    removeItem: (k) => {
+      s.map.delete(k);
+    },
+  };
+  saveReplay(s, INFO, sampleRec(1), 1);
+  saveReplay(s, INFO, sampleRec(2), 2);
+  calls = 0;
+  const res = saveReplay(flaky, { ...INFO, label: 'new' }, sampleRec(3), 3);
+  assert.ok(res.ok); // retry after evicting the oldest succeeded
+  assert.equal(calls, 2);
+  assert.equal(listReplays(flaky).length, 2); // oldest was sacrificed
+  assert.equal(listReplays(flaky)[0]!.label, 'new');
+});
+
+test('persistent quota failure returns { ok:false, reason:quota } without throwing', () => {
+  const full: SlotStorage = {
+    getItem: () => null,
+    setItem: () => {
+      throw new Error('QuotaExceeded');
+    },
+    removeItem: () => {},
+  };
+  const res = saveReplay(full, INFO, sampleRec(), 1);
+  assert.deepEqual(res, { ok: false, reason: 'quota' });
 });

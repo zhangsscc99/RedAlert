@@ -140,7 +140,8 @@ function checksum(rec) {
 
 // src/game/replayStore.ts
 var REPLAYS_KEY = "ra.replays.v1";
-var REPLAY_MAX = 5;
+var REPLAY_MAX = 10;
+var REPLAY_MAX_BYTES = 256 * 1024;
 var isNum2 = (v) => typeof v === "number" && Number.isFinite(v);
 var isStr = (v) => typeof v === "string" && v.length > 0;
 function isStored(v) {
@@ -167,7 +168,13 @@ var metaOf = ({ data: _data, ...meta }) => meta;
 function listReplays(storage) {
   return readAll(storage).map(metaOf);
 }
-function saveReplay(storage, info, rec, savedAt = Date.now()) {
+function trimToLimits(list, maxEntries, maxBytes) {
+  while (list.length > maxEntries) list.pop();
+  while (list.length > 1 && JSON.stringify(list).length > maxBytes) list.pop();
+}
+function saveReplay(storage, info, rec, savedAt = Date.now(), limits = {}) {
+  const maxEntries = limits.maxEntries ?? REPLAY_MAX;
+  const maxBytes = limits.maxBytes ?? REPLAY_MAX_BYTES;
   const sum = checksum(rec);
   const entry = {
     ...info,
@@ -176,13 +183,19 @@ function saveReplay(storage, info, rec, savedAt = Date.now()) {
     checksum: sum,
     data: serializeReplay(rec, { compress: true })
   };
-  const list = [entry, ...readAll(storage)].slice(0, REPLAY_MAX);
+  const list = [entry, ...readAll(storage)];
+  trimToLimits(list, maxEntries, maxBytes);
   try {
     writeAll(storage, list);
   } catch {
-    return null;
+    if (list.length > 0) list.pop();
+    try {
+      writeAll(storage, list);
+    } catch {
+      return { ok: false, reason: "quota" };
+    }
   }
-  return list.map(metaOf);
+  return { ok: true, metas: list.map(metaOf) };
 }
 function loadReplay(storage, id) {
   const e = readAll(storage).find((x) => x.id === id);
@@ -239,8 +252,9 @@ var INFO = {
 test("save \u2192 list \u2192 load round-trips the stream and metadata", () => {
   const s = memStorage();
   const rec = sampleRec();
-  const list = saveReplay(s, INFO, rec, 1e3);
-  assert.equal(list?.length, 1);
+  const res = saveReplay(s, INFO, rec, 1e3);
+  assert.ok(res.ok);
+  assert.equal(res.metas.length, 1);
   const meta = listReplays(s)[0];
   assert.equal(meta.label, "\u906D\u9047\u6218");
   assert.equal(meta.result, "won");
@@ -314,4 +328,57 @@ test("missing id reports a readable error", () => {
   const r = loadReplay(s, "nope");
   assert.equal(r.ok, false);
   if (!r.ok) assert.match(r.error, /回放/);
+});
+test("byte cap evicts oldest entries ahead of the write", () => {
+  const s = memStorage();
+  const big = (seed) => {
+    const rec = createRecorder({ seed, tickMs: 50 });
+    for (let i = 0; i < 20; i++) record(rec, i, { type: "move", unitIds: [i], x: i, y: i });
+    return rec;
+  };
+  for (let i = 0; i < 4; i++) {
+    const r = saveReplay(s, { ...INFO, label: `g${i}` }, big(i), i, {
+      maxEntries: 100,
+      maxBytes: 700
+    });
+    assert.ok(r.ok);
+  }
+  const list = listReplays(s);
+  assert.ok(list.length < 4);
+  assert.equal(list[0].label, "g3");
+});
+test("quota rejection evicts oldest and retries once", () => {
+  const s = memStorage();
+  let calls = 0;
+  const flaky = {
+    getItem: (k) => s.map.has(k) ? s.map.get(k) : null,
+    setItem: (k, v) => {
+      calls++;
+      if (calls === 1) throw new Error("QuotaExceeded");
+      s.map.set(k, v);
+    },
+    removeItem: (k) => {
+      s.map.delete(k);
+    }
+  };
+  saveReplay(s, INFO, sampleRec(1), 1);
+  saveReplay(s, INFO, sampleRec(2), 2);
+  calls = 0;
+  const res = saveReplay(flaky, { ...INFO, label: "new" }, sampleRec(3), 3);
+  assert.ok(res.ok);
+  assert.equal(calls, 2);
+  assert.equal(listReplays(flaky).length, 2);
+  assert.equal(listReplays(flaky)[0].label, "new");
+});
+test("persistent quota failure returns { ok:false, reason:quota } without throwing", () => {
+  const full = {
+    getItem: () => null,
+    setItem: () => {
+      throw new Error("QuotaExceeded");
+    },
+    removeItem: () => {
+    }
+  };
+  const res = saveReplay(full, INFO, sampleRec(), 1);
+  assert.deepEqual(res, { ok: false, reason: "quota" });
 });

@@ -2386,6 +2386,7 @@ var cloneBuilding = (b) => {
 var cloneStats = (s) => ({ ...s });
 var cloneWeather = (w) => ({ ...w });
 var cloneRadar = (r) => ({ ...r });
+var MAX_SAFE = Number.MAX_SAFE_INTEGER;
 function snapshot(input) {
   const s = {
     version: SAVE_VERSION,

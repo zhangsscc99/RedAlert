@@ -215,6 +215,129 @@ function parseRadar(v) {
   if (r.time !== void 0) out.time = time;
   return out;
 }
+var MIGRATE_MAX_COORD = 8192;
+function migNum(v, dflt, min, max) {
+  const n = isNum(v) ? v : dflt;
+  return Math.min(max, Math.max(min, n));
+}
+var migStr = (v, dflt) => typeof v === "string" ? v : dflt;
+function migUnit(v) {
+  if (typeof v !== "object" || v === null) return null;
+  const u = v;
+  if (!isNum(u.id) || typeof u.kind !== "string") return null;
+  const out = {
+    id: u.id,
+    kind: u.kind,
+    x: migNum(u.x, 0, 0, MIGRATE_MAX_COORD),
+    y: migNum(u.y, 0, 0, MIGRATE_MAX_COORD),
+    hp: migNum(u.hp, 0, 0, Number.MAX_SAFE_INTEGER)
+  };
+  if (u.kills !== void 0) out.kills = migNum(u.kills, 0, 0, Number.MAX_SAFE_INTEGER);
+  return out;
+}
+function migBuilding(v) {
+  if (typeof v !== "object" || v === null) return null;
+  const b = v;
+  if (!isNum(b.id) || typeof b.kind !== "string") return null;
+  const out = {
+    id: b.id,
+    kind: b.kind,
+    gx: migNum(b.gx, 0, 0, MIGRATE_MAX_COORD),
+    gy: migNum(b.gy, 0, 0, MIGRATE_MAX_COORD),
+    hp: migNum(b.hp, 0, 0, Number.MAX_SAFE_INTEGER)
+  };
+  if (b.done !== void 0) out.done = b.done === true;
+  if (b.level !== void 0) out.level = migNum(b.level, 1, 1, 255);
+  if (b.repair !== void 0) out.repair = b.repair === true;
+  return out;
+}
+function migList(v, f) {
+  if (!Array.isArray(v)) return [];
+  const out = [];
+  for (const item of v) {
+    const m = f(item);
+    if (m !== null) out.push(m);
+  }
+  return out;
+}
+var MAX_SAFE = Number.MAX_SAFE_INTEGER;
+function migrateSnapshot(raw) {
+  const o = typeof raw === "object" && raw !== null && !Array.isArray(raw) ? raw : {};
+  const s = {
+    version: SAVE_VERSION,
+    seed: migNum(o.seed, 0, 0, MAX_SAFE),
+    credits: migNum(o.credits, 0, 0, MAX_SAFE),
+    elapsed: migNum(o.elapsed, 0, 0, MAX_SAFE),
+    units: migList(o.units, migUnit),
+    buildings: migList(o.buildings, migBuilding),
+    enemyUnits: migList(o.enemyUnits, migUnit),
+    enemyBuildings: migList(o.enemyBuildings, migBuilding)
+  };
+  if (typeof o.ai === "object" && o.ai !== null) {
+    const a = o.ai;
+    s.ai = {
+      phase: migStr(a.phase, "gather"),
+      credits: migNum(a.credits, 0, 0, MAX_SAFE),
+      army: migNum(a.army, 0, 0, MAX_SAFE),
+      wave: migNum(a.wave, 0, 0, MAX_SAFE)
+    };
+  }
+  if (typeof o.camera === "object" && o.camera !== null) {
+    const c = o.camera;
+    s.camera = {
+      x: migNum(c.x, 0, -MAX_SAFE, MAX_SAFE),
+      y: migNum(c.y, 0, -MAX_SAFE, MAX_SAFE),
+      zoom: migNum(c.zoom, 1, 0.1, 16)
+    };
+  }
+  if (typeof o.opts === "object" && o.opts !== null && !Array.isArray(o.opts)) {
+    const opts = {};
+    for (const [k, val] of Object.entries(o.opts)) {
+      if (isNum(val) || typeof val === "boolean") opts[k] = val;
+    }
+    s.opts = opts;
+  }
+  if (typeof o.difficulty === "string") s.difficulty = o.difficulty;
+  if (o.wave !== void 0) s.wave = migNum(o.wave, 0, 0, MAX_SAFE);
+  const fog = parseFog(o.fog);
+  if (fog) s.fog = fog;
+  if (typeof o.stats === "object" && o.stats !== null) {
+    const st = o.stats;
+    s.stats = {
+      unitsTrained: migNum(st.unitsTrained, 0, 0, MAX_SAFE),
+      unitsLost: migNum(st.unitsLost, 0, 0, MAX_SAFE),
+      kills: migNum(st.kills, 0, 0, MAX_SAFE),
+      buildingsBuilt: migNum(st.buildingsBuilt, 0, 0, MAX_SAFE),
+      buildingsLost: migNum(st.buildingsLost, 0, 0, MAX_SAFE),
+      oreMined: migNum(st.oreMined, 0, 0, MAX_SAFE),
+      wavesCleared: migNum(st.wavesCleared, 0, 0, MAX_SAFE),
+      elapsed: migNum(st.elapsed, 0, 0, MAX_SAFE),
+      over: st.over === true,
+      victory: st.victory === true
+    };
+  }
+  if (typeof o.weather === "object" && o.weather !== null) {
+    const w = o.weather;
+    if (isNum(w.seed)) {
+      const out = { seed: w.seed };
+      if (typeof w.kind === "string") out.kind = w.kind;
+      if (w.elapsed !== void 0) out.elapsed = migNum(w.elapsed, 0, 0, MAX_SAFE);
+      if (w.duration !== void 0) out.duration = migNum(w.duration, 0, 0, MAX_SAFE);
+      if (w.intensity !== void 0) out.intensity = migNum(w.intensity, 0, 0, 1);
+      s.weather = out;
+    }
+  }
+  if (typeof o.radar === "object" && o.radar !== null) {
+    const r = o.radar;
+    if (isNum(r.seed)) {
+      const out = { seed: r.seed };
+      if (r.phase !== void 0) out.phase = migNum(r.phase, 0, 0, MAX_SAFE);
+      if (r.time !== void 0) out.time = migNum(r.time, 0, 0, MAX_SAFE);
+      s.radar = out;
+    }
+  }
+  return s;
+}
 var fail = (reason) => ({ ok: false, reason });
 function parseResult(text) {
   let raw;
@@ -631,4 +754,59 @@ test("partial stats/weather/radar fields get defaults", () => {
 test("serialize is stable: same input produces identical strings", () => {
   assert.equal(serialize(state), serialize({ ...state, units: [...state.units ?? []] }));
   assert.equal(serialize(stateV3), serialize({ ...stateV3 }));
+});
+test("migrateSnapshot fills missing fields with defaults", () => {
+  const m = migrateSnapshot({ version: 1, units: [{ id: 7, kind: "rifle", x: 10, y: 20, hp: 40 }] });
+  assert.equal(m.version, SAVE_VERSION);
+  assert.equal(m.credits, 0);
+  assert.equal(m.seed, 0);
+  assert.equal(m.elapsed, 0);
+  assert.deepEqual(m.units, [{ id: 7, kind: "rifle", x: 10, y: 20, hp: 40 }]);
+  assert.deepEqual(m.buildings, []);
+  assert.equal(m.ai, void 0);
+});
+test("migrateSnapshot unifies v1/v2/v3 to the current version", () => {
+  for (const v of [1, 2, 3]) {
+    assert.equal(migrateSnapshot({ version: v, credits: 50 }).version, SAVE_VERSION);
+  }
+});
+test("migrateSnapshot ignores unknown fields and clamps illegal values", () => {
+  const m = migrateSnapshot({
+    version: 2,
+    credits: -500,
+    // negative funds → 0
+    elapsed: "later",
+    // wrong type → default
+    unknownFutureField: { a: 1 },
+    units: [
+      { id: 1, kind: "tank", x: -5, y: 99999, hp: -10 },
+      // clamped
+      { id: 2, kind: "bad", x: "x", y: 1, hp: 5 },
+      // x wrong type → default 0
+      { nope: true }
+      // unrecoverable entry dropped
+    ],
+    buildings: [{ id: 3, kind: "hq", gx: 4, gy: 5, hp: 100, extra: "ignored" }]
+  });
+  assert.equal(m.credits, 0);
+  assert.equal(m.elapsed, 0);
+  assert.equal("unknownFutureField" in m, false);
+  assert.equal(m.units?.length, 2);
+  assert.equal(m.units[0].x, 0);
+  assert.equal(m.units[0].y, MIGRATE_MAX_COORD);
+  assert.equal(m.units[0].hp, 0);
+  assert.equal(m.units[1].x, 0);
+  assert.equal(m.buildings[0].hp, 100);
+});
+test("migrateSnapshot never throws on garbage input", () => {
+  for (const raw of [null, 42, "text", [], void 0]) {
+    const m = migrateSnapshot(raw);
+    assert.equal(m.version, SAVE_VERSION);
+    assert.equal(m.credits, 0);
+  }
+});
+test("parse() still rejects what migrateSnapshot repairs", () => {
+  const text = JSON.stringify({ version: 2, credits: "lots" });
+  assert.equal(parse(text), null);
+  assert.equal(migrateSnapshot(JSON.parse(text)).credits, 0);
 });

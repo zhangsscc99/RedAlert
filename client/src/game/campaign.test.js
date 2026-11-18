@@ -805,6 +805,9 @@ function createHarvester(unit) {
   };
 }
 
+// src/game/save.ts
+var MAX_SAFE = Number.MAX_SAFE_INTEGER;
+
 // src/game/repair.ts
 function createRepairQueue() {
   return { jobs: [], engineers: /* @__PURE__ */ new Map() };

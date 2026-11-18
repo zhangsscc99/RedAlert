@@ -5,6 +5,8 @@ import {
   serialize,
   parse,
   parseResult,
+  migrateSnapshot,
+  MIGRATE_MAX_COORD,
   snapshot,
   encodeBase64,
   decodeBase64,
@@ -365,4 +367,62 @@ test('partial stats/weather/radar fields get defaults', () => {
 test('serialize is stable: same input produces identical strings', () => {
   assert.equal(serialize(state), serialize({ ...state, units: [...(state.units ?? [])] }));
   assert.equal(serialize(stateV3), serialize({ ...stateV3 }));
+});
+
+test('migrateSnapshot fills missing fields with defaults', () => {
+  // A minimal v1-era blob: only version + a unit.
+  const m = migrateSnapshot({ version: 1, units: [{ id: 7, kind: 'rifle', x: 10, y: 20, hp: 40 }] });
+  assert.equal(m.version, SAVE_VERSION);
+  assert.equal(m.credits, 0);
+  assert.equal(m.seed, 0);
+  assert.equal(m.elapsed, 0);
+  assert.deepEqual(m.units, [{ id: 7, kind: 'rifle', x: 10, y: 20, hp: 40 }]);
+  assert.deepEqual(m.buildings, []);
+  assert.equal(m.ai, undefined);
+});
+
+test('migrateSnapshot unifies v1/v2/v3 to the current version', () => {
+  for (const v of [1, 2, 3]) {
+    assert.equal(migrateSnapshot({ version: v, credits: 50 }).version, SAVE_VERSION);
+  }
+});
+
+test('migrateSnapshot ignores unknown fields and clamps illegal values', () => {
+  const m = migrateSnapshot({
+    version: 2,
+    credits: -500, // negative funds → 0
+    elapsed: 'later', // wrong type → default
+    unknownFutureField: { a: 1 },
+    units: [
+      { id: 1, kind: 'tank', x: -5, y: 99999, hp: -10 }, // clamped
+      { id: 2, kind: 'bad', x: 'x', y: 1, hp: 5 }, // x wrong type → default 0
+      { nope: true }, // unrecoverable entry dropped
+    ],
+    buildings: [{ id: 3, kind: 'hq', gx: 4, gy: 5, hp: 100, extra: 'ignored' }],
+  });
+  assert.equal(m.credits, 0);
+  assert.equal(m.elapsed, 0);
+  assert.equal('unknownFutureField' in m, false);
+  assert.equal(m.units?.length, 2);
+  assert.equal(m.units![0]!.x, 0);
+  assert.equal(m.units![0]!.y, MIGRATE_MAX_COORD);
+  assert.equal(m.units![0]!.hp, 0);
+  assert.equal(m.units![1]!.x, 0);
+  assert.equal(m.buildings![0]!.hp, 100);
+});
+
+test('migrateSnapshot never throws on garbage input', () => {
+  for (const raw of [null, 42, 'text', [], undefined]) {
+    const m = migrateSnapshot(raw);
+    assert.equal(m.version, SAVE_VERSION);
+    assert.equal(m.credits, 0);
+  }
+});
+
+test('parse() still rejects what migrateSnapshot repairs', () => {
+  // old decode path unchanged: negative credits parse fine (valid type) —
+  // but a wrong-typed field is corrupt for parse, defaulted for migrate.
+  const text = JSON.stringify({ version: 2, credits: 'lots' });
+  assert.equal(parse(text), null);
+  assert.equal(migrateSnapshot(JSON.parse(text)).credits, 0);
 });

@@ -356,6 +356,157 @@ function parseRadar(v: unknown): SavedRadar | null | undefined {
   return out;
 }
 
+// ------------------------------------------------------------- migration --
+
+/**
+ * Upper bound for migrated coordinates (pixels or tiles). Anything past this
+ * is treated as corrupt and clamped — a sane ceiling for any real map.
+ */
+export const MIGRATE_MAX_COORD = 8192;
+
+/** Lenient number: wrong type/NaN → dflt, then clamped into [min, max]. */
+function migNum(v: unknown, dflt: number, min: number, max: number): number {
+  const n = isNum(v) ? v : dflt;
+  return Math.min(max, Math.max(min, n));
+}
+
+const migStr = (v: unknown, dflt: string): string => (typeof v === 'string' ? v : dflt);
+
+function migUnit(v: unknown): SavedUnit | null {
+  if (typeof v !== 'object' || v === null) return null;
+  const u = v as Record<string, unknown>;
+  if (!isNum(u.id) || typeof u.kind !== 'string') return null;
+  const out: SavedUnit = {
+    id: u.id,
+    kind: u.kind,
+    x: migNum(u.x, 0, 0, MIGRATE_MAX_COORD),
+    y: migNum(u.y, 0, 0, MIGRATE_MAX_COORD),
+    hp: migNum(u.hp, 0, 0, Number.MAX_SAFE_INTEGER),
+  };
+  if (u.kills !== undefined) out.kills = migNum(u.kills, 0, 0, Number.MAX_SAFE_INTEGER);
+  return out;
+}
+
+function migBuilding(v: unknown): SavedBuilding | null {
+  if (typeof v !== 'object' || v === null) return null;
+  const b = v as Record<string, unknown>;
+  if (!isNum(b.id) || typeof b.kind !== 'string') return null;
+  const out: SavedBuilding = {
+    id: b.id,
+    kind: b.kind,
+    gx: migNum(b.gx, 0, 0, MIGRATE_MAX_COORD),
+    gy: migNum(b.gy, 0, 0, MIGRATE_MAX_COORD),
+    hp: migNum(b.hp, 0, 0, Number.MAX_SAFE_INTEGER),
+  };
+  if (b.done !== undefined) out.done = b.done === true;
+  if (b.level !== undefined) out.level = migNum(b.level, 1, 1, 255);
+  if (b.repair !== undefined) out.repair = b.repair === true;
+  return out;
+}
+
+function migList<T>(v: unknown, f: (x: unknown) => T | null): T[] {
+  if (!Array.isArray(v)) return [];
+  const out: T[] = [];
+  for (const item of v) {
+    const m = f(item);
+    if (m !== null) out.push(m);
+  }
+  return out;
+}
+
+const MAX_SAFE = Number.MAX_SAFE_INTEGER;
+
+/**
+ * Migration layer: coerce any v1/v2/v3-era snapshot (already JSON-parsed)
+ * into a current-version SaveState. Unlike parse()/parseResult it never
+ * rejects — missing fields gain defaults, unknown fields are dropped, and
+ * out-of-range values (negative credits, absurd coordinates) are clamped.
+ * Non-object input yields a fresh default snapshot.
+ */
+export function migrateSnapshot(raw: unknown): SaveState {
+  const o = (typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? raw : {}) as Record<
+    string,
+    unknown
+  >;
+  const s: SaveState = {
+    version: SAVE_VERSION,
+    seed: migNum(o.seed, 0, 0, MAX_SAFE),
+    credits: migNum(o.credits, 0, 0, MAX_SAFE),
+    elapsed: migNum(o.elapsed, 0, 0, MAX_SAFE),
+    units: migList(o.units, migUnit),
+    buildings: migList(o.buildings, migBuilding),
+    enemyUnits: migList(o.enemyUnits, migUnit),
+    enemyBuildings: migList(o.enemyBuildings, migBuilding),
+  };
+
+  if (typeof o.ai === 'object' && o.ai !== null) {
+    const a = o.ai as Record<string, unknown>;
+    s.ai = {
+      phase: migStr(a.phase, 'gather'),
+      credits: migNum(a.credits, 0, 0, MAX_SAFE),
+      army: migNum(a.army, 0, 0, MAX_SAFE),
+      wave: migNum(a.wave, 0, 0, MAX_SAFE),
+    };
+  }
+  if (typeof o.camera === 'object' && o.camera !== null) {
+    const c = o.camera as Record<string, unknown>;
+    s.camera = {
+      x: migNum(c.x, 0, -MAX_SAFE, MAX_SAFE),
+      y: migNum(c.y, 0, -MAX_SAFE, MAX_SAFE),
+      zoom: migNum(c.zoom, 1, 0.1, 16),
+    };
+  }
+  if (typeof o.opts === 'object' && o.opts !== null && !Array.isArray(o.opts)) {
+    const opts: SaveOpts = {};
+    for (const [k, val] of Object.entries(o.opts)) {
+      if (isNum(val) || typeof val === 'boolean') opts[k] = val;
+    }
+    s.opts = opts;
+  }
+  if (typeof o.difficulty === 'string') s.difficulty = o.difficulty;
+  if (o.wave !== undefined) s.wave = migNum(o.wave, 0, 0, MAX_SAFE);
+
+  const fog = parseFog(o.fog);
+  if (fog) s.fog = fog;
+
+  if (typeof o.stats === 'object' && o.stats !== null) {
+    const st = o.stats as Record<string, unknown>;
+    s.stats = {
+      unitsTrained: migNum(st.unitsTrained, 0, 0, MAX_SAFE),
+      unitsLost: migNum(st.unitsLost, 0, 0, MAX_SAFE),
+      kills: migNum(st.kills, 0, 0, MAX_SAFE),
+      buildingsBuilt: migNum(st.buildingsBuilt, 0, 0, MAX_SAFE),
+      buildingsLost: migNum(st.buildingsLost, 0, 0, MAX_SAFE),
+      oreMined: migNum(st.oreMined, 0, 0, MAX_SAFE),
+      wavesCleared: migNum(st.wavesCleared, 0, 0, MAX_SAFE),
+      elapsed: migNum(st.elapsed, 0, 0, MAX_SAFE),
+      over: st.over === true,
+      victory: st.victory === true,
+    };
+  }
+  if (typeof o.weather === 'object' && o.weather !== null) {
+    const w = o.weather as Record<string, unknown>;
+    if (isNum(w.seed)) {
+      const out: SavedWeather = { seed: w.seed };
+      if (typeof w.kind === 'string') out.kind = w.kind;
+      if (w.elapsed !== undefined) out.elapsed = migNum(w.elapsed, 0, 0, MAX_SAFE);
+      if (w.duration !== undefined) out.duration = migNum(w.duration, 0, 0, MAX_SAFE);
+      if (w.intensity !== undefined) out.intensity = migNum(w.intensity, 0, 0, 1);
+      s.weather = out;
+    }
+  }
+  if (typeof o.radar === 'object' && o.radar !== null) {
+    const r = o.radar as Record<string, unknown>;
+    if (isNum(r.seed)) {
+      const out: SavedRadar = { seed: r.seed };
+      if (r.phase !== undefined) out.phase = migNum(r.phase, 0, 0, MAX_SAFE);
+      if (r.time !== undefined) out.time = migNum(r.time, 0, 0, MAX_SAFE);
+      s.radar = out;
+    }
+  }
+  return s;
+}
+
 // ------------------------------------------------------------- public API --
 
 export type ParseFailReason =

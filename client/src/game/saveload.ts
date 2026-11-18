@@ -3,7 +3,7 @@
 // a test mock). Each slot keeps a small meta record next to the full save blob
 // so the slot list can render without parsing every snapshot.
 
-import { serialize, parse, type SaveState } from './save.js';
+import { serialize, parse, parseResult, type SaveState } from './save.js';
 
 export interface SlotStorage {
   getItem(key: string): string | null;
@@ -23,9 +23,19 @@ export interface SlotMeta {
   result?: string; // 'playing' | 'won' | 'lost' — how the match stands
 }
 
+/**
+ * Slot health for the load screen:
+ * - 'empty':   no save blob stored
+ * - 'ok':      blob parses under the current decoder
+ * - 'version': blob is well-formed but its version is outside 1..SAVE_VERSION
+ * - 'corrupt': blob present but unreadable (bad JSON, wrong field shapes)
+ */
+export type SlotStatus = 'ok' | 'empty' | 'corrupt' | 'version';
+
 export interface SlotInfo {
   id: SlotId;
-  meta: SlotMeta | null; // null = empty (or corrupt) slot
+  meta: SlotMeta | null; // null = empty (or corrupt) meta record
+  status: SlotStatus;
 }
 
 const KEY_PREFIX = 'redalert.save.v2.';
@@ -64,9 +74,28 @@ function readMeta(storage: SlotStorage, id: SlotId): SlotMeta | null {
   return meta;
 }
 
+/**
+ * All three slots in order with per-slot health. Reads never throw — a bad
+ * meta record reports meta: null while the blob's own status still shows.
+ * Corrupt/version-mismatched slots stay writable (saveSlot overwrites them).
+ */
+export function inspectSlots(storage: SlotStorage): SlotInfo[] {
+  return SLOT_IDS.map((id) => {
+    const text = storage.getItem(slotKey(id));
+    let status: SlotStatus;
+    if (text === null) {
+      status = 'empty';
+    } else {
+      const r = parseResult(text);
+      status = r.ok ? 'ok' : r.reason === 'bad-version' ? 'version' : 'corrupt';
+    }
+    return { id, meta: readMeta(storage, id), status };
+  });
+}
+
 /** All three slots in order; empty/corrupt slots report meta: null. */
 export function listSlots(storage: SlotStorage): SlotInfo[] {
-  return SLOT_IDS.map((id) => ({ id, meta: readMeta(storage, id) }));
+  return inspectSlots(storage);
 }
 
 export interface SaveSlotExtra {
