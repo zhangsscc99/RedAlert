@@ -93,6 +93,17 @@ export function drawWaterTile(ctx: CanvasRenderingContext2D, x: number, y: numbe
   ctx.fillStyle = 'rgba(140,195,235,0.22)';
   ctx.fillRect(px + 3 + (h % 20), py + 6 + ((h >>> 4) % 10), 7 + ((h >>> 7) % 5), 1);
   ctx.fillRect(px + 5 + ((h >>> 10) % 18), py + 19 + ((h >>> 14) % 9), 5 + ((h >>> 18) % 4), 1);
+
+  // Specular pinpricks — tiny bright flecks that catch the light.
+  if ((h & 7) < 3) {
+    ctx.fillStyle = 'rgba(215,240,255,0.30)';
+    ctx.fillRect(px + 4 + ((h >>> 3) % 24), py + 10 + ((h >>> 11) % 16), 2, 1);
+    ctx.fillRect(px + 8 + ((h >>> 17) % 20), py + 22 + ((h >>> 21) % 7), 1, 1);
+  }
+  // Depth shading: a darker wedge on the shadowed (bottom-right) corner.
+  ctx.fillStyle = 'rgba(8,30,60,0.10)';
+  ctx.fillRect(px + TILE_SIZE - 6, py + TILE_SIZE - 4, 6, 4);
+  ctx.fillRect(px + TILE_SIZE - 3, py + TILE_SIZE - 8, 3, 4);
 }
 
 // Directions: 0 = shore on the tile's right edge, 1 = left, 2 = bottom, 3 = top.
