@@ -438,7 +438,7 @@ function drawAntenna(
   ctx.fill();
 }
 
-/** Rotating radar dish + decorative sweep arc on the HQ. */
+/** Rotating radar dish + decorative sweep arc on the HQ; idles slow unpowered. */
 function drawRadar(
   ctx: CanvasRenderingContext2D,
   cx: number,
@@ -446,14 +446,17 @@ function drawRadar(
   r: number,
   now: number,
   id: number,
+  powered: boolean,
 ): void {
-  const a = now * 1.4 + id;
-  // sweep arc (purely decorative)
-  ctx.strokeStyle = 'rgba(140, 220, 255, 0.35)';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.arc(cx, cy, r * 1.6, a, a + 0.9);
-  ctx.stroke();
+  const a = now * (powered ? 1.4 : 0.2) + id;
+  // sweep arc (purely decorative; fades out without power)
+  if (powered) {
+    ctx.strokeStyle = 'rgba(140, 220, 255, 0.35)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r * 1.6, a, a + 0.9);
+    ctx.stroke();
+  }
   // dish pedestal
   ctx.fillStyle = 'rgba(30, 30, 30, 0.8)';
   ctx.fillRect(cx - r * 0.12, cy - r * 0.15, r * 0.24, r * 0.15);
@@ -502,9 +505,11 @@ export function drawBuildings(
   ctx: CanvasRenderingContext2D,
   cam: Camera,
   buildings: readonly GBuilding[],
+  /** Caller-supplied grid state; derived from `buildings` when omitted. */
+  lowPower?: boolean,
 ): void {
   const now = performance.now() / 1000;
-  const lowPower = isLowPower(computePower(buildings));
+  const low = lowPower ?? isLowPower(computePower(buildings));
   const dt = Math.min(0.1, lastFrameT > 0 ? now - lastFrameT : 0.016);
   lastFrameT = now;
   frameStamp++;
@@ -598,12 +603,12 @@ export function drawBuildings(
     }
 
     if (b.done && b.hp > 0) {
-      if (b.kind !== 'wall') drawWindows(ctx, b.id, s.x, s.y, w, h, !lowPower, ratio < 0.9, now);
+      if (b.kind !== 'wall') drawWindows(ctx, b.id, s.x, s.y, w, h, !low, ratio < 0.9, now);
       if (b.kind === 'hq' || b.kind === 'power') {
-        drawAntenna(ctx, s.x, s.y, w, !lowPower, now);
+        drawAntenna(ctx, s.x, s.y, w, !low, now);
       }
       if (b.kind === 'hq') {
-        drawRadar(ctx, s.x + w * 0.8, s.y + h * 0.3, Math.min(w, h) * 0.18, now, b.id);
+        drawRadar(ctx, s.x + w * 0.8, s.y + h * 0.3, Math.min(w, h) * 0.18, now, b.id, !low);
       }
     }
 
