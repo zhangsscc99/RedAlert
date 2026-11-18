@@ -1,7 +1,7 @@
 // Terrain rendering: pre-render the whole map to an offscreen canvas once,
 // then blit the visible window each frame.
 
-import { GRASS, TILE_SIZE, type Camera, type GameMap } from '../game/index.ts';
+import { GRASS, ORE, TILE_SIZE, type Camera, type GameMap } from '../game/index.ts';
 
 export function prerenderMap(map: GameMap): HTMLCanvasElement {
   const canvas = document.createElement('canvas');
@@ -12,12 +12,25 @@ export function prerenderMap(map: GameMap): HTMLCanvasElement {
   for (let y = 0; y < map.h; y++) {
     for (let x = 0; x < map.w; x++) {
       const t = map.tiles[y * map.w + x];
+      const px = x * TILE_SIZE;
+      const py = y * TILE_SIZE;
       if (t === GRASS) {
         ctx.fillStyle = (x + y) % 2 === 0 ? '#3e7f30' : '#39762c';
+        ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+      } else if (t === ORE) {
+        // Dark gold base with a few bright flecks, positioned deterministically
+        // from the tile coords so the pre-render is stable.
+        ctx.fillStyle = (x + y) % 2 === 0 ? '#6b5518' : '#625016';
+        ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+        const h = (x * 73 + y * 151) >>> 0;
+        ctx.fillStyle = '#d9b840';
+        ctx.fillRect(px + 4 + (h % 20), py + 5 + ((h >> 3) % 20), 3, 3);
+        ctx.fillRect(px + 6 + ((h >> 6) % 18), py + 9 + ((h >> 9) % 15), 4, 2);
+        ctx.fillRect(px + 5 + ((h >> 12) % 19), py + 4 + ((h >> 15) % 21), 2, 2);
       } else {
         ctx.fillStyle = (x * 7 + y * 13) % 3 === 0 ? '#1d4f8f' : '#1a4882';
+        ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
       }
-      ctx.fillRect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE);
     }
   }
 
