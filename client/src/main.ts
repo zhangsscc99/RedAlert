@@ -87,6 +87,7 @@ import {
   sellValue,
 } from './game/upgrades.js';
 import { repairCost } from './game/repair.js';
+import { drainPromotions, rankFromKills, rankName } from './game/veterancy.js';
 import {
   bestLines,
   createStats,
@@ -437,6 +438,9 @@ const keys = new Set<string>();
 
 /** Currently selected player building (unit selection lives on GUnit). */
 let selectedBuilding: GBuilding | null = null;
+/** Freshly promoted unit id → glow-until (performance.now ms), 1.5s overhead. */
+const promotedFx = new Map<number, number>();
+const PROMOTE_GLOW_MS = 1500;
 /** Battle stats for the running match; rendered by stats.ts on game over. */
 let stats: Stats = createStats();
 let statsBest: BestRecord = defaultBest();
@@ -624,6 +628,8 @@ function applyGame(g: GameState): void {
   orders.length = 0;
   attackMove.clear();
   groups.clear();
+  promotedFx.clear();
+  drainPromotions(); // drop the previous match's queued rank-ups
   touchMenu = null;
   paused = false;
   speedIdx = 0;
@@ -1890,6 +1896,64 @@ function diffCombat(prev: Map<number, CombatSnap>): void {
   effectsFromCombatEvents(events, effects);
 }
 
+/** Unit kind → HUD label (falls back to the raw kind for unlisted kinds). */
+function unitLabel(kind: string): string {
+  return BAR_DEFS.find((d) => d.kind === kind)?.label ?? kind;
+}
+
+/**
+ * Veterancy's promotion queue → one HUD message each, the promote chime and
+ * a 1.5s overhead glow (tracked in promotedFx, drawn by drawPromotionGlow).
+ * Enemy rank-ups are announced too — the kills that caused them happened in
+ * the open — but only visible foes get the glow (fog stays authoritative).
+ */
+function drainPromos(now: number): void {
+  for (const p of drainPromotions()) {
+    const u =
+      game.units.find((x) => x.id === p.unitId) ??
+      game.enemyUnits.find((x) => x.id === p.unitId);
+    const label = u ? unitLabel(u.kind) : '单位';
+    const side = u?.team === 'enemy' ? '敌方' : '';
+    const tag = p.unitId !== undefined ? ` #${p.unitId}` : '';
+    pushMessage(msgs, `${side}${label}${tag} 晋升为${rankName(p.to)}`);
+    if (u) promotedFx.set(u.id, now + PROMOTE_GLOW_MS);
+    if (!simQuiet) sfx.promote();
+  }
+}
+
+/** Expanding gold ring + rising chevron over freshly promoted units. */
+function drawPromotionGlow(now: number, foes: readonly GUnit[]): void {
+  if (promotedFx.size === 0) return;
+  for (const [id, until] of promotedFx) {
+    if (now >= until) {
+      promotedFx.delete(id);
+      continue;
+    }
+    const u = game.units.find((x) => x.id === id) ?? foes.find((x) => x.id === id);
+    if (!u) continue; // dead or hidden under fog — skip, entry still ages out
+    const t = 1 - (until - now) / PROMOTE_GLOW_MS; // 0 → 1 over the window
+    const sx = (u.x - camera.x) * camera.zoom;
+    const sy = (u.y - camera.y) * camera.zoom;
+    const r = UNIT_STATS[u.kind].radius * camera.zoom;
+    ctx.globalAlpha = Math.max(0, 1 - t);
+    ctx.strokeStyle = '#ffd94d';
+    ctx.lineWidth = Math.max(1, 2 * camera.zoom);
+    ctx.beginPath();
+    ctx.arc(sx, sy, r + 4 + t * 12 * camera.zoom, 0, Math.PI * 2);
+    ctx.stroke();
+    const hy = sy - r - (6 + t * 10) * camera.zoom;
+    const cw = Math.max(3, 6 * camera.zoom);
+    ctx.fillStyle = '#ffd94d';
+    ctx.beginPath();
+    ctx.moveTo(sx, hy - Math.max(4, 8 * camera.zoom));
+    ctx.lineTo(sx - cw, hy);
+    ctx.lineTo(sx + cw, hy);
+    ctx.closePath();
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+}
+
 /** Footprint top-left tile so the ghost stays centered under the cursor. */
 function ghostAnchor(p: Point): Point {
   const w = screenToWorld(camera, p.x, p.y);
@@ -2548,10 +2612,12 @@ function drawBanner(): void {
       ? [
           `第 ${missionIdx + 1} 关 · ${mission.def.name}`,
           `用时 ${fmtClock(mission.elapsed)} · 损失 ${stats.unitsLost}`,
+          veterancySummary(),
         ]
       : [
           `第 ${missionIdx + 1} 关 · ${mission.def.name}`,
           missionFailText(mission.failReason),
+          veterancySummary(),
         ];
     drawMissionEnd(ctx, viewW, viewH, {
       won,
@@ -2572,6 +2638,24 @@ function drawBanner(): void {
   const hover = gameoverHit(gameoverLayout(viewW, viewH), mouse.x, mouse.y);
   drawGameOver(ctx, viewW, viewH, game.phase, hover);
   drawBattleReport(ctx, viewW, viewH, [...reportCard, '', ...boardLines]);
+}
+
+/**
+ * 结算战报的老兵统计：存活单位中的老兵/精英数与击杀最多的单位
+ * （阵亡单位已离场，统计口径为幸存阵容）。
+ */
+function veterancySummary(): string {
+  let vets = 0;
+  let elites = 0;
+  let ace: GUnit | null = null;
+  for (const u of game.units) {
+    const rk = rankFromKills(u.kills ?? 0);
+    if (rk === 'veteran') vets++;
+    else if (rk === 'elite') elites++;
+    if ((u.kills ?? 0) > Math.max(0, ace?.kills ?? 0)) ace = u;
+  }
+  const aceText = ace ? `${unitLabel(ace.kind)} #${ace.id}（${ace.kills ?? 0}杀）` : '无';
+  return `老兵：${vets}　精英：${elites}　击杀王：${aceText}`;
 }
 
 /** 前置建筑未满足时的显示名（指挥部自带雷达 → 雷达站）。 */
@@ -2662,6 +2746,7 @@ function simStep(gameDt: number, now: number): void {
   const ev = tickGame(game, gameDt);
   UNIT_STATS.harvester.speed = harvestBase;
   diffCombat(prev);
+  drainPromos(now);
   updateEffects(effects, gameDt);
 
   // F701 domain events → 战报统计 / 新手引导 / 消息。
@@ -2862,6 +2947,7 @@ function frame(now: number): void {
           }
           reportCard = [
             ...reportLines(stats),
+            veterancySummary(),
             ...(statsBest.score > prevBest.score && statsBest.score > 0 ? ['★ 新纪录！'] : []),
             ...bestLines(statsBest),
           ];
@@ -2900,6 +2986,7 @@ function frame(now: number): void {
   drawUnits(ctx, camera, game.units, now);
   drawUnitsColored(ctx, camera, visibleEnemies, '#e8765a', '#5a2018');
   drawRadarContacts();
+  drawPromotionGlow(now, visibleEnemies);
 
   // Weather + day/night overlays sit on the world but under the HUD.
   if (weather.kind === 'rain') {
