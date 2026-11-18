@@ -389,33 +389,128 @@ function tickQueue(q, dt) {
   return done;
 }
 
+// src/game/unitRoles.ts
+var DAMAGE_MATRIX = {
+  bullet: { infantry: 1, vehicle: 0.5, building: 0.5 },
+  rocket: { infantry: 0.5, vehicle: 2, building: 2.5 }
+};
+function damageMultiplier(weapon, armor) {
+  return DAMAGE_MATRIX[weapon]?.[armor] ?? 0;
+}
+
 // src/game/combat.ts
 function dist(a, b) {
   return Math.hypot(a.x - b.x, a.y - b.y);
+}
+function effectiveDamage(a, t, counters = false) {
+  if (!counters || a.weapon == null || t.armor === void 0) return a.damage;
+  return a.damage * damageMultiplier(a.weapon, t.armor);
+}
+function segIntersectsRect(x1, y1, x2, y2, rx0, ry0, rx1, ry1) {
+  let lo = 0;
+  let hi = 1;
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  if (dx === 0) {
+    if (x1 < rx0 || x1 > rx1) return false;
+  } else {
+    let ta = (rx0 - x1) / dx;
+    let tb = (rx1 - x1) / dx;
+    if (ta > tb) {
+      const s = ta;
+      ta = tb;
+      tb = s;
+    }
+    lo = Math.max(lo, ta);
+    hi = Math.min(hi, tb);
+    if (lo > hi) return false;
+  }
+  if (dy === 0) {
+    if (y1 < ry0 || y1 > ry1) return false;
+  } else {
+    let ta = (ry0 - y1) / dy;
+    let tb = (ry1 - y1) / dy;
+    if (ta > tb) {
+      const s = ta;
+      ta = tb;
+      tb = s;
+    }
+    lo = Math.max(lo, ta);
+    hi = Math.min(hi, tb);
+    if (lo > hi) return false;
+  }
+  return true;
+}
+function losBlocked(a, t, occluders) {
+  for (const b of occluders) {
+    if (b.id === a.id || b.id === t.id || b.hp <= 0) continue;
+    const d = BUILDING_DEFS[b.kind];
+    const rx0 = b.gx * TILE_SIZE;
+    const ry0 = b.gy * TILE_SIZE;
+    if (segIntersectsRect(a.x, a.y, t.x, t.y, rx0, ry0, rx0 + d.w * TILE_SIZE, ry0 + d.h * TILE_SIZE)) {
+      return true;
+    }
+  }
+  return false;
 }
 function applyDamage(t, dmg) {
   t.hp = Math.max(0, t.hp - dmg);
   return t.hp === 0;
 }
-function stepCombat(all, dt) {
+function stepCombat(all, dt, opts = {}) {
+  const counters = opts.counters === true;
+  const splash = opts.splash === true;
+  const focusFire = opts.focusFire === true;
+  const occluders = opts.occluders;
   const events = [];
   for (const c of all) c.cooldown -= dt;
   for (const a of all) {
     if (a.hp <= 0 || a.cooldown > 0) continue;
     let target = null;
-    let nearest = Infinity;
-    for (const t of all) {
-      if (t === a || t.team === a.team || t.hp <= 0) continue;
-      const d = dist(a, t);
-      if (d > a.range) continue;
-      if (d < nearest || d === nearest && target !== null && t.id < target.id) {
-        nearest = d;
-        target = t;
+    if (focusFire && a.targetId != null) {
+      const locked = all.find((c) => c.id === a.targetId);
+      if (locked !== void 0 && locked !== a && locked.team !== a.team && locked.hp > 0) {
+        target = locked;
+        if (dist(a, target) > a.range || occluders !== void 0 && losBlocked(a, target, occluders)) {
+          continue;
+        }
+      } else {
+        a.targetId = null;
       }
     }
-    if (!target) continue;
-    events.push({ type: "hit", from: a.id, to: target.id, damage: a.damage });
-    if (applyDamage(target, a.damage)) events.push({ type: "death", id: target.id });
+    if (!target) {
+      let nearest = Infinity;
+      for (const t of all) {
+        if (t === a || t.team === a.team || t.hp <= 0) continue;
+        const d = dist(a, t);
+        if (d > a.range) continue;
+        if (occluders !== void 0 && losBlocked(a, t, occluders)) continue;
+        if (d < nearest || d === nearest && target !== null && t.id < target.id) {
+          nearest = d;
+          target = t;
+        }
+      }
+      if (!target) continue;
+      if (focusFire) a.targetId = target.id;
+    }
+    const dmg = effectiveDamage(a, target, counters);
+    events.push({ type: "hit", from: a.id, to: target.id, damage: dmg });
+    if (applyDamage(target, dmg)) {
+      events.push({ type: "death", id: target.id });
+      if (a.targetId === target.id) a.targetId = null;
+    }
+    const r = a.splashRadius ?? 0;
+    if (splash && r > 0) {
+      for (const v of all) {
+        if (v === target || v.hp <= 0) continue;
+        const d = Math.hypot(v.x - target.x, v.y - target.y);
+        if (d >= r) continue;
+        const vd = effectiveDamage(a, v, counters) * (1 - d / r);
+        if (!(vd > 0)) continue;
+        events.push({ type: "hit", from: a.id, to: v.id, damage: vd });
+        if (applyDamage(v, vd)) events.push({ type: "death", id: v.id });
+      }
+    }
     a.cooldown = a.cooldownMax;
   }
   return events;
