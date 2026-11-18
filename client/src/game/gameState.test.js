@@ -565,31 +565,10 @@ function credit(e, amount) {
   }
   return accepted;
 }
-function createQueue() {
-  return [];
-}
 function enqueue(q, e, item) {
   if (!spend(e, item.cost)) return false;
   q.push({ ...item });
   return true;
-}
-function tickQueue(q, dt) {
-  const done = [];
-  let remaining = dt;
-  while (q.length > 0 && remaining > 0) {
-    const head = q[0];
-    const need = head.buildTime - head.elapsed;
-    if (remaining >= need) {
-      head.elapsed = head.buildTime;
-      done.push(head);
-      q.shift();
-      remaining -= need;
-    } else {
-      head.elapsed += remaining;
-      remaining = 0;
-    }
-  }
-  return done;
 }
 
 // src/game/buildings.ts
@@ -634,6 +613,192 @@ function place(buildings, kind, gx, gy, nextId) {
   return b;
 }
 var RADAR_SCAN = { radius: 12 * TILE_SIZE, period: 5 };
+
+// src/game/upgrades.ts
+var BASE_LEVEL = 1;
+var MAX_LEVEL = 3;
+var stock = (effect) => ({
+  level: 1,
+  label: "\u57FA\u7840",
+  cost: 0,
+  time: 0,
+  effect,
+  multiplier: 1,
+  needsPower: false
+});
+var UPGRADE_TABLE = {
+  hq: {
+    1: stock("armor"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 800, time: 15, effect: "armor", multiplier: 1.25, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 1500, time: 25, effect: "armor", multiplier: 1.5, needsPower: true }
+  },
+  barracks: {
+    1: stock("production"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 300, time: 12, effect: "production", multiplier: 1.25, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 600, time: 20, effect: "production", multiplier: 1.5, needsPower: true }
+  },
+  refinery: {
+    1: stock("production"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 1e3, time: 18, effect: "production", multiplier: 1.5, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 2e3, time: 30, effect: "production", multiplier: 2, needsPower: true }
+  },
+  power: {
+    1: stock("production"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 200, time: 8, effect: "production", multiplier: 1.5, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 400, time: 15, effect: "production", multiplier: 2, needsPower: true }
+  },
+  turret: {
+    1: stock("range"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 400, time: 12, effect: "range", multiplier: 1.25, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 800, time: 20, effect: "range", multiplier: 1.5, needsPower: true }
+  },
+  wall: {
+    1: stock("armor"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 50, time: 4, effect: "armor", multiplier: 1.5, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 100, time: 8, effect: "armor", multiplier: 2, needsPower: true }
+  }
+};
+function effectAt(kind, level) {
+  const t = UPGRADE_TABLE[kind][level];
+  return { effect: t.effect, multiplier: t.multiplier };
+}
+function nextLevel(level) {
+  return level === 1 ? 2 : level === 2 ? 3 : null;
+}
+function canUpgrade(b, level, credits, powered) {
+  if (!b.done) return { ok: false, reason: "not-done" };
+  const next = nextLevel(level);
+  if (next === null) return { ok: false, reason: "max-level" };
+  const tier = UPGRADE_TABLE[b.kind][next];
+  if (tier.needsPower && !powered) return { ok: false, reason: "no-power" };
+  if (credits < tier.cost) return { ok: false, reason: "funds" };
+  return { ok: true };
+}
+var SELL_REFUND = { 1: 0.5, 2: 0.6, 3: 0.7 };
+function canSell(jobs, buildingId) {
+  return jobs.some((j) => j.buildingId === buildingId) ? { ok: false, reason: "busy" } : { ok: true };
+}
+function sellValue(def, level, hpRatio) {
+  const hp = hpRatio > 0 ? Math.min(1, hpRatio) : 0;
+  return Math.max(0, Math.round(def.cost * SELL_REFUND[level] * hp));
+}
+
+// src/game/production.ts
+var PARALLEL_PER_BARRACKS = 1;
+function createUnitQueue() {
+  return [];
+}
+var PRODUCTION_REQUIRES = {
+  infantry: ["barracks"],
+  tank: ["barracks", "hq"],
+  harvester: ["refinery"]
+};
+function requirementsFor(kind, requires) {
+  return requires ?? PRODUCTION_REQUIRES[kind] ?? [];
+}
+function missingRequirements(state, kind, requires) {
+  const missing = [];
+  for (const k of requirementsFor(kind, requires)) {
+    if (missing.includes(k)) continue;
+    if (!state.buildings.some((b) => b.kind === k && b.done)) missing.push(k);
+  }
+  return missing;
+}
+function enqueueUnitChecked(q, e, kind, opts = {}) {
+  if (opts.buildings !== void 0) {
+    const missing = missingRequirements({ buildings: opts.buildings }, kind, opts.requires);
+    if (missing.length > 0) return { ok: false, reason: "requires", missing };
+  }
+  const s = UNIT_STATS[kind];
+  const order = {
+    type: "unit",
+    key: kind,
+    kind,
+    cost: s.cost,
+    buildTime: s.buildTime,
+    elapsed: 0
+  };
+  if (opts.barracksId !== void 0) {
+    order.barracksId = opts.barracksId;
+    const p = opts.rally?.get(opts.barracksId);
+    if (p) order.rally = { x: p.x, y: p.y };
+  }
+  if (!enqueue(q, e, order)) return { ok: false, reason: "funds" };
+  return { ok: true };
+}
+function createRallyPoints() {
+  return /* @__PURE__ */ new Map();
+}
+function enqueueUpgrade(q, e, b, level, powered) {
+  if (q.some((o) => o.type === "upgrade" && o.buildingId === b.id)) {
+    return { ok: false, reason: "busy" };
+  }
+  const chk = canUpgrade(b, level, e.credits, powered);
+  if (!chk.ok) return chk;
+  const to = level === 1 ? 2 : 3;
+  const tier = UPGRADE_TABLE[b.kind][to];
+  const order = {
+    type: "upgrade",
+    key: `upgrade:${b.id}`,
+    kind: b.kind,
+    buildingId: b.id,
+    from: level,
+    to,
+    cost: tier.cost,
+    buildTime: tier.time,
+    elapsed: 0,
+    effect: tier.effect,
+    multiplier: tier.multiplier
+  };
+  if (!enqueue(q, e, order)) return { ok: false, reason: "funds" };
+  return { ok: true, order };
+}
+function laneKey(o) {
+  return o.type === "upgrade" ? o.buildingId : o.barracksId;
+}
+function tickLanes(list, dt, lanes, done) {
+  let remaining = dt;
+  while (remaining > 0) {
+    const active = Math.min(lanes, list.length);
+    if (active === 0) break;
+    let minNeed = Infinity;
+    for (let i = 0; i < active; i++) {
+      minNeed = Math.min(minNeed, list[i].buildTime - list[i].elapsed);
+    }
+    const step = Math.min(remaining, Math.max(0, minNeed));
+    for (let i = 0; i < active; i++) list[i].elapsed += step;
+    remaining -= step;
+    let removed = 0;
+    for (let i = 0; i < active; i++) {
+      const o = list[i - removed];
+      if (o.elapsed >= o.buildTime) {
+        done.push(o);
+        list.splice(i - removed, 1);
+        removed++;
+      }
+    }
+  }
+}
+function tickProduction(q, dt, parallel = PARALLEL_PER_BARRACKS) {
+  const done = [];
+  if (!(dt > 0)) return done;
+  const lanes = Math.max(1, Math.floor(parallel));
+  const groups = /* @__PURE__ */ new Map();
+  for (const o of q) {
+    const k = laneKey(o);
+    const list = groups.get(k);
+    if (list) list.push(o);
+    else groups.set(k, [o]);
+  }
+  const rest = [];
+  for (const list of groups.values()) {
+    tickLanes(list, dt, lanes, done);
+    rest.push(...list);
+  }
+  q.length = 0;
+  q.push(...rest);
+  return done;
+}
 
 // src/game/unitRoles.ts
 var ARMOR_TYPES = ["infantry", "vehicle", "building"];
@@ -1087,8 +1252,8 @@ function counterWeights(forces) {
     const count = forces[key] ?? 0;
     if (count <= 0) continue;
     const armor = armorOfKind(key);
-    w.infantry += count * damageMultiplier("bullet", armor);
-    w.tank += count * damageMultiplier("rocket", armor);
+    w.infantry += count * damageMultiplier2("bullet", armor);
+    w.tank += count * damageMultiplier2("rocket", armor);
   }
   return w;
 }
@@ -1693,114 +1858,6 @@ function snapshot(input) {
   return s;
 }
 
-// src/game/upgrades.ts
-var BASE_LEVEL = 1;
-var MAX_LEVEL = 3;
-var stock = (effect) => ({
-  level: 1,
-  label: "\u57FA\u7840",
-  cost: 0,
-  time: 0,
-  effect,
-  multiplier: 1,
-  needsPower: false
-});
-var UPGRADE_TABLE = {
-  hq: {
-    1: stock("armor"),
-    2: { level: 2, label: "\u5F3A\u5316", cost: 800, time: 15, effect: "armor", multiplier: 1.25, needsPower: true },
-    3: { level: 3, label: "\u7CBE\u82F1", cost: 1500, time: 25, effect: "armor", multiplier: 1.5, needsPower: true }
-  },
-  barracks: {
-    1: stock("production"),
-    2: { level: 2, label: "\u5F3A\u5316", cost: 300, time: 12, effect: "production", multiplier: 1.25, needsPower: true },
-    3: { level: 3, label: "\u7CBE\u82F1", cost: 600, time: 20, effect: "production", multiplier: 1.5, needsPower: true }
-  },
-  refinery: {
-    1: stock("production"),
-    2: { level: 2, label: "\u5F3A\u5316", cost: 1e3, time: 18, effect: "production", multiplier: 1.5, needsPower: true },
-    3: { level: 3, label: "\u7CBE\u82F1", cost: 2e3, time: 30, effect: "production", multiplier: 2, needsPower: true }
-  },
-  power: {
-    1: stock("production"),
-    2: { level: 2, label: "\u5F3A\u5316", cost: 200, time: 8, effect: "production", multiplier: 1.5, needsPower: true },
-    3: { level: 3, label: "\u7CBE\u82F1", cost: 400, time: 15, effect: "production", multiplier: 2, needsPower: true }
-  },
-  turret: {
-    1: stock("range"),
-    2: { level: 2, label: "\u5F3A\u5316", cost: 400, time: 12, effect: "range", multiplier: 1.25, needsPower: true },
-    3: { level: 3, label: "\u7CBE\u82F1", cost: 800, time: 20, effect: "range", multiplier: 1.5, needsPower: true }
-  },
-  wall: {
-    1: stock("armor"),
-    2: { level: 2, label: "\u5F3A\u5316", cost: 50, time: 4, effect: "armor", multiplier: 1.5, needsPower: true },
-    3: { level: 3, label: "\u7CBE\u82F1", cost: 100, time: 8, effect: "armor", multiplier: 2, needsPower: true }
-  }
-};
-function effectAt(kind, level) {
-  const t = UPGRADE_TABLE[kind][level];
-  return { effect: t.effect, multiplier: t.multiplier };
-}
-function nextLevel(level) {
-  return level === 1 ? 2 : level === 2 ? 3 : null;
-}
-function canUpgrade(b, level, credits, powered) {
-  if (!b.done) return { ok: false, reason: "not-done" };
-  const next = nextLevel(level);
-  if (next === null) return { ok: false, reason: "max-level" };
-  const tier = UPGRADE_TABLE[b.kind][next];
-  if (tier.needsPower && !powered) return { ok: false, reason: "no-power" };
-  if (credits < tier.cost) return { ok: false, reason: "funds" };
-  return { ok: true };
-}
-function startUpgrade(jobs, b, level, e, powered) {
-  if (jobs.some((j) => j.buildingId === b.id)) return { ok: false, reason: "busy" };
-  const chk = canUpgrade(b, level, e.credits, powered);
-  if (!chk.ok) return chk;
-  const to = nextLevel(level);
-  const tier = UPGRADE_TABLE[b.kind][to];
-  if (!spend(e, tier.cost)) return { ok: false, reason: "funds" };
-  const job = {
-    buildingId: b.id,
-    kind: b.kind,
-    from: level,
-    to,
-    cost: tier.cost,
-    time: tier.time,
-    elapsed: 0,
-    effect: tier.effect,
-    multiplier: tier.multiplier
-  };
-  jobs.push(job);
-  return { ok: true, job };
-}
-function tickUpgrade(jobs, dt) {
-  const done = [];
-  if (!(dt > 0)) return done;
-  for (let i = jobs.length - 1; i >= 0; i--) {
-    const j = jobs[i];
-    j.elapsed += dt;
-    if (j.elapsed >= j.time) {
-      jobs.splice(i, 1);
-      done.push({
-        buildingId: j.buildingId,
-        level: j.to,
-        effect: j.effect,
-        multiplier: j.multiplier
-      });
-    }
-  }
-  return done;
-}
-var SELL_REFUND = { 1: 0.5, 2: 0.6, 3: 0.7 };
-function canSell(jobs, buildingId) {
-  return jobs.some((j) => j.buildingId === buildingId) ? { ok: false, reason: "busy" } : { ok: true };
-}
-function sellValue(def, level, hpRatio) {
-  const hp = hpRatio > 0 ? Math.min(1, hpRatio) : 0;
-  return Math.max(0, Math.round(def.cost * SELL_REFUND[level] * hp));
-}
-
 // src/game/repair.ts
 var REPAIR_RATES = {
   /** Fraction of unit value charged for a 0→maxHp repair. */
@@ -1995,7 +2052,8 @@ function createGame(seed, opts = {}) {
     buildings: [],
     enemyBuildings: [],
     economy: createEconomy(o.credits),
-    queue: createQueue(),
+    queue: createUnitQueue(),
+    rally: createRallyPoints(),
     upgradeJobs: [],
     repairs: createRepairQueue(),
     // A shorter waveIntervalScale banks AI income faster → waves land sooner.
@@ -2073,16 +2131,60 @@ function buildAt(g, kind, gx, gy) {
   if (!spend(g.economy, def.cost)) return { ok: false, reason: "funds" };
   return { ok: true, building: addBuilding(g, g.buildings, kind, gx, gy, "player", false) };
 }
+var TRAIN_REQUIRES = {
+  infantry: ["barracks"],
+  tank: ["barracks", "hq"],
+  harvester: ["barracks"]
+};
+function missingTrainRequirements(g, kind) {
+  return missingRequirements({ buildings: g.buildings }, kind, TRAIN_REQUIRES[kind]);
+}
+function laneWorkLeft(g, laneId) {
+  let t = 0;
+  for (const o of g.queue) {
+    const id = o.type === "upgrade" ? o.buildingId : o.barracksId;
+    if (id === laneId) t += Math.max(0, o.buildTime - o.elapsed);
+  }
+  return t;
+}
+function pickProducer(g) {
+  let best;
+  let bestT = Infinity;
+  for (const b of g.buildings) {
+    if (b.kind !== "barracks" || !b.done) continue;
+    const t = laneWorkLeft(g, b.id);
+    if (t < bestT) {
+      bestT = t;
+      best = b;
+    }
+  }
+  return best;
+}
 function trainUnit(g, kind) {
   if (g.phase !== "playing") return { ok: false, reason: "ended" };
-  if (!g.buildings.some((b) => b.kind === "barracks" && b.done)) {
+  const missing = missingTrainRequirements(g, kind);
+  if (missing.length === 1 && missing[0] === "barracks") {
     return { ok: false, reason: "no-barracks" };
   }
-  const s = UNIT_STATS[kind];
-  if (!enqueue(g.queue, g.economy, { key: kind, cost: s.cost, buildTime: s.buildTime, elapsed: 0 })) {
-    return { ok: false, reason: "funds" };
-  }
+  if (missing.length > 0) return { ok: false, reason: "requires", missing };
+  const rax = pickProducer(g);
+  const r = enqueueUnitChecked(g.queue, g.economy, kind, {
+    buildings: g.buildings,
+    requires: TRAIN_REQUIRES[kind],
+    barracksId: rax?.id,
+    rally: g.rally
+  });
+  if (!r.ok) return { ok: false, reason: r.reason, missing: r.missing };
   return { ok: true };
+}
+function productionRate(g) {
+  let raxMul = 1;
+  for (const b of g.buildings) {
+    if (b.kind === "barracks" && b.done && b.level > BASE_LEVEL) {
+      raxMul = Math.max(raxMul, effectAt("barracks", b.level).multiplier);
+    }
+  }
+  return powerFactor(computePower(g.buildings)) * raxMul;
 }
 function restart(g) {
   return createGame(g.seed, g.opts);
@@ -2098,7 +2200,21 @@ function upgradeBuilding(g, buildingId) {
   if (g.phase !== "playing") return { ok: false, reason: "ended" };
   const b = playerBuilding(g, buildingId);
   if (!b) return { ok: false, reason: "missing" };
-  return startUpgrade(g.upgradeJobs, b, b.level, g.economy, gridPowered(g));
+  const r = enqueueUpgrade(g.queue, g.economy, b, b.level, gridPowered(g));
+  if (!r.ok) return r;
+  const job = {
+    buildingId: b.id,
+    kind: b.kind,
+    from: r.order.from,
+    to: r.order.to,
+    cost: r.order.cost,
+    time: r.order.buildTime,
+    elapsed: 0,
+    effect: r.order.effect,
+    multiplier: r.order.multiplier
+  };
+  g.upgradeJobs.push(job);
+  return { ok: true, job };
 }
 function sellBuilding(g, buildingId) {
   if (g.phase !== "playing") return { ok: false, reason: "ended" };
@@ -2134,15 +2250,42 @@ function stopRepair(g, buildingId) {
   const b = playerBuilding(g, buildingId);
   if (b) b.repairing = false;
 }
-function spawnTrained(g, kind) {
-  const rax = g.buildings.find((b) => b.kind === "barracks" && b.done) ?? g.buildings.find((b) => b.done) ?? g.buildings[0];
+function pruneQueue(g) {
+  const alive = new Set(g.buildings.map((b) => b.id));
+  if (g.queue.some((o) => {
+    const id = o.type === "upgrade" ? o.buildingId : o.barracksId;
+    return id !== void 0 && !alive.has(id);
+  })) {
+    g.queue = g.queue.filter((o) => {
+      const id = o.type === "upgrade" ? o.buildingId : o.barracksId;
+      return id === void 0 || alive.has(id);
+    });
+  }
+  for (const id of g.rally.keys()) {
+    if (!alive.has(id)) g.rally.delete(id);
+  }
+}
+function syncUpgradeJobs(g) {
+  if (g.upgradeJobs.length === 0) return;
+  g.upgradeJobs = g.upgradeJobs.filter((j) => {
+    const o = g.queue.find(
+      (x) => x.type === "upgrade" && x.buildingId === j.buildingId
+    );
+    if (!o) return false;
+    j.elapsed = o.elapsed;
+    return true;
+  });
+}
+function spawnTrained(g, o) {
+  const rax = (o.barracksId !== void 0 ? g.buildings.find((b) => b.id === o.barracksId && b.done) : void 0) ?? g.buildings.find((b) => b.kind === "barracks" && b.done) ?? g.buildings.find((b) => b.done) ?? g.buildings[0];
   const ax = rax ? rax.gx + (BUILDING_DEFS[rax.kind].w >> 1) : g.map.w >> 1;
   const ay = rax ? rax.gy + BUILDING_DEFS[rax.kind].h : g.map.h >> 1;
   const t = freeTilesNear(g.map, allBuildings(g), ax, ay, 1)[0];
   if (!t) return;
-  const u = makeGUnit(g.nextId++, kind, t.x, t.y, "player");
+  const u = makeGUnit(g.nextId++, o.kind, t.x, t.y, "player");
   g.units.push(u);
-  if (kind === "harvester") g.harvesters.push(createHarvester(u));
+  if (o.kind === "harvester") g.harvesters.push(createHarvester(u));
+  else if (o.rally) pathTo(g, u, o.rally);
 }
 function spawnEnemy(g, kind) {
   const t = freeTilesNear(g.map, allBuildings(g), g.enemyAnchor.x, g.enemyAnchor.y, 1)[0];
@@ -2264,28 +2407,30 @@ function tickGame(g, dt) {
       }
     }
   }
-  for (const d of tickUpgrade(g.upgradeJobs, dt)) {
-    const b = playerBuilding(g, d.buildingId);
-    if (b) {
-      b.level = d.level;
-      if (d.effect === "armor") {
-        const max = Math.round(BUILDING_DEFS[b.kind].hp * d.multiplier);
-        b.hp = Math.min(max, b.hp + Math.max(0, max - b.maxHp));
-        b.maxHp = max;
+  pruneQueue(g);
+  for (const o of tickProduction(g.queue, dt * productionRate(g))) {
+    if (o.type === "upgrade") {
+      const b = playerBuilding(g, o.buildingId);
+      if (b) {
+        b.level = o.to;
+        if (o.effect === "armor") {
+          const max = Math.round(BUILDING_DEFS[b.kind].hp * o.multiplier);
+          b.hp = Math.min(max, b.hp + Math.max(0, max - b.maxHp));
+          b.maxHp = max;
+        }
       }
+      ev.upgrades.push({
+        buildingId: o.buildingId,
+        level: o.to,
+        effect: o.effect,
+        multiplier: o.multiplier
+      });
+    } else {
+      spawnTrained(g, o);
+      ev.trained.push(o.kind);
     }
-    ev.upgrades.push(d);
   }
-  let raxMul = 1;
-  for (const b of g.buildings) {
-    if (b.kind === "barracks" && b.done && b.level > BASE_LEVEL) {
-      raxMul = Math.max(raxMul, effectAt("barracks", b.level).multiplier);
-    }
-  }
-  for (const item of tickQueue(g.queue, dt * factor * raxMul)) {
-    spawnTrained(g, item.key);
-    ev.trained.push(item.key);
-  }
+  syncUpgradeJobs(g);
   if (g.enemyBuildings.length > 0) {
     const intel = g.ai.deep ? buildAIIntel(g) : void 0;
     for (const cmd of stepAI(g.ai, dt, intel)) applyAICommand(g, cmd);
@@ -2333,10 +2478,6 @@ function tickGame(g, dt) {
     const b = playerBuilding(g, id);
     if (b) b.repairing = false;
     ev.repaired.push(id);
-  }
-  if (g.upgradeJobs.length > 0) {
-    const aliveB = new Set(g.buildings.map((b) => b.id));
-    g.upgradeJobs = g.upgradeJobs.filter((j) => aliveB.has(j.buildingId));
   }
   if (!g.opts.manualEnd) {
     if (!g.buildings.some((b) => b.kind === "hq")) g.phase = "lost";

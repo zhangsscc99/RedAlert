@@ -38,8 +38,8 @@ export interface HudLayoutOpts {
   fullscreen?: boolean;
   /** Selection card is up → messages stack above it. */
   hasSelection?: boolean;
-  /** Number of queued production items (for panel width). */
-  prodCount?: number;
+  /** Queued orders per producer lane (for panel height). */
+  prodLanes?: readonly number[];
 }
 
 export interface HudLayout {
@@ -96,13 +96,12 @@ export function computeHudLayout(
     const selH = 86;
     const selCard: Rect = { x: 12, y: viewH - selH - 12, w: 188, h: selH };
     const msgBottom = o.hasSelection ? selCard.y - 8 : viewH - 12;
-    const prodN = Math.min(o.prodCount ?? 0, 6);
-    const prodW = prodN > 0 ? 20 + prodN * 52 - 8 : 0;
+    const prod = prodPanelSize('desktop', o.prodLanes ?? []);
     const prodPanel: Rect = {
-      x: minimap.x - prodW - 12,
-      y: minimap.y + minimap.h - 80,
-      w: prodW,
-      h: prodN > 0 ? 80 : 0,
+      x: minimap.x - prod.w - 12,
+      y: viewH - 12 - prod.h,
+      w: prod.w,
+      h: prod.h,
     };
     return {
       mode,
@@ -190,17 +189,16 @@ export function computeHudLayout(
 
   // Production strip sits above the bar/dock, right-aligned; the selection
   // card keeps clear of it and of the minimap.
-  const prodN = Math.min(o.prodCount ?? 0, 6);
-  const prodW = prodN > 0 ? 20 + prodN * 52 - 8 : 0;
+  const prod = prodPanelSize(mode, o.prodLanes ?? []);
   const prodBase = buildBarOpen ? buildDock.y : actionBar.y;
   const prodPanel: Rect = {
-    x: viewW - prodW - 10,
-    y: prodBase - 8 - 80,
-    w: prodW,
-    h: prodN > 0 ? 80 : 0,
+    x: viewW - prod.w - 10,
+    y: prodBase - 8 - prod.h,
+    w: prod.w,
+    h: prod.h,
   };
   let cardRight = minimap ? minimap.x - 8 : viewW - 10;
-  if (prodN > 0) cardRight = Math.min(cardRight, prodPanel.x - 8);
+  if (prod.w > 0) cardRight = Math.min(cardRight, prodPanel.x - 8);
   const selCard: Rect = {
     x: 10,
     y: prodBase - 8 - 34,
@@ -265,18 +263,31 @@ export interface HudMessage {
   ttl0?: number;
 }
 
-/** 生产队列条目；progress ∈ [0,1]，队列顺序即数组顺序（0 为生产中）。 */
-export interface ProductionItem {
+/**
+ * One order inside a producer lane: name + progress bar + remaining time
+ * (lane head only) + click-to-cancel. `queueIndex` points back into the
+ * game queue so the hit-test can return a cancel target.
+ */
+export interface ProdOrderItem {
+  queueIndex: number;
   label: string;
+  /** 0..1 progress of this order (lane head advances; queued orders sit at ~0). */
   progress: number;
-  /** 同类排队数量（含进行中），>1 时右上角显示角标。 */
-  count?: number;
-  ready?: boolean;
+  /** Estimated seconds to completion — only set on the lane head. */
+  eta?: number;
+  /** Waiting behind the lane head → dimmer row, no countdown. */
+  queued?: boolean;
+}
+
+/** A producer's own queue: header (building name) + its orders. */
+export interface ProdLane {
+  name: string;
+  orders: ProdOrderItem[];
 }
 
 export interface HudExtras {
   messages?: readonly HudMessage[];
-  production?: readonly ProductionItem[];
+  production?: readonly ProdLane[];
 }
 
 const PANEL_BG = 'rgba(10, 14, 8, 0.72)';
@@ -600,60 +611,140 @@ export function drawSelectionCard(
   ctx.fillText(`移动中: ${moving}`, r.x + padX, y + 22 + (rows.length + 1) * 18);
 }
 
-/** 右侧生产面板：图标占位 + 名称 + 进度条，数组顺序即队列顺序。 */
+// ------------------------------------------------------ production panel --
+
+const PROD_PAD = 8;
+const PROD_LANE_GAP = 6;
+/** Orders rendered per lane before the header's xN badge takes over. */
+const PROD_MAX_ROWS = 4;
+
+/** Per-mode row metrics shared by size, draw and hit-test. */
+function prodGeom(mode: HudMode): { head: number; row: number; w: number } {
+  return mode === 'desktop'
+    ? { head: 16, row: 22, w: 200 }
+    : { head: 22, row: 32, w: 224 };
+}
+
+/** Panel size for a set of lanes (lane order counts only). */
+function prodPanelSize(mode: HudMode, laneOrders: readonly number[]): { w: number; h: number } {
+  const g = prodGeom(mode);
+  if (laneOrders.length === 0) return { w: 0, h: 0 };
+  let h = PROD_PAD * 2 + (laneOrders.length - 1) * PROD_LANE_GAP;
+  for (const n of laneOrders) h += g.head + Math.min(n, PROD_MAX_ROWS) * g.row;
+  return { w: g.w, h };
+}
+
+/**
+ * Hit-test the production panel: clicking an order row returns its
+ * `queueIndex` (cancel target); outside → null. Rows are recomputed with
+ * the same geometry drawProductionPanel uses.
+ */
+export function productionOrderAt(
+  layout: HudLayout,
+  lanes: readonly ProdLane[],
+  px: number,
+  py: number,
+): number | null {
+  const r = layout.prodPanel;
+  if (r.w <= 0 || px < r.x || px > r.x + r.w || py < r.y || py > r.y + r.h) return null;
+  const { head, row } = prodGeom(layout.mode);
+  let y = r.y + PROD_PAD;
+  for (const lane of lanes) {
+    if (lane.orders.length === 0) continue;
+    y += head;
+    const rows = Math.min(lane.orders.length, PROD_MAX_ROWS);
+    for (let k = 0; k < rows; k++) {
+      const ry = y + k * row;
+      if (py >= ry && py <= ry + row) return lane.orders[k]!.queueIndex;
+    }
+    y += rows * row + PROD_LANE_GAP;
+  }
+  return null;
+}
+
+/**
+ * 生产面板：每个生产者（兵营/升级中的建筑）一条独立队列 —— 队列头名称 +
+ * 进度条 + 剩余秒数，队尾排队项标灰，点击整行取消。
+ */
 export function drawProductionPanel(
   ctx: CanvasRenderingContext2D,
   layout: HudLayout,
-  items: readonly ProductionItem[],
+  lanes: readonly ProdLane[],
 ): void {
-  const slot = 44;
-  const gap = 8;
-  const pad = 10;
-  const visible = items.slice(0, 6);
-  if (visible.length === 0) return;
+  const r = layout.prodPanel;
+  const list = lanes.filter((l) => l.orders.length > 0);
+  if (list.length === 0 || r.w <= 0) return;
+  const { head, row } = prodGeom(layout.mode);
+  const touch = layout.mode !== 'desktop';
+  const pad = PROD_PAD;
+  const cancelW = touch ? 34 : 26;
+  const labelW = touch ? 76 : 62;
 
-  const w = pad * 2 + visible.length * (slot + gap) - gap;
-  const h = pad * 2 + slot + 16;
-  const x = layout.prodPanel.x;
-  const y = layout.prodPanel.y;
-  panel(ctx, x, y, w, h);
+  panel(ctx, r.x, r.y, r.w, r.h);
+  ctx.textBaseline = 'alphabetic';
 
-  ctx.font = '10px ui-monospace, Menlo, Consolas, monospace';
-  visible.forEach((it, i) => {
-    const sx = x + pad + i * (slot + gap);
-    const sy = y + pad;
-    const active = i === 0;
-
-    ctx.fillStyle = active ? 'rgba(93,255,93,0.10)' : 'rgba(255,255,255,0.05)';
-    ctx.fillRect(sx, sy, slot, slot);
-    ctx.strokeStyle = active ? ACCENT : 'rgba(255,255,255,0.18)';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(sx + 0.5, sy + 0.5, slot - 1, slot - 1);
-
-    // 图标占位：居中菱形 + 序号。
-    const cx = sx + slot / 2;
-    const cy = sy + slot / 2 - 3;
-    ctx.strokeStyle = it.ready ? WARN : TEXT_DIM;
-    ctx.beginPath();
-    ctx.moveTo(cx, cy - 7);
-    ctx.lineTo(cx + 7, cy);
-    ctx.lineTo(cx, cy + 7);
-    ctx.lineTo(cx - 7, cy);
-    ctx.closePath();
-    ctx.stroke();
-
+  let y = r.y + pad;
+  list.forEach((lane, li) => {
+    // Lane header: producer name + total order count.
+    ctx.font = `bold ${touch ? 12 : 11}px ui-monospace, Menlo, Consolas, monospace`;
+    ctx.fillStyle = ACCENT;
+    ctx.fillText(lane.name, r.x + pad + 2, y + head - 6);
+    ctx.font = `${touch ? 11 : 9}px ui-monospace, Menlo, Consolas, monospace`;
     ctx.fillStyle = TEXT_DIM;
+    ctx.textAlign = 'right';
+    ctx.fillText(`x${lane.orders.length}`, r.x + r.w - pad - 2, y + head - 6);
     ctx.textAlign = 'left';
-    ctx.fillText(`${i + 1}`, sx + 3, sy + 10);
-    if ((it.count ?? 1) > 1) {
-      ctx.fillStyle = TEXT_MAIN;
-      ctx.textAlign = 'right';
-      ctx.fillText(`x${it.count}`, sx + slot - 3, sy + 10);
-      ctx.textAlign = 'left';
-    }
+    y += head;
 
-    const f = Math.max(0, Math.min(1, it.progress));
-    bar(ctx, sx, sy + slot + 3, slot, 5, f, it.ready ? WARN : ACCENT);
+    const rows = lane.orders.slice(0, PROD_MAX_ROWS);
+    rows.forEach((o, k) => {
+      const ry = y + k * row;
+      const dim = o.queued === true;
+
+      ctx.fillStyle = dim ? 'rgba(255,255,255,0.025)' : 'rgba(93,255,93,0.07)';
+      ctx.fillRect(r.x + 4, ry + 1, r.w - 8, row - 2);
+      ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(r.x + 4.5, ry + 1.5, r.w - 9, row - 3);
+
+      const textY = ry + row / 2 + 4;
+      ctx.font = `${touch ? 13 : 11}px ui-monospace, Menlo, Consolas, monospace`;
+      ctx.fillStyle = dim ? TEXT_DIM : TEXT_MAIN;
+      fitText(ctx, o.label, r.x + pad + 2, textY, labelW);
+
+      const cx = r.x + r.w - pad - cancelW;
+      const barX = r.x + pad + 2 + labelW + 6;
+      const etaW = touch ? 42 : 34;
+      bar(ctx, barX, ry + row / 2 - 3, Math.max(8, cx - 6 - etaW - barX), 6, o.progress, dim ? 'rgba(125,168,122,0.5)' : ACCENT);
+
+      ctx.font = `${touch ? 11 : 9}px ui-monospace, Menlo, Consolas, monospace`;
+      ctx.fillStyle = dim ? TEXT_DIM : WARN;
+      ctx.textAlign = 'right';
+      ctx.fillText(dim ? '排队' : o.eta !== undefined ? `${Math.max(0, o.eta).toFixed(1)}s` : '', cx - 5, textY);
+      ctx.textAlign = 'left';
+
+      // 取消格：行尾 ✕ 小方框，整行可点（productionOrderAt）。
+      const boxY = ry + row / 2 - (touch ? 11 : 8.5);
+      const boxS = touch ? 22 : 17;
+      ctx.strokeStyle = 'rgba(255,107,93,0.45)';
+      ctx.strokeRect(cx + 0.5, boxY + 0.5, boxS - 1, boxS - 1);
+      ctx.fillStyle = BAD;
+      ctx.font = `bold ${touch ? 13 : 11}px ui-monospace, Menlo, Consolas, monospace`;
+      ctx.textAlign = 'center';
+      ctx.fillText('×', cx + boxS / 2, ry + row / 2 + (touch ? 5 : 4));
+      ctx.textAlign = 'left';
+    });
+    y += rows.length * row;
+
+    if (li < list.length - 1) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(r.x + pad, y + PROD_LANE_GAP / 2);
+      ctx.lineTo(r.x + r.w - pad, y + PROD_LANE_GAP / 2);
+      ctx.stroke();
+    }
+    y += PROD_LANE_GAP;
   });
 }
 

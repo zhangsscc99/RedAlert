@@ -23,16 +23,22 @@ import {
   type Building,
   type BuildingKind,
 } from './buildings.js';
+import { createEconomy, credit, spend, type Economy } from './economy.js';
 import {
-  createEconomy,
-  createQueue,
-  credit,
-  enqueue,
-  spend,
-  tickQueue,
-  type Economy,
-  type QueueItem,
-} from './economy.js';
+  cancelUnit,
+  createRallyPoints,
+  createUnitQueue,
+  enqueueUnitChecked,
+  enqueueUpgrade,
+  missingRequirements,
+  setRallyPoint,
+  tickProduction,
+  type ProductionOrder,
+  type RallyPoints,
+  type UnitOrder,
+  type UnitQueue,
+  type UpgradeOrder,
+} from './production.js';
 import { stepCombat } from './combat.js';
 import {
   createAIState,
@@ -56,8 +62,6 @@ import {
   canSell,
   effectAt,
   sellValue,
-  startUpgrade,
-  tickUpgrade,
   type StartUpgradeResult,
   type UpgradeDone,
   type UpgradeJob,
@@ -76,6 +80,7 @@ import {
 export { BUILDING_DEFS } from './buildings.js';
 export type { BuildingKind } from './buildings.js';
 export type { UnitKind } from './units.js';
+export type { ProductionOrder, RallyPoints, UnitOrder, UnitQueue, UpgradeOrder } from './production.js';
 
 export type Team = 'player' | 'enemy';
 export type Phase = 'playing' | 'won' | 'lost';
@@ -177,8 +182,9 @@ export interface GameState {
   buildings: GBuilding[]; // player buildings
   enemyBuildings: GBuilding[];
   economy: Economy;
-  queue: QueueItem[]; // unit production queue
-  upgradeJobs: UpgradeJob[]; // in-flight building upgrades (upgrades.ts)
+  queue: UnitQueue; // unit + upgrade production orders (production.ts lanes)
+  rally: RallyPoints; // per-barracks rally points: building id → world px
+  upgradeJobs: UpgradeJob[]; // mirror of queued upgrade orders (compat view)
   repairs: RepairQueue; // building repair queue (repair.ts)
   ai: AIState;
   phase: Phase;
@@ -330,7 +336,8 @@ export function createGame(seed: number, opts: GameOpts = {}): GameState {
     buildings: [],
     enemyBuildings: [],
     economy: createEconomy(o.credits),
-    queue: createQueue(),
+    queue: createUnitQueue(),
+    rally: createRallyPoints(),
     upgradeJobs: [],
     repairs: createRepairQueue(),
     // A shorter waveIntervalScale banks AI income faster → waves land sooner.
@@ -440,19 +447,112 @@ export function buildAt(g: GameState, kind: BuildingKind, gx: number, gy: number
   return { ok: true, building: addBuilding(g, g.buildings, kind, gx, gy, 'player', false) };
 }
 
-export type TrainResult = { ok: true } | { ok: false; reason: 'funds' | 'no-barracks' | 'ended' };
+/**
+ * In-game tech tree for unit production: every kind must be built at a
+ * finished barracks, and the tank additionally needs the radar dish (the HQ
+ * doubles as one). The harvester deliberately keeps only the barracks gate —
+ * training one without a refinery is legal; it just idles with no dropoff.
+ */
+export const TRAIN_REQUIRES: Record<UnitKind, readonly BuildingKind[]> = {
+  infantry: ['barracks'],
+  tank: ['barracks', 'hq'],
+  harvester: ['barracks'],
+};
 
-/** Charge up front and queue a unit; it spawns by the barracks when done. */
+/**
+ * Unmet tech prerequisites for `kind` (finished buildings only), so the UI
+ * can name the blocker — e.g. ['hq'] for the tank's missing radar.
+ */
+export function missingTrainRequirements(g: GameState, kind: UnitKind): BuildingKind[] {
+  return missingRequirements({ buildings: g.buildings }, kind, TRAIN_REQUIRES[kind]);
+}
+
+/** Remaining work queued on one producer lane (units + shared upgrades). */
+function laneWorkLeft(g: GameState, laneId: number): number {
+  let t = 0;
+  for (const o of g.queue) {
+    const id = o.type === 'upgrade' ? o.buildingId : o.barracksId;
+    if (id === laneId) t += Math.max(0, o.buildTime - o.elapsed);
+  }
+  return t;
+}
+
+/** Least-loaded finished barracks — new orders spread across producers. */
+function pickProducer(g: GameState): GBuilding | undefined {
+  let best: GBuilding | undefined;
+  let bestT = Infinity;
+  for (const b of g.buildings) {
+    if (b.kind !== 'barracks' || !b.done) continue;
+    const t = laneWorkLeft(g, b.id);
+    if (t < bestT) {
+      bestT = t;
+      best = b;
+    }
+  }
+  return best;
+}
+
+export type TrainResult =
+  | { ok: true }
+  | { ok: false; reason: 'funds' | 'no-barracks' | 'ended' | 'requires'; missing?: BuildingKind[] };
+
+/**
+ * Charge up front and queue a unit order on the least-loaded finished
+ * barracks (production.ts lane), stamped with that barracks' rally point.
+ * Tech prerequisites block the order and name the missing buildings.
+ */
 export function trainUnit(g: GameState, kind: UnitKind): TrainResult {
   if (g.phase !== 'playing') return { ok: false, reason: 'ended' };
-  if (!g.buildings.some((b) => b.kind === 'barracks' && b.done)) {
+  const missing = missingTrainRequirements(g, kind);
+  if (missing.length === 1 && missing[0] === 'barracks') {
     return { ok: false, reason: 'no-barracks' };
   }
-  const s = UNIT_STATS[kind];
-  if (!enqueue(g.queue, g.economy, { key: kind, cost: s.cost, buildTime: s.buildTime, elapsed: 0 })) {
-    return { ok: false, reason: 'funds' };
-  }
+  if (missing.length > 0) return { ok: false, reason: 'requires', missing };
+  const rax = pickProducer(g);
+  const r = enqueueUnitChecked(g.queue, g.economy, kind, {
+    buildings: g.buildings,
+    requires: TRAIN_REQUIRES[kind],
+    barracksId: rax?.id,
+    rally: g.rally,
+  });
+  if (!r.ok) return { ok: false, reason: r.reason, missing: r.missing };
   return { ok: true };
+}
+
+/** Set or move a finished barracks' rally point; pending orders re-stamp. */
+export function setRally(g: GameState, buildingId: number, to: Point): boolean {
+  const b = playerBuilding(g, buildingId);
+  if (!b || b.kind !== 'barracks' || !b.done) return false;
+  setRallyPoint(g.rally, g.queue, buildingId, to);
+  return true;
+}
+
+export type CancelOrderResult = { ok: true; refund: number } | { ok: false };
+
+/**
+ * Cancel the queue order at `index` (unit or upgrade): the refund scales
+ * with progress — 0% done pays back the full cost, 100% nothing.
+ */
+export function cancelOrder(g: GameState, index: number): CancelOrderResult {
+  if (g.phase !== 'playing') return { ok: false };
+  const o = g.queue[index];
+  if (!o) return { ok: false };
+  const progress = o.buildTime > 0 ? Math.min(1, Math.max(0, o.elapsed / o.buildTime)) : 0;
+  const refund = Math.round(o.cost * (1 - progress));
+  if (!cancelUnit(g.queue, g.economy, index)) return { ok: false };
+  syncUpgradeJobs(g);
+  return { ok: true, refund };
+}
+
+/** Effective production speed: grid factor × best upgraded-barracks bonus. */
+export function productionRate(g: GameState): number {
+  let raxMul = 1;
+  for (const b of g.buildings) {
+    if (b.kind === 'barracks' && b.done && b.level > BASE_LEVEL) {
+      raxMul = Math.max(raxMul, effectAt('barracks', b.level).multiplier);
+    }
+  }
+  return powerFactor(computePower(g.buildings)) * raxMul;
 }
 
 /** Fresh state with the same seed + options (main.ts swaps its reference). */
@@ -476,12 +576,31 @@ export type UpgradeStartResult =
   | StartUpgradeResult
   | { ok: false; reason: 'ended' | 'missing' };
 
-/** Queue an upgrade job on a player building via upgrades.ts. */
+/**
+ * Queue an upgrade order on a player building via production.ts: it joins
+ * the shared production queue and occupies that building's own lane, so
+ * upgrading a barracks competes with its training orders. `upgradeJobs`
+ * keeps a mirrored UpgradeJob entry for HUD/sell checks.
+ */
 export function upgradeBuilding(g: GameState, buildingId: number): UpgradeStartResult {
   if (g.phase !== 'playing') return { ok: false, reason: 'ended' };
   const b = playerBuilding(g, buildingId);
   if (!b) return { ok: false, reason: 'missing' };
-  return startUpgrade(g.upgradeJobs, b, b.level, g.economy, gridPowered(g));
+  const r = enqueueUpgrade(g.queue, g.economy, b, b.level, gridPowered(g));
+  if (!r.ok) return r;
+  const job: UpgradeJob = {
+    buildingId: b.id,
+    kind: b.kind,
+    from: r.order.from,
+    to: r.order.to,
+    cost: r.order.cost,
+    time: r.order.buildTime,
+    elapsed: 0,
+    effect: r.order.effect,
+    multiplier: r.order.multiplier,
+  };
+  g.upgradeJobs.push(job);
+  return { ok: true, job };
 }
 
 export type SellResult =
@@ -543,9 +662,52 @@ export function stopRepair(g: GameState, buildingId: number): void {
 
 // ------------------------------------------------------------------ tick ---
 
-/** Spawn a trained player unit next to a finished barracks (or any building). */
-function spawnTrained(g: GameState, kind: UnitKind): void {
+/** Drop orders whose producer/target left the field, plus stale rallies. */
+function pruneQueue(g: GameState): void {
+  const alive = new Set(g.buildings.map((b) => b.id));
+  if (
+    g.queue.some((o) => {
+      const id = o.type === 'upgrade' ? o.buildingId : o.barracksId;
+      return id !== undefined && !alive.has(id);
+    })
+  ) {
+    g.queue = g.queue.filter((o) => {
+      const id = o.type === 'upgrade' ? o.buildingId : o.barracksId;
+      return id === undefined || alive.has(id);
+    });
+  }
+  for (const id of g.rally.keys()) {
+    if (!alive.has(id)) g.rally.delete(id);
+  }
+}
+
+/**
+ * Keep `upgradeJobs` in step with the production queue: each mirror copies
+ * its order's elapsed time; mirrors whose order finished, was cancelled, or
+ * died with its building are swept. The queue orders are authoritative.
+ */
+function syncUpgradeJobs(g: GameState): void {
+  if (g.upgradeJobs.length === 0) return;
+  g.upgradeJobs = g.upgradeJobs.filter((j) => {
+    const o = g.queue.find(
+      (x): x is UpgradeOrder => x.type === 'upgrade' && x.buildingId === j.buildingId,
+    );
+    if (!o) return false;
+    j.elapsed = o.elapsed;
+    return true;
+  });
+}
+
+/**
+ * Spawn a finished unit order next to its producing barracks (falling back
+ * to any finished building if it died mid-build). Combat units head for the
+ * order's rally point; harvesters hand control to their ore-loop FSM.
+ */
+function spawnTrained(g: GameState, o: UnitOrder): void {
   const rax =
+    (o.barracksId !== undefined
+      ? g.buildings.find((b) => b.id === o.barracksId && b.done)
+      : undefined) ??
     g.buildings.find((b) => b.kind === 'barracks' && b.done) ??
     g.buildings.find((b) => b.done) ??
     g.buildings[0];
@@ -553,9 +715,10 @@ function spawnTrained(g: GameState, kind: UnitKind): void {
   const ay = rax ? rax.gy + BUILDING_DEFS[rax.kind].h : g.map.h >> 1;
   const t = freeTilesNear(g.map, allBuildings(g), ax, ay, 1)[0];
   if (!t) return;
-  const u = makeGUnit(g.nextId++, kind, t.x, t.y, 'player');
+  const u = makeGUnit(g.nextId++, o.kind, t.x, t.y, 'player');
   g.units.push(u);
-  if (kind === 'harvester') g.harvesters.push(createHarvester(u));
+  if (o.kind === 'harvester') g.harvesters.push(createHarvester(u));
+  else if (o.rally) pathTo(g, u, o.rally);
 }
 
 /** Spawn an AI-trained enemy next to its base anchor. */
@@ -719,33 +882,36 @@ export function tickGame(g: GameState, dt: number): TickEvents {
     }
   }
 
-  // Upgrade jobs tick in parallel; completion raises the building's level
-  // and applies the tier effect (armor grows maxHp and heals the delta).
-  for (const d of tickUpgrade(g.upgradeJobs, dt)) {
-    const b = playerBuilding(g, d.buildingId);
-    if (b) {
-      b.level = d.level;
-      if (d.effect === 'armor') {
-        const max = Math.round(BUILDING_DEFS[b.kind].hp * d.multiplier);
-        b.hp = Math.min(max, b.hp + Math.max(0, max - b.maxHp));
-        b.maxHp = max;
-      }
-    }
-    ev.upgrades.push(d);
-  }
+  // Producers that died or were sold take their queued orders with them
+  // (the paid cost is lost — same rule upgrades.ts used for its jobs).
+  pruneQueue(g);
 
-  // Finished production items spawn at a working barracks; an upgraded
-  // barracks (production effect) pushes the queue faster.
-  let raxMul = 1;
-  for (const b of g.buildings) {
-    if (b.kind === 'barracks' && b.done && b.level > BASE_LEVEL) {
-      raxMul = Math.max(raxMul, effectAt('barracks', b.level).multiplier);
+  // Production lanes tick per producer (production.ts): each finished unit
+  // order spawns at its own barracks and walks its rally; each finished
+  // upgrade order applies its tier (armor grows maxHp and heals the delta).
+  for (const o of tickProduction(g.queue, dt * productionRate(g))) {
+    if (o.type === 'upgrade') {
+      const b = playerBuilding(g, o.buildingId);
+      if (b) {
+        b.level = o.to;
+        if (o.effect === 'armor') {
+          const max = Math.round(BUILDING_DEFS[b.kind].hp * o.multiplier);
+          b.hp = Math.min(max, b.hp + Math.max(0, max - b.maxHp));
+          b.maxHp = max;
+        }
+      }
+      ev.upgrades.push({
+        buildingId: o.buildingId,
+        level: o.to,
+        effect: o.effect,
+        multiplier: o.multiplier,
+      });
+    } else {
+      spawnTrained(g, o);
+      ev.trained.push(o.kind);
     }
   }
-  for (const item of tickQueue(g.queue, dt * factor * raxMul)) {
-    spawnTrained(g, item.key as UnitKind);
-    ev.trained.push(item.key as UnitKind);
-  }
+  syncUpgradeJobs(g);
 
   // Enemy AI emits commands; the AI dies with its base.
   if (g.enemyBuildings.length > 0) {
@@ -812,12 +978,6 @@ export function tickGame(g: GameState, dt: number): TickEvents {
     const b = playerBuilding(g, id);
     if (b) b.repairing = false;
     ev.repaired.push(id);
-  }
-
-  // Upgrade jobs die with their building (the spent cost is lost).
-  if (g.upgradeJobs.length > 0) {
-    const aliveB = new Set(g.buildings.map((b) => b.id));
-    g.upgradeJobs = g.upgradeJobs.filter((j) => aliveB.has(j.buildingId));
   }
 
   // Mission mode owns the end state: objectives (not annihilation) decide it.
