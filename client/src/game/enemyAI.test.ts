@@ -5,9 +5,14 @@ import {
   AI_BASE_CAP,
   AI_BUILDING_COST,
   AI_DEFEND_RATIO,
+  AI_FOCUS_HOLD,
   AI_INCOME_PER_TICK,
   AI_INFANTRY_PER_WAVE,
   AI_REFINERY_INCOME,
+  AI_RETREAT_BY_DIFFICULTY,
+  AI_RETREAT_RATIO,
+  AI_SCOUT_MAX,
+  counterWeights,
   createAIState,
   stepAI,
   type AIBuildKind,
@@ -451,4 +456,235 @@ test('a confirmed refinery raises income; a barracks raises training tempo', () 
   t.buildings = { refinery: 1, barracks: 1, turret: 1 };
   const cmds = stepAI(t, 1, { buildings: { refinery: 1, barracks: 1, turret: 1 } });
   assert.equal(cmds.filter((c) => c.type === 'train').length, 2);
+});
+
+// ------------------------------------------------------- F803: tactics --
+
+test('tactics implies the deep machine and starts blind', () => {
+  const s = createAIState(1, 1, { tactics: true });
+  assert.ok(s.tactics);
+  assert.ok(s.deep, 'tactics implies deep');
+  assert.equal(s.known.tick, -1);
+  assert.equal(s.known.pos, null);
+  assert.equal(s.focus, null);
+  assert.equal(s.healing, 0);
+
+  // Opt-out stays exactly the legacy machine.
+  const legacy = createAIState(1);
+  assert.equal(legacy.tactics, false);
+  assert.equal(legacy.retreatRatio, AI_RETREAT_RATIO);
+});
+
+test('counterWeights scores a known composition through the damage matrix', () => {
+  const vsInfantry = counterWeights({ infantry: 6 });
+  assert.ok(vsInfantry.infantry > vsInfantry.tank, 'bullets answer infantry');
+
+  const vsVehicles = counterWeights({ tank: 3, harvester: 2 });
+  assert.ok(vsVehicles.tank > vsVehicles.infantry, 'rockets answer vehicles and miners');
+
+  const vsStructures = counterWeights({ barracks: 2, refinery: 1 });
+  assert.ok(vsStructures.tank > vsStructures.infantry, 'rockets answer buildings');
+
+  assert.deepEqual(counterWeights({}), { infantry: 0, tank: 0 });
+});
+
+test('tactics sends a periodic 1–2 unit recon after the opening scout', () => {
+  const s = createAIState(42, 1, { tactics: true, scoutPeriod: 5 });
+  const cmds = runFor(s, 45);
+  const scouts = cmds.filter((c) => c.type === 'scout');
+  // Opening scout plus the first periodic pair.
+  assert.ok(scouts.length >= 3, `expected recon dispatches, got ${scouts.length}`);
+  assert.ok(s.scoutsActive <= AI_SCOUT_MAX);
+  // Every scout dispatch is paired with a fresh cheap infantry.
+  for (const [i, c] of cmds.entries()) {
+    if (c.type !== 'scout') continue;
+    const prev = cmds[i - 1];
+    assert.ok(prev && prev.type === 'train' && prev.kind === 'infantry');
+  }
+});
+
+test('lost recon units are replaced on the next period', () => {
+  const s = createAIState(42, 1, { tactics: true, scoutPeriod: 3 });
+  runFor(s, 36); // through the opening scout and the first recon pair
+  assert.equal(s.scoutsActive, AI_SCOUT_MAX);
+
+  // One casualty report → the next period re-dispatches the pair.
+  const cmds: AICommand[] = [];
+  for (let t = 0; t < 10; t++) {
+    cmds.push(...stepAI(s, 1, t === 0 ? { scouts: 0 } : undefined));
+  }
+  const scouts = cmds.filter((c) => c.type === 'scout');
+  assert.ok(scouts.length >= 2, 'recon losses get replaced');
+  assert.equal(s.scoutsActive, AI_SCOUT_MAX);
+});
+
+test('tactics banks sightings into the known intel picture', () => {
+  const s = createAIState(7, 1, { tactics: true });
+  s.phase = 'attack';
+  s.army = 10;
+  stepAI(s, 1, {
+    sightings: [
+      { kind: 'infantry', x: 100, y: 100 },
+      { kind: 'infantry', x: 200, y: 300 },
+      { kind: 'harvester', x: 150, y: 200 },
+      { kind: 'barracks', x: 150, y: 200 },
+    ],
+  });
+  assert.deepEqual(s.known.pos, { x: 150, y: 200 }, 'position is the sighting centroid');
+  assert.equal(s.known.units.infantry, 2);
+  assert.equal(s.known.units.harvester, 1);
+  assert.equal(s.known.structures.barracks, 1);
+  assert.equal(s.known.tick, s.ticks);
+  assert.ok(s.spotted, 'a sighting counts as contact');
+});
+
+test('tactics counter-picks from the banked composition after going blind', () => {
+  const s = createAIState(5, 1, { tactics: true, musterSize: 100 });
+  s.phase = 'muster';
+  s.army = AI_INFANTRY_PER_WAVE; // past the guaranteed infantry screen
+  s.credits = 5000;
+
+  // One scouting report: the player runs vehicles — tanks counter them.
+  stepAI(s, 1, {
+    sightings: [
+      { kind: 'tank', x: 0, y: 0 },
+      { kind: 'tank', x: 0, y: 0 },
+      { kind: 'harvester', x: 0, y: 0 },
+    ],
+  });
+  // The scout is gone, but the banked picture still steers production.
+  const kinds = runFor(s, 10).flatMap((c) => (c.type === 'train' ? [c.kind] : []));
+  assert.ok(kinds.length > 0);
+  assert.ok(kinds.every((k) => k === 'tank'));
+});
+
+test('the wave locks one focus target and holds it through the hold window', () => {
+  const s = createAIState(7, 1, { tactics: true });
+  s.phase = 'attack';
+  s.army = 8;
+  const sights = [
+    { kind: 'tank' as const, x: 10, y: 10 },
+    { kind: 'harvester' as const, x: 20, y: 20 },
+  ];
+  const first = stepAI(s, 1, { sightings: sights });
+  const f = first.find((c) => c.type === 'focus');
+  assert.ok(f && f.type === 'focus');
+  assert.deepEqual(f.to, { x: 20, y: 20 }, 'the harvester outranks a tank');
+
+  // A wounded high-value target appears mid-hold → no retarget jitter.
+  const hotter = [...sights, { kind: 'barracks' as const, x: 99, y: 99, hpRatio: 0.1 }];
+  for (let i = 0; i < AI_FOCUS_HOLD - 1; i++) {
+    const c = stepAI(s, 1, { sightings: hotter });
+    assert.ok(!c.some((x) => x.type === 'focus'), 'locked target is held');
+  }
+
+  // Once the hold lapses the best target is re-picked.
+  const later = stepAI(s, 1, { sightings: hotter });
+  const f2 = later.find((c) => c.type === 'focus');
+  assert.ok(f2 && f2.type === 'focus');
+  assert.deepEqual(f2.to, { x: 99, y: 99 });
+});
+
+test('retreated units queue for repairs and healed ones rejoin the push', () => {
+  const s = createAIState(7, 1, { tactics: true });
+  s.phase = 'attack';
+  s.army = 10;
+  const anchor = { x: 1, y: 2 };
+
+  const r = stepAI(s, 1, { lowHp: 3, anchor });
+  const retreat = r.find((c) => c.type === 'retreat');
+  assert.ok(retreat && retreat.type === 'retreat');
+  assert.equal(retreat.count, 3, 'the host is told how many fell back');
+  assert.equal(s.healing, 3);
+
+  const next = stepAI(s, 1, {
+    healed: 2,
+    sightings: [{ kind: 'harvester', x: 50, y: 50 }],
+  });
+  const j = next.find((c) => c.type === 'rejoin');
+  assert.ok(j && j.type === 'rejoin');
+  assert.equal(j.count, 2);
+  assert.deepEqual(j.to, { x: 50, y: 50 }, 'healed units head for the known enemy');
+  assert.equal(s.healing, 1);
+});
+
+test('tactics scales the retreat threshold by difficulty', () => {
+  const easy = createAIState(1, 1, { tactics: true, difficulty: 'easy' });
+  const normal = createAIState(1, 1, { tactics: true });
+  const hard = createAIState(1, 1, { tactics: true, difficulty: 'hard' });
+  assert.equal(easy.retreatRatio, AI_RETREAT_BY_DIFFICULTY.easy);
+  assert.equal(normal.retreatRatio, AI_RETREAT_BY_DIFFICULTY.normal);
+  assert.equal(hard.retreatRatio, AI_RETREAT_BY_DIFFICULTY.hard);
+  assert.ok(easy.retreatRatio < normal.retreatRatio);
+  assert.ok(normal.retreatRatio < hard.retreatRatio);
+
+  const custom = createAIState(1, 1, { tactics: true, retreatRatio: 0.5 });
+  assert.equal(custom.retreatRatio, 0.5, 'explicit override still wins');
+});
+
+test('tactics waves grow each launch and early commits still rest', () => {
+  const s = createAIState(5, 1, { tactics: true });
+  s.phase = 'muster';
+  s.wave = 1; // the next wave musters larger than the flat base size
+  s.army = s.musterSize;
+  s.sinceWave = s.waveGap;
+  stepAI(s, 1);
+  assert.equal(s.wave, 1, 'base muster size is not enough for the second wave');
+  s.army = s.musterSize + 2; // the +growth wave
+  stepAI(s, 1);
+  assert.equal(s.wave, 2);
+
+  // Contact lets a wave commit early, but never inside its minimum rest.
+  const tac = createAIState(5, 1, { tactics: true });
+  tac.phase = 'muster';
+  tac.army = 10;
+  tac.sinceWave = 0;
+  for (let i = 0; i < 11; i++) stepAI(tac, 1, { contact: true });
+  assert.equal(tac.wave, 0, 'still waiting out the rest window');
+  stepAI(tac, 1, { contact: true });
+  assert.equal(tac.wave, 1);
+
+  // Plain deep mode has no rest rule — contact commits immediately.
+  const deep = createAIState(5, 1, { deep: true });
+  deep.phase = 'muster';
+  deep.army = 10;
+  deep.sinceWave = 0;
+  stepAI(deep, 1, { contact: true });
+  assert.equal(deep.wave, 1);
+});
+
+test('without tactics no focus/rejoin/periodic-scout commands are emitted', () => {
+  const s = createAIState(9, 1, { deep: true });
+  s.phase = 'attack';
+  s.army = 10;
+  const cmds = stepAI(s, 1, {
+    sightings: [{ kind: 'harvester', x: 1, y: 1 }],
+    healed: 3,
+    lowHp: 2,
+    scouts: 0,
+  });
+  assert.ok(!cmds.some((c) => c.type === 'focus'));
+  assert.ok(!cmds.some((c) => c.type === 'rejoin'));
+  assert.equal(s.known.tick, -1, 'the deep machine stays blind to sightings');
+
+  // A full legacy run beyond any recon cadence emits no scouts at all.
+  const legacy = runFor(createAIState(9), 90);
+  assert.ok(!legacy.some((c) => c.type === 'scout'));
+});
+
+test('tactics mode is deterministic per seed and intel sequence', () => {
+  const run = (): AICommand[] => {
+    const s = createAIState(7, 1, { tactics: true, scoutPeriod: 8 });
+    const out: AICommand[] = [];
+    for (let t = 0; t < 120; t++) {
+      out.push(
+        ...stepAI(s, 1, {
+          sightings: t === 50 ? [{ kind: 'harvester', x: 30, y: 30 }] : [],
+          contact: t >= 55,
+        }),
+      );
+    }
+    return out;
+  };
+  assert.deepEqual(run(), run());
 });
