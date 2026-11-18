@@ -1,7 +1,15 @@
 // Terrain rendering: pre-render the whole map to an offscreen canvas once,
 // then blit the visible window each frame.
 
-import { GRASS, ORE, TILE_SIZE, type Camera, type GameMap } from '../game/index.ts';
+import { ORE, WATER, TILE_SIZE, type Camera, type GameMap } from '../game/index.ts';
+import {
+  SHORE_DX,
+  SHORE_DY,
+  drawOreTile,
+  drawShoreEdge,
+  drawWaterTile,
+  makeGrassTexture,
+} from './textures.ts';
 
 export function prerenderMap(map: GameMap): HTMLCanvasElement {
   const canvas = document.createElement('canvas');
@@ -9,27 +17,45 @@ export function prerenderMap(map: GameMap): HTMLCanvasElement {
   canvas.height = map.h * TILE_SIZE;
   const ctx = canvas.getContext('2d')!;
 
+  // Grass everywhere first via a pre-rendered noise pattern; water and ore
+  // are drawn over it.
+  const grassTex = makeGrassTexture();
+  ctx.fillStyle = ctx.createPattern(grassTex, 'repeat')!;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
   for (let y = 0; y < map.h; y++) {
     for (let x = 0; x < map.w; x++) {
       const t = map.tiles[y * map.w + x];
-      const px = x * TILE_SIZE;
-      const py = y * TILE_SIZE;
-      if (t === GRASS) {
-        ctx.fillStyle = (x + y) % 2 === 0 ? '#3e7f30' : '#39762c';
-        ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+      if (t === WATER) {
+        drawWaterTile(ctx, x, y);
       } else if (t === ORE) {
-        // Dark gold base with a few bright flecks, positioned deterministically
-        // from the tile coords so the pre-render is stable.
-        ctx.fillStyle = (x + y) % 2 === 0 ? '#6b5518' : '#625016';
-        ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
-        const h = (x * 73 + y * 151) >>> 0;
-        ctx.fillStyle = '#d9b840';
-        ctx.fillRect(px + 4 + (h % 20), py + 5 + ((h >> 3) % 20), 3, 3);
-        ctx.fillRect(px + 6 + ((h >> 6) % 18), py + 9 + ((h >> 9) % 15), 4, 2);
-        ctx.fillRect(px + 5 + ((h >> 12) % 19), py + 4 + ((h >> 15) % 21), 2, 2);
-      } else {
-        ctx.fillStyle = (x * 7 + y * 13) % 3 === 0 ? '#1d4f8f' : '#1a4882';
-        ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+        // Density = neighbouring ore count, so vein centres grow richer
+        // crystal clusters than isolated fringe cells.
+        let density = 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = x + dx;
+            const ny = y + dy;
+            if (nx >= 0 && ny >= 0 && nx < map.w && ny < map.h && map.tiles[ny * map.w + nx] === ORE) {
+              density++;
+            }
+          }
+        }
+        drawOreTile(ctx, x, y, density);
+      }
+    }
+  }
+
+  // Shoreline pass: inside each water tile, edge bands + foam facing land.
+  for (let y = 0; y < map.h; y++) {
+    for (let x = 0; x < map.w; x++) {
+      if (map.tiles[y * map.w + x] !== WATER) continue;
+      for (let d = 0; d < 4; d++) {
+        const nx = x + SHORE_DX[d]!;
+        const ny = y + SHORE_DY[d]!;
+        if (nx < 0 || ny < 0 || nx >= map.w || ny >= map.h) continue;
+        if (map.tiles[ny * map.w + nx] !== WATER) drawShoreEdge(ctx, x, y, d);
       }
     }
   }
