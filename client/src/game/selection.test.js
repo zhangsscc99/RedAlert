@@ -35,7 +35,7 @@ function selectUnits(units, picked, additive) {
 
 // src/game/selection.test.ts
 function mkUnit(id, x, y) {
-  return { id, x, y, angle: 0, speed: 70, path: [], selected: false };
+  return { id, kind: "infantry", hp: 50, maxHp: 50, x, y, angle: 0, speed: 70, path: [], selected: false };
 }
 test("normRect normalizes any corner order", () => {
   assert.deepEqual(normRect({ x: 10, y: 20 }, { x: 4, y: 8 }), { x: 4, y: 8, w: 6, h: 12 });
