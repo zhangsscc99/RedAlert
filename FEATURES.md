@@ -132,3 +132,23 @@
 - [x] F708 存档 v3：save.ts 快照加入迷雾已探明位图、统计快照、建筑等级与受损状态、老兵经验、天气/雷达种子，兼容读 v1/v2；saveload.ts 三槽位保持旧 API 与旧存档可读｜verify: bash scripts/build-tests.sh && node --test client/src/game/save.test.js && node --test client/src/game/saveload.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
 - [x] F709 自适应音频：music.ts 加战斗强度驱动的三段编曲（平静/交战/溃败）无缝切换与音量回退；sfx.ts 加单位应答音（选中/下令/阵亡，振荡器合成、无外部素材）与分组音量｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
 - [x] F710 战斗反馈特效：game/effects.ts 加弹坑残留、残骸粒子、爆炸冲击波环与震屏强度数值，render/effects.ts 绘制（updateEffects/drawEffects 签名不变）｜verify: bash scripts/build-tests.sh && node --test client/src/game/effects.test.js && (cd client && npx tsc --noEmit)｜risk: low
+
+## M8 并行车道批（2026-11-18 19:45 UTC）— 战役模式落地 + 战斗纵深 + 表现层
+
+> 现状判断（本轮 grep 实测）：`missions.ts`（5 关定义、目标推进、星评价）与 `veterancy.ts`
+> 在 `main.ts` / `gameState.ts` / `index.ts` 里引用数全为 **0** —— 上一轮造好却没接线的孤儿模块；
+> 玩家依旧只有无尽遭遇战，没有关卡、没有目标、没有星级；单位击杀不成长；
+> AI 只会攒钱出兵，生产没有科技前置，电力没有实际惩罚；渲染与音频仍偏「程序员 Demo」。
+> 本批 F801 是**唯一**允许改 `main.ts` / `gameState.ts` / `render/hud.ts` / `render/menu.ts` / `index.html` 的车道；
+> 其余九条各自独占文件，只加不改旧签名（可加可选字段），禁止改 FEATURES.md，禁止互相 import 对方新符号。
+
+- [ ] F801 战役模式上线：菜单加「战役」入口与 5 关关卡选择（复用 missions.ts 的 MISSIONS），开局按 MissionDef 布置双方编成与初始资金，游戏中 HUD 显示目标列表与进度、计时与存活/占领提示，达成目标走 updateMission → 胜利结算按 rateMission 出 1–3 星并解锁下一关，失败给出重试；关卡进度与星级存 localStorage；战役与遭遇战互不影响｜verify: bash scripts/build-tests.sh && node --test client/src/game/missions.test.js && (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: med
+- [ ] F802 老兵成长接入战斗：Unit 加可选 kills/rank 字段（不破坏旧构造），combat.ts 结算击杀时用 veterancy.addKill 累计并按 damageMultiplier/armorMultiplier 生效，晋升记录事件供 UI 取用；新增纯函数 resolveDamage 的等级参数化测试｜verify: bash scripts/build-tests.sh && node --test client/src/game/combat.test.js && node --test client/src/game/veterancy.test.js && node --test client/src/game/units.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F803 敌方 AI 战术纵深：enemyAI.ts 加侦察小队、按玩家编成选克制兵种、集火优先目标、残血撤退回修、按难度分波次增兵；旧导出与默认行为保持一致，新行为由参数开启并补测试｜verify: bash scripts/build-tests.sh && node --test client/src/game/enemyAI.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F804 科技前置与建筑功能：production.ts 加科技/建筑前置解锁（无兵营不能出兵、无雷达不能出坦克）、队列优先级与退款规则；buildings.ts 让雷达提供扫描与视野加成、维修厂自动修复邻接载具、建造完成产出一次补给；旧签名不变｜verify: bash scripts/build-tests.sh && node --test client/src/game/production.test.js && node --test client/src/game/buildings.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F805 经济与矿车手感：economy.ts 加资金上限、低资金告警与被动收入节奏；harvest.ts 加矿车排队不打架、矿脉枯竭后自动迁矿、被堵超时换道与满载提示；纯逻辑可测，旧签名不变｜verify: bash scripts/build-tests.sh && node --test client/src/game/economy.test.js && node --test client/src/game/harvest.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F806 电力与视野联动：power.ts 加低电惩罚（生产减速、炮塔充能变慢）与电力缺口分级；fog.ts 加建筑/单位视野半径差异化、雷达扫描短暂揭示、被摧毁后视野收缩；纯逻辑可测｜verify: bash scripts/build-tests.sh && node --test client/src/game/power.test.js && node --test client/src/game/fog.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F807 单位表现再升级：render/units.ts 按兵种加行走循环帧、坦克履带尘与炮塔朝向分离、步兵卧倒/射击火光、矿车满载抖动、选中体显示老兵角标位（读可选 rank），drawUnits 签名不变｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F808 建筑表现再升级：render/buildings.ts 加建造完成闪光与吊装动画、电力不足时窗口变暗、受损分级贴花与裂缝、炮塔待机扫描与开火后坐、雷达碟旋转，签名不变｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F809 地形与天气视觉：render/terrain.ts 加季节色调、道路与建筑地基过渡、矿脉储量可视化；render/weather.ts 让雨雪在地面积水/积雪并影响能见度绘制，保持既有导出签名｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F810 音频层次：audio/music.ts 三段编曲加乐器分层与关卡切换淡入淡出；audio/sfx.ts 加建造/采矿/警报/晋升音与空间化音量衰减，振荡器合成无外部素材｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
