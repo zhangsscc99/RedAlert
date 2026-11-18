@@ -123,6 +123,7 @@ interface UnitTrack {
   hp: number;
   hitAt: number; // timestamp of last hp drop, for the white damage flash
   dustAcc: number; // distance since last dust puff, world px
+  markAcc: number; // distance since last tread-mark stamp, world px
   turret: number; // smoothed turret angle, rad (world space)
   seenAt: number; // last frame counter this unit was drawn — stale-track GC
 }
@@ -131,10 +132,14 @@ const track = new Map<number, UnitTrack>();
 let frameNo = 0;
 
 const HIT_FLASH_MS = 150;
-const WRECK_FADE_MS = 4000; // wrecks linger then fade out
+const WRECK_HOLD_MS = 900; // corpse stays fully opaque after death
+const WRECK_FADE_MS = 900; // then fades out — gone ~1.8s post-mortem
 const DUST_SPACING = 16; // world px between kicked-up puffs
 const DUST_TTL_MS = 550;
 const MAX_PUFFS = 180;
+const MARK_SPACING = 9; // world px between tread-mark stamps
+const MARK_TTL_MS = 1400; // ground scuff lifetime
+const MAX_MARKS = 240;
 const TURRET_STEP = 0.14; // rad/frame — max turret slew rate
 const MUZZLE_FLASH_MS = 90;
 const RECOIL_MS = 140;
@@ -152,6 +157,21 @@ interface Puff {
 }
 
 const puffs: Puff[] = [];
+
+/** Tank tread scuff stamped on the ground; fades with age. */
+interface Mark {
+  x: number;
+  y: number;
+  angle: number;
+  born: number;
+}
+
+const marks: Mark[] = [];
+
+function spawnMark(u: Unit, now: number): void {
+  if (marks.length >= MAX_MARKS) marks.shift();
+  marks.push({ x: u.x, y: u.y, angle: u.angle, born: now });
+}
 
 /**
  * Same 4-tile-block hash the terrain patch pass uses (terrain.ts) so kicked
@@ -183,7 +203,7 @@ function approachAngle(cur: number, target: number, step: number): number {
   return cur + Math.max(-step, Math.min(step, d));
 }
 
-function trackUnit(u: Unit, fx: UnitFx, now: number): UnitTrack {
+function trackUnit(u: Unit, fx: UnitFx, now: number, vehicle: boolean): UnitTrack {
   let t = track.get(u.id);
   if (!t) {
     t = {
@@ -194,6 +214,7 @@ function trackUnit(u: Unit, fx: UnitFx, now: number): UnitTrack {
       hp: u.hp,
       hitAt: -Infinity,
       dustAcc: 0,
+      markAcc: 0,
       turret: u.angle,
       seenAt: frameNo,
     };
@@ -208,8 +229,16 @@ function trackUnit(u: Unit, fx: UnitFx, now: number): UnitTrack {
       t.dustAcc %= DUST_SPACING;
       spawnPuff(u, now);
     }
+    if (vehicle) {
+      t.markAcc += step;
+      if (t.markAcc >= MARK_SPACING) {
+        t.markAcc %= MARK_SPACING;
+        spawnMark(u, now);
+      }
+    }
   } else {
     t.dustAcc = DUST_SPACING; // first step after idling puffs right away
+    t.markAcc = MARK_SPACING;
   }
   t.x = u.x;
   t.y = u.y;
@@ -465,8 +494,8 @@ function drawMuzzleFlash(
 
 /**
  * Infantry-family body: feet driven by the 4-frame gait, breathing-scaled
- * torso disc, kit detail, weapon barrel along facing, plus muzzle flash and
- * firing jitter when `firedAt` is fresh.
+ * torso disc, kit detail, weapon barrel along facing, plus muzzle flash,
+ * firing jitter and a recoil kick when `firedAt` is fresh.
  */
 function drawFootman(
   ctx: CanvasRenderingContext2D,
@@ -475,6 +504,7 @@ function drawFootman(
   r: number,
   t: UnitTrack,
   fireAge: number,
+  recoil: number,
   now: number,
 ): void {
   const kind: string = u.kind;
@@ -504,6 +534,9 @@ function drawFootman(
       Math.cos(now * 1.1 + u.id * 5.3) * r * 0.05,
     );
   }
+
+  // Recoil: the whole silhouette gets shoved backward along -x for a beat.
+  if (recoil > 0) ctx.translate(-recoil * 0.35, 0);
 
   // Idle breathing: subtle torso swell; moving units stay at full size.
   const breath = t.moving ? 1 : 1 + Math.sin(now / 520 + u.id * 1.7) * 0.04;
@@ -550,11 +583,12 @@ function drawFootman(
       ctx.fill();
   }
 
-  // Muzzle along facing for armed footmen (engineers carry no weapon).
+  // Muzzle along facing for armed footmen (engineers carry no weapon);
+  // the barrel slides back with the remaining recoil.
   if (kind !== 'engineer') {
-    const tip = r * (kind === 'scout' ? 1.0 : 1.25);
+    const tip = r * (kind === 'scout' ? 1.0 : 1.25) - recoil * 0.65;
     ctx.beginPath();
-    ctx.moveTo(r * 0.3, 0);
+    ctx.moveTo(r * 0.3 - recoil * 0.65, 0);
     ctx.lineTo(tip, 0);
     ctx.strokeStyle = '#141410';
     ctx.lineWidth = Math.max(1.5, r * 0.2);
@@ -635,17 +669,19 @@ function drawRankBadge(
   zoom: number,
 ): void {
   if (zoom < 0.55) return; // unreadable far out — skip the work entirely
-  const name = rankName(parseRank(rank));
+  const rk = parseRank(rank);
+  if (rk === 'rookie') return; // badge only marks veterans and elites
+  const name = rankName(rk);
   const size = Math.max(8, 9 * zoom);
   ctx.font = `${size}px sans-serif`;
   const w = ctx.measureText(name).width + 6;
   const h = size + 2;
   const bx = sx - r - w * 0.4;
   const by = sy - r - h - 4;
-  ctx.fillStyle = RANK_BG[rank] ?? RANK_BG.rookie!;
+  ctx.fillStyle = RANK_BG[rk] ?? RANK_BG.rookie!;
   roundRect(ctx, bx, by, w, h, h / 2);
   ctx.fill();
-  ctx.fillStyle = RANK_FG[rank] ?? RANK_FG.rookie!;
+  ctx.fillStyle = RANK_FG[rk] ?? RANK_FG.rookie!;
   ctx.textBaseline = 'middle';
   ctx.textAlign = 'center';
   ctx.fillText(name, bx + w / 2, by + h / 2);
@@ -701,6 +737,28 @@ export function drawUnits(
     ctx.fill();
   }
 
+  // Tread marks: two short parallel dashes stamped behind moving vehicles.
+  // Oldest-first array like puffs, so expiry is a cheap prefix scan.
+  while (marks.length > 0 && now - marks[0]!.born > MARK_TTL_MS) marks.shift();
+  for (const m of marks) {
+    const age = (now - m.born) / MARK_TTL_MS;
+    if (age < 0 || age >= 1) continue;
+    const mx = (m.x - cam.x) * cam.zoom;
+    const my = (m.y - cam.y) * cam.zoom;
+    const ca = Math.cos(m.angle);
+    const sa = Math.sin(m.angle);
+    const half = 4 * cam.zoom; // dash half-length along travel
+    const off = 3 * cam.zoom; // half the tread separation
+    ctx.strokeStyle = `rgba(24,22,16,${0.3 * (1 - age)})`;
+    ctx.lineWidth = Math.max(1, 1.8 * cam.zoom);
+    ctx.beginPath();
+    for (const s of [-1, 1]) {
+      ctx.moveTo(mx - ca * half - sa * off * s, my - sa * half + ca * off * s);
+      ctx.lineTo(mx + ca * half - sa * off * s, my + sa * half + ca * off * s);
+    }
+    ctx.stroke();
+  }
+
   for (const u of units) {
     const fx = u as Unit & UnitFx;
     const sxp = (u.x - cam.x) * cam.zoom;
@@ -709,17 +767,20 @@ export function drawUnits(
     const style = styleOf(u);
 
     // Death pass: infantry crumple into a fallen pose, vehicles burn out as
-    // wreck smears; both fade over WRECK_FADE_MS then stop drawing.
+    // wreck smears; both hold ~0.9s then fade out over the next ~0.9s.
     if (fx.deadAt !== undefined) {
       const age = now - fx.deadAt;
-      if (age >= 0 && age < WRECK_FADE_MS) {
-        if (style.vehicle) drawWreck(ctx, sxp, syp, r, 1 - age / WRECK_FADE_MS);
-        else drawFallen(ctx, sxp, syp, r, style, 1 - age / WRECK_FADE_MS, u.angle);
+      const span = WRECK_HOLD_MS + WRECK_FADE_MS;
+      if (age >= 0 && age < span) {
+        const alpha =
+          age < WRECK_HOLD_MS ? 1 : 1 - (age - WRECK_HOLD_MS) / WRECK_FADE_MS;
+        if (style.vehicle) drawWreck(ctx, sxp, syp, r, alpha);
+        else drawFallen(ctx, sxp, syp, r, style, alpha, u.angle);
       }
       continue;
     }
 
-    const t = trackUnit(u, fx, now);
+    const t = trackUnit(u, fx, now, style.vehicle);
 
     // Ground shadow: soft ellipse anchored at the feet, drawn before bob.
     ctx.beginPath();
@@ -776,7 +837,7 @@ export function drawUnits(
       }
     } else {
       ctx.rotate(u.angle);
-      drawFootman(ctx, u, style, r, t, fireAge, now);
+      drawFootman(ctx, u, style, r, t, fireAge, recoil, now);
     }
     ctx.restore();
 
@@ -792,6 +853,10 @@ export function drawUnits(
       if (fireAge >= 0 && fireAge < SMOKE_MS) {
         drawMuzzleSmoke(ctx, sx, sy + bob, t.turret, tipDist, fireAge, r);
       }
+    } else if ((u.kind as string) !== 'engineer' && fireAge >= 0 && fireAge < SMOKE_MS) {
+      // Small-arms smoke: shorter, tighter drift out of the weapon tip.
+      const tipDist = r * ((u.kind as string) === 'scout' ? 1.0 : 1.25) + r * 0.2;
+      drawMuzzleSmoke(ctx, sx, sy + bob, u.angle, tipDist, fireAge, r * 0.55);
     }
 
     // Hit flash: prefer the sim's lastHitAt stamp when present, else the
@@ -816,8 +881,11 @@ export function drawUnits(
       ctx.fillRect(bx, by, Math.max(0, w * pct), 3);
     }
 
-    // Veterancy badge above the health bar (missing rank = rookie).
-    drawRankBadge(ctx, sx, sy, r, fx.rank ?? 'rookie', cam.zoom);
+    // Veterancy badge above the health bar — only when the unit reports a
+    // rank, and only for veterans/elites (rookie draws nothing).
+    if (fx.rank !== undefined) {
+      drawRankBadge(ctx, sx, sy, r, fx.rank, cam.zoom);
+    }
   }
 
   // Forget despawned units so the tracking map can't grow unbounded. The
