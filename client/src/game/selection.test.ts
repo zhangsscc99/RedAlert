@@ -50,11 +50,18 @@ test('selectUnits replaces selection unless additive', () => {
 });
 
 function mkKindUnit(id: number, speed: number): Unit {
-  // kindOf() prefers `kind` over speed, so map the test speeds onto kinds:
-  // 70 → infantry, anything else → tank. That keeps units 1&3 "same kind".
-  const kind = speed === 70 ? 'infantry' : 'tank';
-  const hp = kind === 'infantry' ? 50 : 400;
-  return { id, kind, hp, maxHp: hp, x: 0, y: 0, angle: 0, speed, path: [], selected: false };
+  return {
+    id,
+    kind: speed === 70 ? 'infantry' : 'tank',
+    hp: 50,
+    maxHp: 50,
+    x: 0,
+    y: 0,
+    angle: 0,
+    speed,
+    path: [],
+    selected: false,
+  };
 }
 
 test('selectSameKind selects all units of the same kind', () => {
