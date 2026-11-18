@@ -42,6 +42,8 @@ export interface Unit {
   selected: boolean;
   kills?: number; // confirmed kills (veterancy bookkeeping); absent = 0
   rank?: Rank; // veterancy rank; absent = 'rookie'
+  /** Suppression level 0..1 built by incoming fire (see combat.ts). */
+  suppression?: number;
 }
 
 function makeUnit(id: number, kind: UnitKind, tx: number, ty: number): Unit {

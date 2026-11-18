@@ -1,6 +1,7 @@
 // Combat resolution: hp, range, damage, cooldown, death. Pure logic, no DOM.
-// Depth layers (armor counters, splash, focus fire, building occlusion) are
-// opt-in via CombatOptions — a 2-arg call behaves exactly as before.
+// Depth layers (armor counters, splash, focus fire, suppression, building
+// occlusion) are opt-in via CombatOptions — a 2-arg call behaves exactly as
+// before.
 
 import { damageMultiplier, type ArmorType, type WeaponType } from './unitRoles.js';
 import { BUILDING_DEFS, type Building } from './buildings.js';
@@ -26,10 +27,13 @@ export interface Combatant {
   cooldownMax: number; // seconds between attacks
   armor?: ArmorType; // used when counters are on; absent = multiplier 1
   weapon?: WeaponType | null; // used when counters are on; null/absent = no multiplier
-  targetId?: number | null; // focus-fire lock; kept until the target dies
+  targetId?: number | null; // focus-fire lock; kept until the target dies or leaves range
   splashRadius?: number; // world px; >0 = hits splash around the target point
   kills?: number; // confirmed kills (veterancy bookkeeping); absent = 0
   rank?: Rank; // veterancy rank; absent = 'rookie' (multiplier 1)
+  suppression?: number; // 0..SUPPRESSION_MAX; built by incoming fire, decays off-combat
+  underFire?: boolean; // suppression bookkeeping: took a hit this tick
+  accDebt?: number; // suppression bookkeeping: deterministic accuracy debt
 }
 
 export type CombatEvent =
@@ -42,8 +46,10 @@ export interface CombatOptions {
   counters?: boolean;
   /** Attackers with splashRadius > 0 damage bystanders, decayed by distance. */
   splash?: boolean;
-  /** Respect targetId locks; a dead lock re-picks the nearest threat. */
+  /** Respect targetId locks; a dead or out-of-range lock re-picks the nearest threat. */
   focusFire?: boolean;
+  /** Hits build suppression; suppressed units miss shots and move slower. */
+  suppression?: boolean;
   /** Buildings whose footprints block line-of-fire (dead ones don't). */
   occluders?: readonly Building[];
 }
@@ -148,6 +154,49 @@ export function losBlocked(a: Combatant, t: Combatant, occluders: readonly Build
   return false;
 }
 
+/** Suppression level cap. */
+export const SUPPRESSION_MAX = 1;
+/** Suppression gained per hit = damage taken as a fraction of maxHp × this. */
+export const SUPPRESSION_GAIN = 2.5;
+/** Suppression recovered per second by a unit that took no fire this tick. */
+export const SUPPRESSION_RECOVERY = 0.25;
+/** Worst-case multipliers at full suppression. */
+export const SUPPRESSION_MIN_ACCURACY = 0.25;
+export const SUPPRESSION_MIN_SPEED = 0.4;
+
+/** How suppression degrades a unit: accuracy = hit rate, speed = move rate. */
+export interface SuppressionModifiers {
+  accuracy: number;
+  speed: number;
+}
+
+/**
+ * Add `amount` to the unit's suppression level, clamped to
+ * [0, SUPPRESSION_MAX]. Returns the new level. Sustained fire stacks this
+ * up; stepCombat decays it for units that took no fire during the tick.
+ */
+export function applySuppression(t: Combatant, amount: number): number {
+  t.suppression = Math.min(
+    SUPPRESSION_MAX,
+    Math.max(0, (t.suppression ?? 0) + Math.max(0, amount)),
+  );
+  return t.suppression;
+}
+
+/**
+ * Multipliers for a suppressed unit: accuracy scales the chance a shot
+ * lands (applied deterministically by stepCombat), speed scales movement.
+ * Both interpolate linearly from 1 at suppression 0 down to the floors
+ * above at SUPPRESSION_MAX.
+ */
+export function suppressionModifiers(c: { suppression?: number }): SuppressionModifiers {
+  const s = Math.min(SUPPRESSION_MAX, Math.max(0, c.suppression ?? 0));
+  return {
+    accuracy: 1 - s * (1 - SUPPRESSION_MIN_ACCURACY),
+    speed: 1 - s * (1 - SUPPRESSION_MIN_SPEED),
+  };
+}
+
 /** `a` may fire on `t` only if it's an enemy, alive, in range, and off cooldown. */
 export function canAttack(a: Combatant, t: Combatant, occluders?: readonly Building[]): boolean {
   return (
@@ -176,8 +225,14 @@ export function applyDamage(t: Combatant, dmg: number): boolean {
  * - splash: a hit also damages every other combatant within splashRadius of
  *   the impact point, scaled by (1 - d/radius); friends and the shooter are
  *   not exempt.
- * - focusFire: a locked targetId is kept while the target lives (no re-pick);
- *   a dead or invalid lock falls back to the nearest threat and re-locks.
+ * - focusFire: a locked targetId is kept while the target lives and stays
+ *   in range — an occluded lock waits rather than churning targets. A dead
+ *   or out-of-range lock is released and the nearest in-range threat is
+ *   locked instead, so units never jitter between targets tick to tick.
+ * - suppression: every hit adds suppression scaled by the share of maxHp
+ *   it removed; suppressed shooters miss a deterministic share of shots
+ *   (suppressionModifiers also reports the move-speed multiplier for
+ *   consumers like units.ts). Units that took no fire this tick recover.
  * - occluders: targets behind a building footprint are neither fired on nor
  *   selected.
  */
@@ -189,6 +244,7 @@ export function stepCombat(
   const counters = opts.counters === true;
   const splash = opts.splash === true;
   const focusFire = opts.focusFire === true;
+  const suppression = opts.suppression === true;
   const occluders = opts.occluders;
   const events: CombatEvent[] = [];
   for (const c of all) c.cooldown -= dt;
@@ -198,13 +254,19 @@ export function stepCombat(
 
     if (focusFire && a.targetId != null) {
       const locked = all.find((c) => c.id === a.targetId);
-      if (locked !== undefined && locked !== a && locked.team !== a.team && locked.hp > 0) {
+      if (
+        locked !== undefined &&
+        locked !== a &&
+        locked.team !== a.team &&
+        locked.hp > 0 &&
+        dist(a, locked) <= a.range
+      ) {
+        // A live lock inside range is kept — an occluded shot holds fire
+        // instead of switching targets.
+        if (occluders !== undefined && losBlocked(a, locked, occluders)) continue;
         target = locked;
-        // A lock that can't be reached yet holds fire but is not dropped.
-        if (dist(a, target) > a.range || (occluders !== undefined && losBlocked(a, target, occluders))) {
-          continue;
-        }
       } else {
+        // Dead or beyond range: release and re-pick the nearest threat.
         a.targetId = null;
       }
     }
@@ -225,12 +287,28 @@ export function stepCombat(
       if (focusFire) a.targetId = target.id;
     }
 
+    if (suppression) {
+      // Suppressed shooters hit less often. Deterministic thinning: the
+      // accuracy shortfall accrues as debt and every full point forfeits a
+      // shot — the unit still fires (and pays the cooldown), it just misses.
+      a.accDebt = (a.accDebt ?? 0) + (1 - suppressionModifiers(a).accuracy);
+      if (a.accDebt >= 1) {
+        a.accDebt -= 1;
+        a.cooldown = a.cooldownMax;
+        continue;
+      }
+    }
+
     const dmg = effectiveDamage(a, target, counters);
     events.push({ type: 'hit', from: a.id, to: target.id, damage: dmg });
     if (applyDamage(target, dmg)) {
       events.push({ type: 'death', id: target.id });
       if (a.targetId === target.id) a.targetId = null;
       creditKill(a);
+    }
+    if (suppression) {
+      applySuppression(target, (dmg / Math.max(1, target.maxHp)) * SUPPRESSION_GAIN);
+      target.underFire = true;
     }
 
     const r = a.splashRadius ?? 0;
@@ -246,10 +324,25 @@ export function stepCombat(
           events.push({ type: 'death', id: v.id });
           creditKill(a);
         }
+        if (suppression) {
+          applySuppression(v, (vd / Math.max(1, v.maxHp)) * SUPPRESSION_GAIN);
+          v.underFire = true;
+        }
       }
     }
 
     a.cooldown = a.cooldownMax;
+  }
+  if (suppression) {
+    // Units that took fire this tick keep their suppression (the flag is
+    // cleared for the next tick); everyone else recovers a little.
+    for (const c of all) {
+      if (c.underFire) {
+        c.underFire = false;
+      } else if ((c.suppression ?? 0) > 0) {
+        c.suppression = Math.max(0, (c.suppression ?? 0) - SUPPRESSION_RECOVERY * dt);
+      }
+    }
   }
   return events;
 }
