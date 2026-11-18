@@ -12,7 +12,11 @@ import {
   cancel,
   tickQueue,
   pollAlerts,
+  gradeForReserve,
+  oreRegenTick,
   ORE_GRADE_RICH,
+  ORE_GRADE_POOR,
+  ORE_GRADE_LEAN,
   LOW_FUNDS_AT,
   ALERT_COOLDOWN,
 } from './economy.js';
@@ -334,4 +338,82 @@ test('pollAlerts is quiet on a healthy economy', () => {
   const e = createEconomy(5000);
   assert.deepEqual(pollAlerts(e, 0), []);
   assert.deepEqual(pollAlerts(e, ALERT_COOLDOWN * 2), []);
+});
+
+test('gradeForReserve maps reserve fraction to the income tier', () => {
+  assert.equal(gradeForReserve(350, 350), ORE_GRADE_RICH); // 满储段
+  assert.equal(gradeForReserve(210, 350), ORE_GRADE_RICH); // 恰好 ≥60%
+  assert.equal(gradeForReserve(200, 350), ORE_GRADE_POOR); // 中段基准价
+  assert.equal(gradeForReserve(87, 350), ORE_GRADE_LEAN); // ≤25% 见底折半
+  assert.equal(gradeForReserve(1, 350), ORE_GRADE_LEAN);
+  // 枯竭矿脉与非法满储回基准价（本来也无矿可采）
+  assert.equal(gradeForReserve(0, 350), ORE_GRADE_POOR);
+  assert.equal(gradeForReserve(100, 0), ORE_GRADE_POOR);
+  assert.equal(gradeForReserve(-5, 350), ORE_GRADE_POOR);
+});
+
+test('oreRegenTick refills live veins up to the cap but never the depleted', () => {
+  const r = new Float64Array([100, 0, 345]);
+  const gained = oreRegenTick(r, 1, { rate: 10, cap: 350 });
+  assert.equal(r[0], 110); // 正常回填
+  assert.equal(r[1], 0); // 枯竭矿脉不再回填
+  assert.equal(r[2], 350); // 回填有上限
+  assert.ok(Math.abs(gained - 15) < 1e-9); // 10 + 5（封顶截断）
+});
+
+test('oreRegenTick honors the skip set and ignores dead ticks', () => {
+  const r = new Float64Array([100, 200]);
+  oreRegenTick(r, 1, { rate: 10, skip: new Set([0]) });
+  assert.equal(r[0], 100); // 正被认领的矿格跳过
+  assert.equal(r[1], 210);
+
+  assert.equal(oreRegenTick(r, 0, { rate: 10 }), 0);
+  assert.equal(oreRegenTick(r, -1, { rate: 10 }), 0);
+  assert.equal(oreRegenTick(r, 1, { rate: 0 }), 0);
+  assert.equal(r[0], 100);
+  assert.equal(r[1], 210);
+
+  // 缺省参数用 ORE_REGEN_RATE，且不设上限
+  const s = new Float64Array([0, 10]);
+  oreRegenTick(s, 1);
+  assert.equal(s[0], 0);
+  assert.ok(s[1] > 10);
+});
+
+test('pollAlerts escalates low-funds to critical below the crit fraction of cap', () => {
+  const e = createEconomy(150, { cap: 1000 }); // 15% → 警告级
+  assert.deepEqual(pollAlerts(e, 0), ['low-funds']);
+
+  spend(e, 60); // 90 → 9% → 升级为告急，普通警告被压掉
+  assert.deepEqual(pollAlerts(e, ALERT_COOLDOWN), ['low-funds-critical']);
+
+  credit(e, 100); // 190 → 19% → 降回普通警告
+  assert.deepEqual(pollAlerts(e, ALERT_COOLDOWN * 2), ['low-funds']);
+
+  credit(e, 300); // 490 → 49% → 告警解除
+  assert.deepEqual(pollAlerts(e, ALERT_COOLDOWN * 3), []);
+});
+
+test('low-funds tiers throttle independently inside the cooldown window', () => {
+  const e = createEconomy(50, { cap: 1000 }); // 5% → 告急级
+  assert.deepEqual(pollAlerts(e, 0), ['low-funds-critical']);
+  assert.deepEqual(pollAlerts(e, 1), []); // 冷却内不再刷屏
+
+  // 两级各自的冷却互不影响：升到警告级时警告级是首发
+  credit(e, 100); // 150 → 15%
+  assert.deepEqual(pollAlerts(e, 2), ['low-funds']);
+});
+
+test('custom warn/crit fractions override the default low-funds tiers', () => {
+  const e = createEconomy(400, {
+    cap: 1000,
+    lowFundsWarnFraction: 0.5,
+    lowFundsCritFraction: 0.45,
+  });
+  // 40% < 45% → 直接告急
+  assert.deepEqual(pollAlerts(e, 0), ['low-funds-critical']);
+
+  const w = createEconomy(400, { cap: 1000, lowFundsWarnFraction: 0.5 });
+  // 40% < 50% 但 ≥ 10% → 只发普通警告
+  assert.deepEqual(pollAlerts(w, 0), ['low-funds']);
 });

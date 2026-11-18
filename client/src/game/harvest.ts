@@ -17,6 +17,15 @@
 //   lane-change), then retries the plain route, then abandons the vein.
 // - Per-tile ore grade (setOreGrade) marks rich veins: cargo is credited
 //   grade× per ore unit mined, so a rich tile pays more per round trip.
+//
+// F1004 additions:
+// - Veins slowly regenerate (oreRegenTick) up to their capacity; depleted
+//   veins never regrow, and a tile claimed this tick is skipped so an
+//   actively worked vein drains at the normal rate.
+// - A harvester below REPAIR_BELOW hp breaks off its mine leg and returns
+//   to the nearest refinery/HQ (the depot) for welding; it resumes work
+//   only after repairs finish. Hauling/unloading legs are never
+//   interrupted — a full hold still comes home first.
 
 import {
   idx,
@@ -30,31 +39,58 @@ import {
 } from './grid.js';
 import { findPathAvoiding, type Blocker } from './pathfind.js';
 import { UNIT_STATS, type Unit } from './units.js';
-import { BUILDING_DEFS, type Building } from './buildings.js';
-import { credit, ORE_GRADE_POOR, type Economy } from './economy.js';
+import {
+  BUILDING_DEFS,
+  isAdjacentTo,
+  tickDepotRepair,
+  type Building,
+} from './buildings.js';
+import {
+  credit,
+  oreRegenTick,
+  ORE_GRADE_POOR,
+  ORE_REGEN_RATE,
+  type Economy,
+  type OreRegenOptions,
+} from './economy.js';
 import type { Point } from './selection.js';
 
 export const HARVEST_RATE = 140; // credits/sec pulled from the vein
 export const HARVEST_CAPACITY = 700; // cargo hold, in credits
 export const ORE_RESERVE = 350; // credits stored in one fresh ore tile
 export const STUCK_SECONDS = 3; // no-displacement budget before re-planning
+export const REPAIR_BELOW = 0.5; // hp fraction that triggers the depot run
 
 const STUCK_EPS = 1; // px of travel per tick that still counts as "stuck"
 const MAX_MINERS_PER_TILE = 1; // simultaneous claimants allowed on one ore tile
 const CLAIM_PENALTY = 4; // score multiplier per claimant already on a vein
 const REPLAN_BEFORE_SWITCH = 1; // failed re-plans on a vein before trying others
 
-export type HarvesterState = 'idle' | 'toOre' | 'mining' | 'toRefinery' | 'unloading';
+export type HarvesterState =
+  | 'idle'
+  | 'toOre'
+  | 'mining'
+  | 'toRefinery'
+  | 'unloading'
+  | 'toRepair'
+  | 'repairing';
 
 /**
  * Coarse status for UI badges:
  * - 'mining'    采矿中：开往矿脉或正在装载
  * - 'hauling'   运矿中：满载/载货返回卸载点
  * - 'unloading' 卸载：正在向经济账户卸货
+ * - 'repairing' 返修中：回维修厂或焊接中
  * - 'standby'   待命：空闲，随时可被重新分配
  * - 'depleted'  无矿可采：找不到任何可到达且有储量的矿脉
  */
-export type HarvesterStatus = 'mining' | 'hauling' | 'unloading' | 'standby' | 'depleted';
+export type HarvesterStatus =
+  | 'mining'
+  | 'hauling'
+  | 'unloading'
+  | 'repairing'
+  | 'standby'
+  | 'depleted';
 
 export interface Harvester {
   unit: Unit;
@@ -95,6 +131,9 @@ export function harvesterStatus(h: Harvester): HarvesterStatus {
       return 'hauling';
     case 'unloading':
       return 'unloading';
+    case 'toRepair':
+    case 'repairing':
+      return 'repairing';
     default:
       return h.noOre ? 'depleted' : 'standby';
   }
@@ -104,15 +143,15 @@ export function harvesterStatus(h: Harvester): HarvesterStatus {
 // is treated as exhausted even before the caller rewrites it to GRASS.
 const reservesByMap = new WeakMap<GameMap, Float64Array>();
 
-// Per-tile ore grade (富矿/贫矿品位). Absent table or 0 → ORE_GRADE_POOR.
-// The map layer marks rich fields via setOreGrade; mining multiplies the
-// credits loaded per ore unit by the tile's grade.
+// Per-tile ore grade (富矿/贫矿品位). 0 marks "unset"; absent table or 0 →
+// ORE_GRADE_POOR. The map layer marks rich fields via setOreGrade; mining
+// multiplies the credits loaded per ore unit by the tile's grade.
 const gradesByMap = new WeakMap<GameMap, Float64Array>();
 
 export function setOreGrade(map: GameMap, x: number, y: number, grade: number): void {
   let g = gradesByMap.get(map);
   if (!g) {
-    g = new Float64Array(map.w * map.h).fill(ORE_GRADE_POOR);
+    g = new Float64Array(map.w * map.h); // 0 = unset, explicit grade always wins
     gradesByMap.set(map, g);
   }
   g[idx(map, x, y)] = grade;
@@ -131,6 +170,11 @@ function reserveTable(map: GameMap): Float64Array {
     reservesByMap.set(map, r);
   }
   return r;
+}
+
+/** Remaining ore (credits) on a tile; 0 when dry or not an ore tile. */
+export function oreReserveAt(map: GameMap, x: number, y: number): number {
+  return isOre(map, x, y) ? (reserveTable(map)[idx(map, x, y)] ?? 0) : 0;
 }
 
 /** Harvester speed comes from the stats table, not the unit instance. */
@@ -214,6 +258,11 @@ function resetWatchdog(h: Harvester): void {
   h.stuckT = 0;
   h.lastX = h.unit.x;
   h.lastY = h.unit.y;
+}
+
+/** Below the repair threshold and still alive: hp 0 means dead — callers filter corpses. */
+function needsRepair(h: Harvester): boolean {
+  return h.unit.hp > 0 && h.unit.maxHp > 0 && h.unit.hp < h.unit.maxHp * REPAIR_BELOW;
 }
 
 function toIdle(h: Harvester): void {
@@ -353,11 +402,17 @@ function dropoffBuilding(buildings: readonly Building[], ux: number, uy: number)
   return best;
 }
 
+/**
+ * Route to the dropoff doorstep. With `forRepair` the building doubles as
+ * the maintenance depot (维修厂): the leg is 'toRepair' and arrival parks
+ * the harvester for welding — or unloads first when the hold isn't empty.
+ */
 function sendToRefinery(
   h: Harvester,
   map: GameMap,
   buildings: readonly Building[],
   blockers: readonly Blocker[],
+  forRepair = false,
 ): boolean {
   const ux = worldToTile(h.unit.x);
   const uy = worldToTile(h.unit.y);
@@ -375,7 +430,11 @@ function sendToRefinery(
   h.unit.path = path.map((t) => ({ x: tileCenter(t.x), y: tileCenter(t.y) }));
   const last = path[path.length - 1];
   h.target = last ? { x: last.x, y: last.y } : goal;
-  h.state = path.length === 0 ? 'unloading' : 'toRefinery';
+  if (path.length === 0) {
+    h.state = forRepair && h.cargo <= 0 ? 'repairing' : 'unloading';
+  } else {
+    h.state = forRepair ? 'toRepair' : 'toRefinery';
+  }
   resetWatchdog(h);
   return true;
 }
@@ -394,6 +453,9 @@ function hasDropoff(buildings: readonly Building[]): boolean {
  * defaults to `buildings` so older callers get identical behavior. Only a
  * finished refinery/HQ inside `buildings` accepts cargo — obstacles never
  * become dropoff candidates by themselves.
+ *
+ * `regen` tunes vein regrowth for this tick (see oreRegenTick); pass false
+ * to disable. Default refills unclaimed live veins up to ORE_RESERVE.
  */
 export function updateHarvesters(
   hs: Harvester[],
@@ -402,6 +464,7 @@ export function updateHarvesters(
   economy: Economy,
   dt: number,
   obstacles?: readonly Building[],
+  regen?: OreRegenOptions | false,
 ): Tile[] {
   const depleted: Tile[] = [];
   if (dt <= 0) return depleted;
@@ -424,12 +487,37 @@ export function updateHarvesters(
       claims.set(i, (claims.get(i) ?? 0) + 1);
     }
   }
+  // 矿脉再生：未被认领且尚有储量的矿格缓慢回填（枯竭与正被认领的跳过），
+  // 这样被放弃但没采空的矿脉会慢慢恢复，矿车回来还能继续采。
+  if (regen !== false) {
+    oreRegenTick(reserves, dt, {
+      rate: regen?.rate ?? ORE_REGEN_RATE,
+      cap: regen?.cap ?? ORE_RESERVE,
+      skip: new Set(claims.keys()),
+    });
+  }
   for (const h of hs) {
     if (h.unit.kind !== 'harvester') continue;
 
+    // 受损返修：血量低于阈值的矿车中断采矿腿回维修厂焊接；载货腿
+    // （toRefinery/unloading）不打断 —— 满载仍先回库。找不到卸点时就
+    // 地带病干活。认领中的矿脉在成功改道后立即释放，让别的矿车接手。
+    if (
+      needsRepair(h) &&
+      (h.state === 'idle' || h.state === 'toOre' || h.state === 'mining')
+    ) {
+      const claimed =
+        h.target !== null && h.state !== 'idle' && isOre(map, h.target.x, h.target.y)
+          ? idx(map, h.target.x, h.target.y)
+          : -1;
+      if (sendToRefinery(h, map, buildings, blockers, true) && claimed >= 0) {
+        claims.set(claimed, (claims.get(claimed) ?? 1) - 1);
+      }
+    }
+
     // Watchdog: only travel legs can be stuck — mining, unloading and idle
     // are stationary by design.
-    if (h.state === 'toOre' || h.state === 'toRefinery') {
+    if (h.state === 'toOre' || h.state === 'toRefinery' || h.state === 'toRepair') {
       const dx = h.unit.x - (h.lastX ?? h.unit.x);
       const dy = h.unit.y - (h.lastY ?? h.unit.y);
       const stuckT = dx * dx + dy * dy < STUCK_EPS * STUCK_EPS ? (h.stuckT ?? 0) + dt : 0;
@@ -455,10 +543,14 @@ export function updateHarvesters(
           }
           if (!ok) ok = sendToOre(h, map, reserves, claims, avoid, avoidBlocked);
           if (!ok) ok = sendToOre(h, map, reserves, claims, blockers, blocked);
-        } else {
+        } else if (h.state === 'toRefinery') {
           ok =
             sendToRefinery(h, map, buildings, avoid) ||
             sendToRefinery(h, map, buildings, blockers);
+        } else {
+          ok =
+            sendToRefinery(h, map, buildings, avoid, true) ||
+            sendToRefinery(h, map, buildings, blockers, true);
         }
         if (!ok) toIdle(h);
         continue;
@@ -538,6 +630,39 @@ export function updateHarvesters(
         h.cargo = 0;
         h.target = null;
         h.state = 'idle';
+        break;
+      }
+
+      case 'toRepair': {
+        stepAlong(h.unit, dt);
+        if (h.unit.path.length === 0) {
+          // 舱里还有矿就先卸，卸完下个 tick 从 idle 转回焊接。
+          h.state = h.cargo > 0 ? 'unloading' : 'repairing';
+        }
+        break;
+      }
+
+      case 'repairing': {
+        const ux = worldToTile(h.unit.x);
+        const uy = worldToTile(h.unit.y);
+        const depot = dropoffBuilding(buildings, ux, uy);
+        if (!depot) {
+          toIdle(h); // 维修厂没了：带病复工
+          break;
+        }
+        if (!isAdjacentTo(depot, ux, uy)) {
+          // 被挤下维修位（罕见）：重新寻路回厂。
+          if (!sendToRefinery(h, map, buildings, blockers, true)) toIdle(h);
+          break;
+        }
+        // 维修厂即卸点：按 DEPOT_REPAIR 的速率/单价焊接，钱不够就部分
+        // 修并原地暂停，等资金回来继续 —— 与 tickDepotRepair 语义一致。
+        tickDepotRepair(depot, [h.unit], dt, economy);
+        if (h.unit.hp >= h.unit.maxHp) {
+          // 修完再出车：回 idle，下个 tick 按常规逻辑重新分配矿脉。
+          h.noOre = false;
+          toIdle(h);
+        }
         break;
       }
     }

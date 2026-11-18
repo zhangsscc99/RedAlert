@@ -18,8 +18,10 @@ import {
   updateHarvesters,
   harvesterStatus,
   setOreGrade,
+  oreReserveAt,
   HARVEST_CAPACITY,
   ORE_RESERVE,
+  REPAIR_BELOW,
   STUCK_SECONDS,
   type Harvester,
 } from './harvest.js';
@@ -574,4 +576,163 @@ test('each harvester claims the vein nearest to it', () => {
 
   assert.deepEqual(h1.target, { x: 10, y: 8 });
   assert.deepEqual(h2.target, { x: 16, y: 8 });
+});
+
+test('a damaged harvester breaks off mining, welds at the depot, then resumes', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  const h = createHarvester(unitAt('harvester', 8, 8));
+  const econ = createEconomy(5000);
+
+  // Reach the vein and start loading.
+  for (let i = 0; i < 50 && h.state !== 'mining'; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2);
+  }
+  assert.equal(h.state, 'mining');
+
+  // Battle damage below the threshold diverts it to the depot.
+  h.unit.hp = Math.floor(h.unit.maxHp * REPAIR_BELOW) - 1;
+  updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, 'toRepair');
+
+  // Run until welding finishes: travel → welding → back to idle.
+  let sawRepairing = false;
+  for (let i = 0; i < 600 && h.state !== 'idle'; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2);
+    if (h.state === 'repairing') sawRepairing = true;
+  }
+  assert.ok(sawRepairing, 'spent time welding at the depot');
+  assert.equal(h.unit.hp, h.unit.maxHp);
+  assert.equal(h.state, 'idle');
+  assert.ok(econ.credits < 5000, 'welding billed the economy');
+
+  // 修完再出车：下一个 tick 正常回到矿脉。
+  updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.ok(h.state === 'toOre' || h.state === 'mining');
+});
+
+test('a damaged harvester with a full hold still unloads before welding', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  const h = createHarvester(unitAt('harvester', 8, 8));
+  h.cargo = HARVEST_CAPACITY;
+  h.unit.hp = Math.floor(h.unit.maxHp * REPAIR_BELOW) - 1;
+  const econ = createEconomy(0);
+
+  updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, 'toRepair'); // 载货返修，同一卸点
+
+  // 满载优先回程卸货：repairing 之前 cargo 先清进账。
+  for (let i = 0; i < 200 && h.cargo > 0; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2);
+  }
+  assert.equal(h.cargo, 0);
+  assert.equal(econ.earned, HARVEST_CAPACITY);
+});
+
+test('a hauling leg is never interrupted by battle damage', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  const h = createHarvester(unitAt('harvester', 15, 8));
+  h.cargo = 300;
+  const econ = createEconomy(0);
+
+  // Get it onto the return leg first, then wound it mid-haul.
+  updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, 'toRefinery');
+  h.unit.hp = Math.floor(h.unit.maxHp * REPAIR_BELOW) - 1;
+
+  for (let i = 0; i < 200 && h.state === 'toRefinery'; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2);
+  }
+  // 载货腿不被打断：卸完之前绝不出现 repairing（toRepair 到达即 unloading）。
+  const post = harvesterStatus(h);
+  assert.ok(post === 'unloading' || post === 'standby');
+
+  // 卸完货后才转入返修。
+  for (let i = 0; i < 10 && harvesterStatus(h) !== 'repairing'; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2);
+  }
+  assert.equal(harvesterStatus(h), 'repairing');
+});
+
+test('welding pauses on an empty wallet but the harvester waits at the depot', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  const h = createHarvester(unitAt('harvester', 8, 8));
+  h.unit.hp = Math.floor(h.unit.maxHp * 0.2);
+  const econ = createEconomy(0);
+
+  for (let i = 0; i < 200 && h.state !== 'repairing'; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2);
+  }
+  assert.equal(h.state, 'repairing');
+
+  // 没钱焊接：原地等待，hp 不涨也不掉。
+  for (let i = 0; i < 20; i++) updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, 'repairing');
+  assert.equal(h.unit.hp, Math.floor(h.unit.maxHp * 0.2));
+});
+
+test('a damaged harvester with no dropoff falls back instead of wedging', () => {
+  const map = openMap();
+  setTerrain(map, 10, 8, ORE);
+  const h = createHarvester(unitAt('harvester', 9, 8));
+  h.unit.hp = 10;
+  const econ = createEconomy(0);
+
+  drive([h], map, [], econ, 50);
+  assert.equal(h.state, 'idle'); // 没有维修厂/卸点：与健康矿车一样待命
+});
+
+test('harvesterStatus reports the repair legs', () => {
+  const h = createHarvester(unitAt('harvester', 5, 5));
+  h.state = 'toRepair';
+  assert.equal(harvesterStatus(h), 'repairing');
+  h.state = 'repairing';
+  assert.equal(harvesterStatus(h), 'repairing');
+});
+
+test('an abandoned live vein slowly refills toward ORE_RESERVE', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  const h = createHarvester(unitAt('harvester', 8, 8));
+  const econ = createEconomy(0);
+
+  // Mine a little, then battle damage pulls the harvester off the claim.
+  for (let i = 0; i < 50 && h.state !== 'mining'; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2);
+  }
+  for (let i = 0; i < 5; i++) updateHarvesters([h], map, [refinery], econ, 0.2);
+  const drained = oreReserveAt(map, 10, 8);
+  assert.ok(drained > 0 && drained < ORE_RESERVE, `partially drained: ${drained}`);
+
+  h.unit.hp = 10; // below the repair threshold → releases the claim
+  updateHarvesters([h], map, [refinery], econ, 0.2);
+  assert.equal(h.state, 'toRepair');
+
+  // While it travels and welds the unclaimed vein regrows, capped at full.
+  for (let i = 0; i < 50; i++) updateHarvesters([h], map, [refinery], econ, 0.2);
+  const regrown = oreReserveAt(map, 10, 8);
+  assert.ok(regrown > drained, `regen refilled ${drained} → ${regrown}`);
+  assert.ok(regrown <= ORE_RESERVE);
+});
+
+test('a depleted vein never regrows', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  const h = createHarvester(unitAt('harvester', 8, 8));
+  const econ = createEconomy(0);
+
+  const depleted = drive([h], map, [refinery], econ, 400);
+  assert.deepEqual(depleted, [{ x: 10, y: 8 }]);
+  assert.equal(oreReserveAt(map, 10, 8), 0);
+
+  // 枯竭矿脉不再回填：再跑多少 tick 也还是 0。
+  drive([h], map, [refinery], econ, 200);
+  assert.equal(oreReserveAt(map, 10, 8), 0);
 });
