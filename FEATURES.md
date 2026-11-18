@@ -152,3 +152,23 @@
 - [x] F808 建筑表现再升级：render/buildings.ts 加建造完成闪光与吊装动画、电力不足时窗口变暗、受损分级贴花与裂缝、炮塔待机扫描与开火后坐、雷达碟旋转，签名不变｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
 - [x] F809 地形与天气视觉：render/terrain.ts 加季节色调、道路与建筑地基过渡、矿脉储量可视化；render/weather.ts 让雨雪在地面积水/积雪并影响能见度绘制，保持既有导出签名｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
 - [x] F810 音频层次：audio/music.ts 三段编曲加乐器分层与关卡切换淡入淡出；audio/sfx.ts 加建造/采矿/警报/晋升音与空间化音量衰减，振荡器合成无外部素材｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+
+## M9 并行车道批（2026-11-18 21:10 UTC）— 生产系统上线 + 玩法纵深 + 服务端战绩
+
+> 现状判断（本轮 grep 实测）：`game/production.ts`（505 行、33 个导出、科技前置/集结点/多队列/退款规则全套）
+> 在 `main.ts` / `gameState.ts` / `render/hud.ts` 里的引用数为 **0** —— 玩家点「训练」走的仍是 gameState 手搓的
+> 单队列 `trainUnit`，科技前置、集结点、取消退款这些规则一条也用不到；`server/index.js` 只有 health + 静态托管，
+> 打完成就只存在浏览器 localStorage 里，服务端没有任何战绩沉淀；战斗、AI、矿车、寻路、渲染在 M2–M8 的粗版上还能再深一层。
+> 本批 F901 是**唯一**允许改 `client/src/main.ts` / `client/src/game/gameState.ts` / `client/src/render/hud.ts` / `client/index.html` 的车道；
+> 其余九条各自独占列出的文件，只加不改旧导出签名，禁止改 FEATURES.md，禁止互相 import 对方新增符号。
+
+- [ ] F901 生产系统上线：用 game/production.ts 取代 main.ts 手搓的 trainUnit —— 多兵营并行队列、科技/建筑前置（无兵营不出兵、无雷达不出坦克）、右键设集结点（rally point）并让新兵自动前往、取消按进度退款、升级任务排队；HUD 生产面板显示队列进度条与「前置未满足」原因。唯一允许改 main.ts / gameState.ts / render/hud.ts / client/index.html｜verify: bash scripts/build-tests.sh && node --test client/src/game/production.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: med
+- [ ] F902 战斗纵深：combat.ts 加压制值（被持续火力压制时命中与移速下降、脱离后恢复）、溅射伤害随距离衰减、集火目标保持与失效切换、对地与对空伤害权重；纯函数可测，旧导出签名不变｜verify: bash scripts/build-tests.sh && node --test client/src/game/combat.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F903 敌方 AI 战术：enemyAI.ts 加骚扰小队（绕侧翼偷袭矿车与矿厂）、被打退后回防再反击、按玩家兵力动态调整波次规模、0–3 级难度曲线；旧导出与默认行为保持一致，新行为由参数开启并补测试｜verify: bash scripts/build-tests.sh && node --test client/src/game/enemyAI.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F904 经济与矿车手感：economy.ts 加分矿与富矿收入梯度、资金上限与低资金告警节奏；harvest.ts 加矿车避堵换道、矿脉枯竭自动迁矿、满载优先回程、多矿车就近分配；纯逻辑可测，旧签名不变｜verify: bash scripts/build-tests.sh && node --test client/src/game/economy.test.js && node --test client/src/game/harvest.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F905 寻路与编队：pathfind.ts 加地形代价分层（道路更快、水面与岩石绕行）、动态拥堵避让、formationSlots 支持宽/窄两种阵型；旧 findPath / findPathSmooth 签名与语义不变并补测试｜verify: bash scripts/build-tests.sh && node --test client/src/game/pathfind.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F906 单位表现再细化：render/units.ts 加坦克履带压痕、步兵开火后坐与枪口烟、老兵角标（读可选 rank）、阵亡残骸停留与淡出、低血抖动；drawUnits 签名不变｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F907 建筑表现再细化：render/buildings.ts 加电力不足时窗口变暗与灯光闪烁、建造吊装与完成闪光、受损分级裂缝贴花、炮塔开火后坐与待机扫描、雷达碟旋转；导出签名不变｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F908 地形氛围：render/terrain.ts 与 render/textures.ts 加季节色调、土路与建筑地基过渡、矿脉储量可视化（枯竭变暗）、水岸波光与岸线阴影；drawTerrain / prerenderMap / prerenderGrid 签名不变｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F909 触屏与小地图：input/minimap.ts 加拖拽持续平移与框选跳转、敌方来袭红点告警与闪烁；input/gestures.ts 加双指缩放、长按框选、双击居中，导出签名不变｜verify: bash scripts/build-tests.sh && node --test client/src/input/ && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F910 战绩榜服务端：server/index.js 加 POST /api/score（入参校验 + 原子写 data/scoreboard.json + 简单限流）与 GET /api/leaderboard（按关卡/总分排序取前 20），不改端口 3027、不改静态托管与隧道；新增纯 Node 单测覆盖排序与校验，不引入新依赖｜verify: (cd client && npx tsc --noEmit) && node --test server/scoreboard.test.js｜risk: med
