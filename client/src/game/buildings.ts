@@ -3,7 +3,7 @@
 import { inBounds, isPassable, worldToTile, type GameMap } from './grid.js';
 import type { Point } from './selection.js';
 
-export type BuildingKind = 'hq' | 'barracks' | 'refinery';
+export type BuildingKind = 'hq' | 'barracks' | 'refinery' | 'power';
 
 export interface BuildingDef {
   w: number; // footprint width in tiles
@@ -18,6 +18,7 @@ export const BUILDING_DEFS: Record<BuildingKind, BuildingDef> = {
   hq: { w: 4, h: 3, cost: 2500, buildTime: 40, hp: 2000, label: 'HQ' },
   barracks: { w: 3, h: 2, cost: 500, buildTime: 15, hp: 800, label: 'Barracks' },
   refinery: { w: 4, h: 3, cost: 2000, buildTime: 25, hp: 1200, label: 'Refinery' },
+  power: { w: 2, h: 2, cost: 300, buildTime: 8, hp: 400, label: 'Power Plant' },
 };
 
 export interface Building {
