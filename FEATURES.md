@@ -54,3 +54,21 @@
 - [x] F308 地形渲染升级：render/terrain.ts（矿脉晶簇、水岸过渡、草地纹理噪点，预渲染离屏，不引第三方库）｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
 - [x] F309 HUD 深化：render/hud.ts（多选信息卡、生产面板骨架、快捷键提示、消息队列样式；保持 drawHud 旧签名兼容）｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
 - [x] F310 数值平衡表：balance.ts（单位/建筑成本、伤害、波次难度曲线，集中可调 + 一致性校验测试）｜verify: bash scripts/build-tests.sh && node --test client/src/game/balance.test.js && (cd client && npx tsc --noEmit)｜risk: low
+
+## M4 并行车道批（2026-11-18 15:00 UTC）— 产品闭环：让已有内核真正跑起来
+
+> 现状判断：M2/M3 造了 harvest/fog/power/production/commands/effects/save/balance 八个内核，
+> `gameState.ts` 只用到了 economy/buildings/combat/enemyAI，`main.ts` 完全没有迷雾、没有特效、
+> 没有攻击指令、没有矿车——矿脉是装饰，玩起来仍是「步兵互推」。本批两条接线车道（F401 逻辑层、
+> F402 表现层）+ 八条独立模块，先把断掉的产品环补上。
+
+- [ ] F401 经济闭环接线：gameState 接 harvest 矿车循环（矿车可训练、自动采矿卸货）+ power 供电（低电降速）+ 矿物入账，保持旧导出签名兼容｜verify: bash scripts/build-tests.sh && node --test client/src/game/gameState.test.js && node --test client/src/game/harvest.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F402 战场表现接线：main.ts/index.ts 接战争迷雾叠加、战斗特效、攻击移动/停止/编队 1-9、HUD 生产面板、鼠标边缘滚屏、暂停与加速（只此一条车道改 main.ts）｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: med
+- [ ] F403 WebAudio 合成音效：client/src/audio/sfx.ts（枪声/爆炸/建造完成/低电警报/胜负，全部振荡器合成，无外部素材，可静音、懒初始化）｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F404 防御建筑：buildings.ts 新增 turret（炮塔，射程/伤害/power 消耗）与 wall（围墙），旧定义与签名不变，canPlace/place 兼容｜verify: bash scripts/build-tests.sh && node --test client/src/game/buildings.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F405 建筑避障寻路：pathfind 新增 findPathAvoiding（把建筑占地当障碍，禁止穿墙，不可达返回 null）｜verify: bash scripts/build-tests.sh && node --test client/src/game/pathfind.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F406 建造/生产面板逻辑：game/panel.ts（底栏按钮布局、命中测试、禁用原因与进度条数值，纯几何无 DOM）+ render/panel.ts 绘制｜verify: bash scripts/build-tests.sh && node --test client/src/game/panel.test.js && (cd client && npx tsc --noEmit)｜risk: low
+- [ ] F407 存档 v2 与三槽位：save.ts 升级快照（含建筑/敌方/AI/相机/时间，兼容读 v1）+ game/saveload.ts 槽位逻辑（storage 注入，可测）｜verify: bash scripts/build-tests.sh && node --test client/src/game/save.test.js && node --test client/src/game/saveload.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F408 新手引导状态机：game/onboarding.ts（采矿→建兵营→出兵→摧毁敌基地，事件驱动推进、可跳过、步骤高亮文案）｜verify: bash scripts/build-tests.sh && node --test client/src/game/onboarding.test.js && (cd client && npx tsc --noEmit)｜risk: low
+- [ ] F409 三档难度曲线：balance.ts 增加 difficulty（easy/normal/hard：初始资金、波次间隔、敌方强度倍率）+ 一致性校验｜verify: bash scripts/build-tests.sh && node --test client/src/game/balance.test.js && (cd client && npx tsc --noEmit)｜risk: low
+- [ ] F410 帧率与实体护栏：game/perf.ts（帧时间 EMA、实体上限、慢帧降级建议、断线判定，纯逻辑）｜verify: bash scripts/build-tests.sh && node --test client/src/game/perf.test.js && (cd client && npx tsc --noEmit)｜risk: low
