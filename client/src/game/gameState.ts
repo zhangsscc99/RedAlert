@@ -47,9 +47,31 @@ import {
 import { DIFFICULTY_ORDER, type Difficulty } from './balance.js';
 import type { ArmorType } from './unitRoles.js';
 import { createHarvester, updateHarvesters, type Harvester } from './harvest.js';
-import { computePower, powerFactor } from './power.js';
+import { computePower, isLowPower, powerFactor } from './power.js';
 import type { Point } from './selection.js';
-import { snapshot, type SavedBuilding, type SavedUnit, type SaveState } from './save.js';
+import { snapshot, type SavedBuilding, type SavedUnit, type SaveState, type SaveOpts } from './save.js';
+import {
+  BASE_LEVEL,
+  MAX_LEVEL,
+  canSell,
+  effectAt,
+  sellValue,
+  startUpgrade,
+  tickUpgrade,
+  type StartUpgradeResult,
+  type UpgradeDone,
+  type UpgradeJob,
+  type UpgradeLevel,
+} from './upgrades.js';
+import {
+  assignEngineer,
+  createRepairQueue,
+  enqueue as enqueueRepair,
+  notifyDestroyed,
+  repairCost,
+  tickRepair,
+  type RepairQueue,
+} from './repair.js';
 
 export { BUILDING_DEFS } from './buildings.js';
 export type { BuildingKind } from './buildings.js';
@@ -79,6 +101,8 @@ export interface GBuilding extends Building {
   cooldown: number;
   cooldownMax: number;
   buildLeft: number; // construction seconds left; done when 0
+  level: UpgradeLevel; // 1 基础 / 2 强化 / 3 精英 (upgrades.ts)
+  repairing: boolean; // a repair-queue job with an assigned engineer is active
 }
 
 /** Per-kind combat numbers (hp/speed/cost live in UNIT_STATS). */
@@ -117,6 +141,8 @@ export interface GameState {
   enemyBuildings: GBuilding[];
   economy: Economy;
   queue: QueueItem[]; // unit production queue
+  upgradeJobs: UpgradeJob[]; // in-flight building upgrades (upgrades.ts)
+  repairs: RepairQueue; // building repair queue (repair.ts)
   ai: AIState;
   phase: Phase;
   elapsed: number; // seconds since match start
@@ -181,6 +207,8 @@ function addBuilding(
   b.cooldownMax = 0;
   b.done = done;
   b.buildLeft = done ? 0 : def.buildTime;
+  b.level = BASE_LEVEL;
+  b.repairing = false;
   return b;
 }
 
@@ -262,6 +290,8 @@ export function createGame(seed: number, opts: GameOpts = {}): GameState {
     enemyBuildings: [],
     economy: createEconomy(o.credits),
     queue: createQueue(),
+    upgradeJobs: [],
+    repairs: createRepairQueue(),
     // A shorter waveIntervalScale banks AI income faster → waves land sooner.
     ai: createAIState(seed, 1 / Math.max(0.01, o.waveIntervalScale), {
       deep: o.deepAI,
@@ -339,6 +369,87 @@ export function trainUnit(g: GameState, kind: UnitKind): TrainResult {
 /** Fresh state with the same seed + options (main.ts swaps its reference). */
 export function restart(g: GameState): GameState {
   return createGame(g.seed, g.opts);
+}
+
+// ------------------------------------------------------- building ops -----
+
+/** Grid is "online" for upgrade tiers: something produces and no deficit. */
+function gridPowered(g: GameState): boolean {
+  const p = computePower(g.buildings);
+  return p.produced > 0 && !isLowPower(p);
+}
+
+function playerBuilding(g: GameState, id: number): GBuilding | undefined {
+  return g.buildings.find((b) => b.id === id);
+}
+
+export type UpgradeStartResult =
+  | StartUpgradeResult
+  | { ok: false; reason: 'ended' | 'missing' };
+
+/** Queue an upgrade job on a player building via upgrades.ts. */
+export function upgradeBuilding(g: GameState, buildingId: number): UpgradeStartResult {
+  if (g.phase !== 'playing') return { ok: false, reason: 'ended' };
+  const b = playerBuilding(g, buildingId);
+  if (!b) return { ok: false, reason: 'missing' };
+  return startUpgrade(g.upgradeJobs, b, b.level, g.economy, gridPowered(g));
+}
+
+export type SellResult =
+  | { ok: true; refund: number }
+  | { ok: false; reason: 'ended' | 'missing' | 'busy' };
+
+/**
+ * Sell a player building: refund scales with level (SELL_REFUND) and with
+ * build progress — unfinished construction refunds only the completed
+ * fraction — times remaining hp. Any repair job is cancelled.
+ */
+export function sellBuilding(g: GameState, buildingId: number): SellResult {
+  if (g.phase !== 'playing') return { ok: false, reason: 'ended' };
+  const i = g.buildings.findIndex((b) => b.id === buildingId);
+  if (i === -1) return { ok: false, reason: 'missing' };
+  if (!canSell(g.upgradeJobs, buildingId).ok) return { ok: false, reason: 'busy' };
+  const b = g.buildings[i]!;
+  const def = BUILDING_DEFS[b.kind];
+  const prog = b.done || def.buildTime <= 0 ? 1 : Math.max(0, 1 - b.buildLeft / def.buildTime);
+  const ratio = (b.maxHp > 0 ? Math.min(1, Math.max(0, b.hp / b.maxHp)) : 0) * prog;
+  const refund = sellValue(def, b.level, ratio);
+  credit(g.economy, refund);
+  g.buildings.splice(i, 1);
+  notifyDestroyed(g.repairs, buildingId);
+  return { ok: true, refund };
+}
+
+export type RepairStartResult =
+  | { ok: true }
+  | { ok: false; reason: 'ended' | 'missing' | 'full' | 'dead' | 'duplicate' | 'invalid' | 'funds' };
+
+/**
+ * Enqueue a damaged player building for repair and attach its engineer
+ * (one dedicated engineer per building, keyed by the building id, so
+ * repairs on different buildings run in parallel). Fails loudly on empty
+ * funds so the UI can complain instead of stalling silently.
+ */
+export function startRepair(g: GameState, buildingId: number): RepairStartResult {
+  if (g.phase !== 'playing') return { ok: false, reason: 'ended' };
+  const b = playerBuilding(g, buildingId);
+  if (!b) return { ok: false, reason: 'missing' };
+  const def = BUILDING_DEFS[b.kind];
+  if (repairCost(b.maxHp, b.hp, def.cost) > 0 && g.economy.credits <= 0) {
+    return { ok: false, reason: 'funds' };
+  }
+  const r = enqueueRepair(g.repairs, { id: b.id, hp: b.hp, maxHp: b.maxHp, value: def.cost });
+  if (!r.ok) return r;
+  assignEngineer(g.repairs, b.id, b.id);
+  b.repairing = true;
+  return { ok: true };
+}
+
+/** Cancel an active repair: the job leaves the queue, engineer freed. */
+export function stopRepair(g: GameState, buildingId: number): void {
+  notifyDestroyed(g.repairs, buildingId);
+  const b = playerBuilding(g, buildingId);
+  if (b) b.repairing = false;
 }
 
 // ------------------------------------------------------------------ tick ---
@@ -480,14 +591,29 @@ function applyAICommand(g: GameState, cmd: AICommand): void {
   // 'attack': engagements resolve automatically in stepCombat.
 }
 
-export function tickGame(g: GameState, dt: number): void {
-  if (g.phase !== 'playing' || !(dt > 0)) return;
+/** Per-tick domain events, returned so the host can message/react. */
+export interface TickEvents {
+  /** Buildings whose construction finished this tick. */
+  built: GBuilding[];
+  /** Player unit kinds spawned from the production queue. */
+  trained: UnitKind[];
+  /** Upgrade jobs that completed (level already applied to the building). */
+  upgrades: UpgradeDone[];
+  /** Building ids whose repair job finished (hp back to max). */
+  repaired: number[];
+}
+
+export function tickGame(g: GameState, dt: number): TickEvents {
+  const ev: TickEvents = { built: [], trained: [], upgrades: [], repaired: [] };
+  if (g.phase !== 'playing' || !(dt > 0)) return ev;
   g.elapsed += dt;
 
-  // Refinery trickle income (finished refineries only).
-  let refs = 0;
-  for (const b of g.buildings) if (b.kind === 'refinery' && b.done) refs++;
-  if (refs > 0) credit(g.economy, REFINERY_TRICKLE * refs * dt);
+  // Refinery trickle income (finished refineries only, scaled by level).
+  let trickle = 0;
+  for (const b of g.buildings) {
+    if (b.kind === 'refinery' && b.done) trickle += effectAt('refinery', b.level).multiplier;
+  }
+  if (trickle > 0) credit(g.economy, REFINERY_TRICKLE * trickle * dt);
 
   // A short power grid slows the player's production and construction.
   const factor = powerFactor(computePower(g.buildings));
@@ -499,12 +625,38 @@ export function tickGame(g: GameState, dt: number): void {
       if (b.buildLeft <= 0) {
         b.buildLeft = 0;
         b.done = true;
+        ev.built.push(b);
       }
     }
   }
 
-  // Finished production items spawn at a working barracks.
-  for (const item of tickQueue(g.queue, dt * factor)) spawnTrained(g, item.key as UnitKind);
+  // Upgrade jobs tick in parallel; completion raises the building's level
+  // and applies the tier effect (armor grows maxHp and heals the delta).
+  for (const d of tickUpgrade(g.upgradeJobs, dt)) {
+    const b = playerBuilding(g, d.buildingId);
+    if (b) {
+      b.level = d.level;
+      if (d.effect === 'armor') {
+        const max = Math.round(BUILDING_DEFS[b.kind].hp * d.multiplier);
+        b.hp = Math.min(max, b.hp + Math.max(0, max - b.maxHp));
+        b.maxHp = max;
+      }
+    }
+    ev.upgrades.push(d);
+  }
+
+  // Finished production items spawn at a working barracks; an upgraded
+  // barracks (production effect) pushes the queue faster.
+  let raxMul = 1;
+  for (const b of g.buildings) {
+    if (b.kind === 'barracks' && b.done && b.level > BASE_LEVEL) {
+      raxMul = Math.max(raxMul, effectAt('barracks', b.level).multiplier);
+    }
+  }
+  for (const item of tickQueue(g.queue, dt * factor * raxMul)) {
+    spawnTrained(g, item.key as UnitKind);
+    ev.trained.push(item.key as UnitKind);
+  }
 
   // Enemy AI emits commands; the AI dies with its base.
   if (g.enemyBuildings.length > 0) {
@@ -552,8 +704,36 @@ export function tickGame(g: GameState, dt: number): void {
   g.enemyBuildings = g.enemyBuildings.filter((b) => b.hp > 0);
   g.ai.army = g.enemyUnits.length;
 
+  // Repairs: sync each job's hp/maxHp with its live building (combat may
+  // have damaged it further or an armor upgrade grown the cap), let
+  // engineers work, then write healed hp back. A missing building marks
+  // its job dead so tickRepair sweeps it and frees the engineer.
+  for (const j of g.repairs.jobs) {
+    const b = playerBuilding(g, j.id);
+    j.hp = b ? b.hp : 0;
+    if (b) j.maxHp = b.maxHp;
+  }
+  const rep = tickRepair(g.repairs, dt, g.economy.credits);
+  if (rep.spent > 0) spend(g.economy, rep.spent);
+  for (const h of rep.healed) {
+    const b = playerBuilding(g, h.id);
+    if (b) b.hp = h.hp;
+  }
+  for (const id of rep.finished) {
+    const b = playerBuilding(g, id);
+    if (b) b.repairing = false;
+    ev.repaired.push(id);
+  }
+
+  // Upgrade jobs die with their building (the spent cost is lost).
+  if (g.upgradeJobs.length > 0) {
+    const aliveB = new Set(g.buildings.map((b) => b.id));
+    g.upgradeJobs = g.upgradeJobs.filter((j) => aliveB.has(j.buildingId));
+  }
+
   if (!g.buildings.some((b) => b.kind === 'hq')) g.phase = 'lost';
   else if (g.enemyUnits.length === 0 && g.enemyBuildings.length === 0) g.phase = 'won';
+  return ev;
 }
 
 // ---------------------------------------------------------------- save -----
@@ -565,6 +745,29 @@ const savedBuilding = (b: GBuilding): SavedBuilding => {
   if (b.done) s.done = true;
   return s;
 };
+
+/**
+ * Per-building extras the v2 schema has no columns for — ride along inside
+ * the free-form opts map (`lvl.<id>` = upgrade level, `rep.<id>` = repair
+ * flag). Older saves simply lack these keys and restore defaults.
+ */
+function buildingSaveExtras(g: GameState): SaveOpts {
+  const o: SaveOpts = {};
+  for (const b of g.buildings) {
+    if (b.level !== BASE_LEVEL) o[`lvl.${b.id}`] = b.level;
+    if (b.repairing) o[`rep.${b.id}`] = true;
+  }
+  return o;
+}
+
+/** Apply a saved level to a restored building, growing maxHp for armor. */
+function applySavedLevel(b: GBuilding, level: UpgradeLevel): void {
+  b.level = level;
+  const fx = effectAt(b.kind, level);
+  if (fx.effect === 'armor' && level > BASE_LEVEL) {
+    b.maxHp = Math.round(BUILDING_DEFS[b.kind].hp * fx.multiplier);
+  }
+}
 
 /** SaveState snapshot of a live match (camera is optional, host-supplied). */
 export function snapshotGame(g: GameState, camera?: { x: number; y: number; zoom: number }): SaveState {
@@ -587,6 +790,7 @@ export function snapshotGame(g: GameState, camera?: { x: number; y: number; zoom
       waveIntervalScale: g.opts.waveIntervalScale,
       deepAI: g.opts.deepAI,
       aiDifficulty: DIFFICULTY_ORDER.indexOf(g.opts.aiDifficulty),
+      ...buildingSaveExtras(g),
     },
   });
 }
@@ -615,6 +819,8 @@ function restoreBuilding(
   b.hp = Math.min(Math.max(0, s.hp), def.hp);
   b.done = s.done === true;
   b.buildLeft = b.done ? 0 : def.buildTime;
+  b.level = BASE_LEVEL;
+  b.repairing = false;
   return b;
 }
 
@@ -665,7 +871,22 @@ export function restoreGame(s: SaveState): GameState | null {
 
   if (!restoreUnits(g.units, s.units ?? [], 'player', 1)) return null;
   if (!restoreUnits(g.enemyUnits, s.enemyUnits ?? [], 'enemy', g.opts.enemyStrength)) return null;
-  for (const b of s.buildings ?? []) if (!restoreBuilding(g.buildings, b, 'player')) return null;
+  for (const b of s.buildings ?? []) {
+    const rb = restoreBuilding(g.buildings, b, 'player');
+    if (!rb) return null;
+    // Level/repair flags ride in opts (`lvl.<id>` / `rep.<id>`); old saves
+    // lack them → defaults (L1, idle) apply.
+    const lv = o[`lvl.${rb.id}`];
+    if (typeof lv === 'number') {
+      const lvl = lv >= MAX_LEVEL ? MAX_LEVEL : lv <= BASE_LEVEL ? BASE_LEVEL : Math.round(lv);
+      applySavedLevel(rb, lvl as UpgradeLevel);
+      rb.hp = Math.min(Math.max(0, b.hp), rb.maxHp);
+    }
+    if (o[`rep.${rb.id}`] === true && rb.hp < rb.maxHp) {
+      const r = startRepair(g, rb.id);
+      if (!r.ok) rb.repairing = false;
+    }
+  }
   for (const b of s.enemyBuildings ?? [])
     if (!restoreBuilding(g.enemyBuildings, b, 'enemy')) return null;
 

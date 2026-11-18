@@ -1251,3 +1251,238 @@ export function drawTouchHint(
   ctx.textBaseline = 'alphabetic';
   ctx.globalAlpha = 1;
 }
+
+// ---------------------------------------------------------- building ops ----
+
+export type BuildingOpId = 'upgrade' | 'sell' | 'repair';
+
+/** One button in the building ops row. `sub` = price/refund hint line. */
+export interface BuildingOpItem {
+  id: BuildingOpId;
+  label: string;
+  sub?: string;
+  enabled: boolean;
+  reason?: string;
+}
+
+/** Everything the ops card needs — the caller translates game state. */
+export interface BuildingOpsModel {
+  title: string; // e.g. "兵营 #12  Lv2 强化"
+  hp: number;
+  maxHp: number;
+  /** 建造中 / 升级中 45% / 维修中 — shown dim under the hp bar. */
+  status?: string;
+  items: readonly BuildingOpItem[];
+}
+
+export interface BuildingOpsLayout {
+  card: Rect;
+  buttons: { id: BuildingOpId; rect: Rect }[];
+}
+
+const OPS_IDS: readonly BuildingOpId[] = ['upgrade', 'sell', 'repair'];
+
+/**
+ * Ops card anchored on the selection-card slot: the info block sits on top
+ * and the three action buttons row along its bottom edge. Card grows upward
+ * so it never covers the build bar / action bar below.
+ */
+export function buildingOpsLayout(l: HudLayout): BuildingOpsLayout {
+  const touch = l.mode !== 'desktop';
+  const btnW = touch ? 96 : 62;
+  const btnH = touch ? 44 : 32;
+  const gap = 8;
+  const pad = touch ? 12 : 10;
+  const headH = touch ? 20 : 18; // title row
+  const barH = touch ? 10 : 8; // hp bar
+  const statH = touch ? 20 : 16; // status row
+  const w = pad * 2 + OPS_IDS.length * btnW + (OPS_IDS.length - 1) * gap;
+  const h = pad * 2 + headH + 4 + barH + 4 + statH + 6 + btnH;
+  const a = l.selCard;
+  const card: Rect = {
+    x: Math.max(8, Math.min(a.x, l.viewW - w - 8)),
+    y: a.y + a.h - h,
+    w,
+    h,
+  };
+  const by = card.y + card.h - pad - btnH;
+  return {
+    card,
+    buttons: OPS_IDS.map((id, i) => ({
+      id,
+      rect: { x: card.x + pad + i * (btnW + gap), y: by, w: btnW, h: btnH },
+    })),
+  };
+}
+
+/** Which ops button (if any) is under the point. */
+export function buildingOpsHit(l: HudLayout, px: number, py: number): BuildingOpId | null {
+  for (const b of buildingOpsLayout(l).buttons) {
+    const r = b.rect;
+    if (px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h) return b.id;
+  }
+  return null;
+}
+
+/** 己方建筑信息卡：名称/等级 + 血条 + 状态 + 升级/出售/维修 按钮行。 */
+export function drawBuildingOps(
+  ctx: CanvasRenderingContext2D,
+  l: HudLayout,
+  m: BuildingOpsModel,
+): void {
+  const ol = buildingOpsLayout(l);
+  const { card } = ol;
+  panel(ctx, card.x, card.y, card.w, card.h);
+
+  const touch = l.mode !== 'desktop';
+  const pad = touch ? 12 : 10;
+  ctx.textBaseline = 'alphabetic';
+
+  ctx.font = `bold ${touch ? 15 : 14}px ui-monospace, Menlo, Consolas, monospace`;
+  ctx.fillStyle = ACCENT;
+  ctx.fillText(m.title, card.x + pad, card.y + pad + (touch ? 13 : 11));
+
+  const barY = card.y + pad + (touch ? 20 : 18) + 4;
+  const frac = m.maxHp > 0 ? m.hp / m.maxHp : 0;
+  const c = frac > 0.5 ? ACCENT : frac > 0.25 ? WARN : BAD;
+  bar(ctx, card.x + pad, barY, card.w - pad * 2, touch ? 10 : 8, frac, c);
+
+  ctx.font = `${touch ? 12 : 10}px ui-monospace, Menlo, Consolas, monospace`;
+  ctx.fillStyle = TEXT_DIM;
+  ctx.fillText(
+    `${Math.ceil(m.hp)}/${m.maxHp}${m.status ? `  ${m.status}` : ''}`,
+    card.x + pad,
+    barY + (touch ? 10 : 8) + (touch ? 16 : 13),
+  );
+
+  const fontMain = `bold ${touch ? 14 : 12}px ui-monospace, Menlo, Consolas, monospace`;
+  const fontSub = `${touch ? 10 : 9}px ui-monospace, Menlo, Consolas, monospace`;
+  for (const b of ol.buttons) {
+    const it = m.items.find((i) => i.id === b.id);
+    if (!it) continue;
+    const r = b.rect;
+    const dim = !it.enabled;
+    ctx.fillStyle = dim ? 'rgba(255,255,255,0.03)' : 'rgba(255,255,255,0.07)';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeStyle = dim ? 'rgba(255,255,255,0.10)' : 'rgba(255,255,255,0.18)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+
+    ctx.font = fontMain;
+    ctx.fillStyle = dim ? TEXT_DIM : TEXT_MAIN;
+    ctx.fillText(it.label, r.x + 6, r.y + (touch ? 18 : 14));
+    ctx.font = fontSub;
+    if (!dim && it.sub) {
+      ctx.fillStyle = WARN;
+      ctx.fillText(it.sub, r.x + 6, r.y + r.h - 5);
+    } else if (dim && it.reason) {
+      ctx.fillStyle = BAD;
+      ctx.fillText(it.reason, r.x + 6, r.y + r.h - 5);
+    }
+  }
+}
+
+// --------------------------------------------------------- onboarding bar ---
+
+/** Text the onboarding strip renders — caller maps goal()/progress(). */
+export interface OnboardingBarModel {
+  title: string;
+  body: string;
+  hint?: string;
+  done: number;
+  total: number;
+}
+
+export interface OnboardingBarLayout {
+  rect: Rect;
+  skip: Rect;
+}
+
+/** Desktop-only top-center guide strip; returns null on touch layouts. */
+export function onboardingBarLayout(l: HudLayout): OnboardingBarLayout | null {
+  if (l.mode !== 'desktop') return null;
+  const w = Math.max(320, Math.min(560, l.viewW - 380));
+  const rect: Rect = { x: (l.viewW - w) / 2, y: 10, w, h: 58 };
+  return {
+    rect,
+    skip: { x: rect.x + rect.w - 64 - 10, y: rect.y + 14, w: 64, h: 30 },
+  };
+}
+
+export function onboardingSkipHit(lay: OnboardingBarLayout, px: number, py: number): boolean {
+  const r = lay.skip;
+  return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
+}
+
+/** 新手引导条：步骤 x/y + 标题 + 说明 + 「跳过」按钮（桌面端）。 */
+export function drawOnboardingBar(
+  ctx: CanvasRenderingContext2D,
+  l: HudLayout,
+  m: OnboardingBarModel,
+): void {
+  const ol = onboardingBarLayout(l);
+  if (!ol) return;
+  const { rect, skip } = ol;
+  panel(ctx, rect.x, rect.y, rect.w, rect.h);
+
+  ctx.textBaseline = 'alphabetic';
+  ctx.font = '10px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillStyle = TEXT_DIM;
+  ctx.fillText(`新手引导 ${Math.min(m.done + 1, m.total)}/${m.total}`, rect.x + 14, rect.y + 15);
+
+  ctx.font = 'bold 13px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillStyle = ACCENT;
+  ctx.fillText(m.title, rect.x + 14, rect.y + 32);
+
+  ctx.font = '11px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillStyle = TEXT_MAIN;
+  const text = m.hint ? `${m.body} — ${m.hint}` : m.body;
+  // Crude clip: keep the body line inside the strip.
+  const maxW = skip.x - rect.x - 24;
+  ctx.fillText(text.length * 11 > maxW ? `${text.slice(0, Math.max(8, Math.floor(maxW / 11)))}…` : text, rect.x + 14, rect.y + 49);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.06)';
+  ctx.fillRect(skip.x, skip.y, skip.w, skip.h);
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(skip.x + 0.5, skip.y + 0.5, skip.w - 1, skip.h - 1);
+  ctx.font = 'bold 12px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillStyle = TEXT_DIM;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('跳过', skip.x + skip.w / 2, skip.y + skip.h / 2 + 1);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+}
+
+// ----------------------------------------------------------- battle report --
+
+/**
+ * 战报 panel drawn under the game-over band. `lines` come pre-rendered
+ * (stats.reportLines + stats.bestLines); the panel flips above the band on
+ * very short viewports.
+ */
+export function drawBattleReport(
+  ctx: CanvasRenderingContext2D,
+  viewW: number,
+  viewH: number,
+  lines: readonly string[],
+): void {
+  if (lines.length === 0) return;
+  const lineH = 18;
+  const pad = 16;
+  const w = Math.min(viewW - 32, 430);
+  const h = pad * 2 + lines.length * lineH;
+  const x = (viewW - w) / 2;
+  const cy = viewH / 2;
+  let y = cy + 92;
+  if (y + h > viewH - 10) y = cy - 64 - 10 - h;
+
+  panel(ctx, x, y, w, h);
+  ctx.font = '12px ui-monospace, Menlo, Consolas, monospace';
+  ctx.textBaseline = 'alphabetic';
+  lines.forEach((line, i) => {
+    ctx.fillStyle = line.startsWith('——') ? ACCENT : TEXT_MAIN;
+    ctx.fillText(line, x + pad, y + pad + 12 + i * lineH);
+  });
+}
