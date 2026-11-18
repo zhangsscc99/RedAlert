@@ -10,7 +10,13 @@ export type SfxName =
   | 'build'
   | 'alarm'
   | 'fanfare'
-  | 'defeat';
+  | 'defeat'
+  | 'buildStart'
+  | 'buildComplete'
+  | 'harvestUnload'
+  | 'promote'
+  | 'lowPower'
+  | 'baseAttack';
 
 /** Unit kinds that can bark back; kept local so audio stays game-free. */
 export type UnitVoice = 'infantry' | 'tank' | 'harvester' | 'turret';
@@ -22,7 +28,11 @@ export interface Sfx {
   readonly enabled: boolean;
   masterVolume: number;
   setEnabled(on: boolean): void;
-  play(name: SfxName): void;
+  /**
+   * Play a named effect. `opts.gain` (0..1) scales loudness for
+   * off-screen/distance attenuation; omit for full volume.
+   */
+  play(name: SfxName, opts?: { gain?: number }): void;
   /** Selection acknowledgment bark for a unit kind. */
   unitAck(kind: UnitVoice): void;
   /** Order confirmation bark for a unit kind. */
@@ -34,7 +44,7 @@ export interface Sfx {
   dispose(): void;
 }
 
-const RATE_LIMIT_MS = 50;
+const RATE_LIMIT_MS = 80;
 const VOICE_RATE_LIMIT_MS = 90;
 const GROUPS: readonly SfxGroup[] = ['ui', 'combat', 'voice'];
 const hasWindow = typeof window !== 'undefined';
@@ -276,6 +286,113 @@ export function createSfx(): Sfx {
         );
       },
     },
+    // Clank + rising blip when construction starts.
+    buildStart: {
+      group: 'ui',
+      fn: (c, bus) => {
+        playNoise(c, bus, {
+          dur: 0.05,
+          filter: 'bandpass',
+          freq: 900,
+          q: 1.5,
+          peak: 0.3,
+        });
+        playTone(c, bus, {
+          type: 'square',
+          f0: 240,
+          f1: 320,
+          t0offset: 0.04,
+          dur: 0.09,
+          peak: 0.25,
+        });
+      },
+    },
+    // Three-note rising chime when construction finishes.
+    buildComplete: {
+      group: 'ui',
+      fn: (c, bus) => {
+        const notes = [660, 880, 990];
+        notes.forEach((f, i) =>
+          playTone(c, bus, {
+            type: 'triangle',
+            f0: f,
+            t0offset: i * 0.09,
+            dur: i === notes.length - 1 ? 0.22 : 0.09,
+            peak: 0.3,
+          }),
+        );
+      },
+    },
+    // Conveyor rumble + clunk for a harvester dumping ore.
+    harvestUnload: {
+      group: 'ui',
+      fn: (c, bus) => {
+        playNoise(c, bus, {
+          dur: 0.35,
+          brown: true,
+          filter: 'lowpass',
+          freq: 500,
+          freqEnd: 140,
+          peak: 0.3,
+        });
+        playTone(c, bus, { type: 'triangle', f0: 220, f1: 140, dur: 0.3, peak: 0.3 });
+        playNoise(c, bus, {
+          dur: 0.05,
+          filter: 'bandpass',
+          freq: 1100,
+          q: 1.5,
+          t0offset: 0.3,
+          peak: 0.25,
+        });
+      },
+    },
+    // Bright triple chirp for a veteran promotion.
+    promote: {
+      group: 'ui',
+      fn: (c, bus) => {
+        const notes = [880, 1108, 1318];
+        notes.forEach((f, i) =>
+          playTone(c, bus, {
+            type: 'square',
+            f0: f,
+            t0offset: i * 0.07,
+            dur: i === notes.length - 1 ? 0.16 : 0.06,
+            peak: 0.22,
+          }),
+        );
+      },
+    },
+    // Dull low warble — power below demand.
+    lowPower: {
+      group: 'ui',
+      fn: (c, bus) => {
+        playTone(c, bus, { type: 'square', f0: 180, f1: 140, dur: 0.25, peak: 0.3 });
+        playTone(c, bus, {
+          type: 'square',
+          f0: 160,
+          f1: 120,
+          t0offset: 0.32,
+          dur: 0.3,
+          peak: 0.3,
+        });
+      },
+    },
+    // Urgent two-tone siren while the base takes damage.
+    baseAttack: {
+      group: 'ui',
+      fn: (c, bus) => {
+        for (let i = 0; i < 3; i++) {
+          playTone(c, bus, {
+            type: 'sawtooth',
+            f0: i % 2 === 0 ? 620 : 880,
+            f1: i % 2 === 0 ? 880 : 620,
+            t0offset: i * 0.22,
+            dur: 0.2,
+            peak: 0.32,
+          });
+        }
+      },
+    },
   };
 
   // --- Unit voice barks -----------------------------------------------------
@@ -393,13 +510,22 @@ export function createSfx(): Sfx {
     setEnabled(on: boolean): void {
       enabled = on;
     },
-    play(name: SfxName): void {
+    play(name: SfxName, opts?: { gain?: number }): void {
       if (!enabled) return;
       if (!rateOk(name, RATE_LIMIT_MS)) return;
       const c = readyCtx();
       if (!c) return;
       const s = shots[name];
-      s.fn(c, buses[s.group] ?? master!);
+      let bus: AudioNode = buses[s.group] ?? master!;
+      // Distance/off-screen attenuation: a throwaway gain staged before
+      // the group bus so group/master volumes still apply on top.
+      if (opts?.gain !== undefined) {
+        const g = c.createGain();
+        g.gain.value = Math.min(1, Math.max(0, opts.gain));
+        g.connect(bus);
+        bus = g;
+      }
+      s.fn(c, bus);
     },
     unitAck(kind: UnitVoice): void {
       playVoice(kind, 'ack', acks);

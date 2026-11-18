@@ -39,7 +39,7 @@ export interface VoicePart {
  * Adaptive arrangement stems blended by combat intensity. 'base' stems
  * always play at full weight; 'calm'/'combat'/'rout' fade with intensity.
  */
-export type MusicLayer = 'base' | 'calm' | 'combat' | 'rout';
+export type MusicLayer = 'base' | 'calm' | 'combat' | 'rout' | 'defeat';
 
 export interface LayerDef {
   layer: MusicLayer;
@@ -65,8 +65,11 @@ export interface Music {
   setVolume(v: number): void;
   readonly volume: number;
   crossfade(track: MusicTrack, seconds: number): void;
-  /** Combat intensity 0..1, fed per-frame; rebalances stems in place. */
-  setIntensity?(v: number): void;
+  /**
+   * Combat intensity 0..1, fed per-frame; rebalances stems in place.
+   * `opts.fadeScale` multiplies the per-layer fade times (0.8–1.5s base).
+   */
+  setIntensity?(v: number, opts?: { fadeScale?: number }): void;
   /** Silence the bus without losing the stored volume. */
   setMuted?(muted: boolean): void;
   dispose(): void;
@@ -107,8 +110,23 @@ export function layerWeights(
 
 function layerWeight(name: MusicLayer, intensity: number): number {
   if (name === 'base') return 1;
-  return layerWeights(intensity)[name];
+  const w = layerWeights(intensity);
+  // 'defeat' is an alias for the rout arrangement.
+  return name === 'defeat' ? w.rout : w[name];
 }
+
+/**
+ * Per-stem fade seconds for intensity rebalances: slow enough to read as
+ * layered crossfades (0.8–1.5s) rather than a hard cut. The defeat/rout
+ * pad swells slowest so the collapse feels gradual.
+ */
+const LAYER_FADE_SEC: Record<MusicLayer, number> = {
+  base: 0.8,
+  calm: 1.0,
+  combat: 0.8,
+  rout: 1.5,
+  defeat: 1.5,
+};
 
 // --- Pure data tables -------------------------------------------------------
 
@@ -218,6 +236,47 @@ function routPadPart(chords: number[][], detune: number, gain: number): VoicePar
   return { wave: 'sawtooth', gain, attack: 1.8, detune, notes };
 }
 
+// Sustained low root per bar: the bass bed under calm and defeat stems
+// where the busy 8th-note ostinato would be too aggressive.
+function bedBassPart(
+  roots: number[],
+  gain: number,
+  wave: OscillatorType = 'triangle',
+): VoicePart {
+  return {
+    wave,
+    gain,
+    attack: 0.4,
+    notes: roots.map((root, bar) => ({
+      beat: bar * 4,
+      midi: root + 12,
+      beats: 3.8,
+      vel: 0.6,
+    })),
+  };
+}
+
+// Off-beat hats only: keeps the calm stem breathing without a backbeat.
+function hatTrack(bars: number, vel: number): PercEvent[] {
+  const evs: PercEvent[] = [];
+  for (let bar = 0; bar < bars; bar++) {
+    for (let b = 0; b < 4; b++) {
+      evs.push({ beat: bar * 4 + b + 0.5, freq: 7000, dur: 0.05, vel });
+    }
+  }
+  return evs;
+}
+
+// Half-time pulse under defeat: kick on 1, dull rim on 3.
+function defeatPerc(bars: number): PercEvent[] {
+  const evs: PercEvent[] = [];
+  for (let bar = 0; bar < bars; bar++) {
+    evs.push({ beat: bar * 4, freq: 100, dur: 0.16, vel: 0.7 });
+    evs.push({ beat: bar * 4 + 2, freq: 900, dur: 0.08, vel: 0.3 });
+  }
+  return evs;
+}
+
 // Slow sub pulse under the rout pad: one swollen root note per bar.
 function routPulsePart(roots: number[], gain: number): VoicePart {
   return {
@@ -296,8 +355,12 @@ export const TRACKS: Record<MusicTrack, TrackDef> = {
     layers: [
       {
         layer: 'calm',
-        parts: [padPart(BATTLE_BED, 0.45), arpPart(BATTLE_BED, 0.35)],
-        perc: [],
+        parts: [
+          bedBassPart(BATTLE_ROOTS, 0.4),
+          padPart(BATTLE_BED, 0.45),
+          arpPart(BATTLE_BED, 0.35),
+        ],
+        perc: hatTrack(8, 0.18),
       },
       {
         layer: 'combat',
@@ -309,14 +372,15 @@ export const TRACKS: Record<MusicTrack, TrackDef> = {
         perc: percTrack(8),
       },
       {
-        layer: 'rout',
+        layer: 'defeat',
         lpFreq: 750,
         parts: [
+          routPulsePart(BATTLE_ROOTS, 0.3),
           routPadPart(BATTLE_BED, -28, 0.42),
           routPadPart(BATTLE_BED, 22, 0.34),
-          routPulsePart(BATTLE_ROOTS, 0.3),
+          arpPart(BATTLE_BED, 0.2),
         ],
-        perc: [],
+        perc: defeatPerc(8),
       },
     ],
   },
@@ -442,17 +506,24 @@ export function createMusic(ac: AudioContext): Music {
     return Math.min(12000, lp * (1 + 5 * (1 - w)));
   }
 
-  /** Ramp every stem's weight toward the current intensity — in place. */
-  function applyLayers(p: Playing, when: number): void {
+  /**
+   * Ramp every stem's weight toward the current intensity — in place.
+   * Each stem uses its own fade length (LAYER_FADE_SEC), so the layers
+   * crossfade on slightly different timescales instead of snapping.
+   */
+  function applyLayers(p: Playing, when: number, fadeScale = 1): void {
     for (const l of p.layers) {
       const w = layerWeight(l.def.layer, intensity);
-      l.gain.gain.setTargetAtTime(w, when, 0.25);
+      const dur = Math.max(0.05, LAYER_FADE_SEC[l.def.layer] * fadeScale);
+      const g = l.gain.gain;
+      g.cancelScheduledValues(when);
+      g.setValueAtTime(g.value, when);
+      g.linearRampToValueAtTime(w, when + dur);
       if (l.filter) {
-        l.filter.frequency.setTargetAtTime(
-          layerFilterFreq(l.def.lpFreq, w),
-          when,
-          0.3,
-        );
+        const f = l.filter.frequency;
+        f.cancelScheduledValues(when);
+        f.setValueAtTime(f.value, when);
+        f.linearRampToValueAtTime(layerFilterFreq(l.def.lpFreq, w), when + dur);
       }
     }
   }
@@ -554,7 +625,12 @@ export function createMusic(ac: AudioContext): Music {
       if (disposed) return;
       if (current?.track === track) return;
       if (current) killPlaying(current, 0.15);
-      current = startTrack(track, 0.3);
+      // A suspended/closed context must no-op, not throw.
+      try {
+        current = startTrack(track, 0.3);
+      } catch {
+        current = null;
+      }
     },
     stop() {
       if (current) {
@@ -571,11 +647,11 @@ export function createMusic(ac: AudioContext): Music {
         master.gain.linearRampToValueAtTime(masterTarget(), now + 0.05);
       }
     },
-    setIntensity(v) {
+    setIntensity(v, opts) {
       const x = Math.min(1, Math.max(0, v));
       if (Math.abs(x - intensity) < 1e-3) return;
       intensity = x;
-      if (current) applyLayers(current, ac.currentTime);
+      if (current) applyLayers(current, ac.currentTime, opts?.fadeScale);
     },
     setMuted(m) {
       if (muted === m) return;
@@ -588,7 +664,11 @@ export function createMusic(ac: AudioContext): Music {
       if (disposed) return;
       if (current?.track === track) return;
       if (current) killPlaying(current, seconds);
-      current = startTrack(track, seconds);
+      try {
+        current = startTrack(track, seconds);
+      } catch {
+        current = null;
+      }
     },
     dispose() {
       disposed = true;
