@@ -2555,6 +2555,7 @@ function snapshot(input) {
   if (input.stats) s.stats = cloneStats(input.stats);
   if (input.wave !== void 0) s.wave = input.wave;
   if (input.difficulty !== void 0) s.difficulty = input.difficulty;
+  if (input.mission !== void 0) s.mission = input.mission;
   if (input.weather) s.weather = cloneWeather(input.weather);
   if (input.radar) s.radar = cloneRadar(input.radar);
   return s;

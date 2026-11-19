@@ -72,6 +72,7 @@ function serialize(s) {
   if (s.camera) o.camera = { x: s.camera.x, y: s.camera.y, zoom: s.camera.zoom };
   if (s.opts) o.opts = { ...s.opts };
   if (s.difficulty !== void 0) o.difficulty = s.difficulty;
+  if (s.mission !== void 0) o.mission = s.mission;
   if (s.wave !== void 0) o.wave = s.wave;
   if (s.fog) {
     o.fog = { w: s.fog.w, h: s.fog.h, explored: encodeBase64(s.fog.explored) };
@@ -298,6 +299,7 @@ function migrateSnapshot(raw) {
     s.opts = opts;
   }
   if (typeof o.difficulty === "string") s.difficulty = o.difficulty;
+  if (typeof o.mission === "string") s.mission = o.mission;
   if (o.wave !== void 0) s.wave = migNum(o.wave, 0, 0, MAX_SAFE);
   const fog = parseFog(o.fog);
   if (fog) s.fog = fog;
@@ -337,6 +339,16 @@ function migrateSnapshot(raw) {
     }
   }
   return s;
+}
+function migrateSave(text) {
+  let raw;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  return migrateSnapshot(raw);
 }
 var fail = (reason) => ({ ok: false, reason });
 function parseResult(text) {
@@ -383,6 +395,11 @@ function parseResult(text) {
     if (typeof o.difficulty !== "string") return fail("bad-field:difficulty");
     difficulty = o.difficulty;
   }
+  let mission;
+  if (o.mission !== void 0) {
+    if (typeof o.mission !== "string") return fail("bad-field:mission");
+    mission = o.mission;
+  }
   const s = {
     version: SAVE_VERSION,
     seed,
@@ -397,6 +414,7 @@ function parseResult(text) {
   if (camera !== void 0) s.camera = camera;
   if (opts !== void 0) s.opts = opts;
   if (difficulty !== void 0) s.difficulty = difficulty;
+  if (mission !== void 0) s.mission = mission;
   if (o.wave !== void 0) s.wave = wave;
   if (fog !== void 0) s.fog = fog;
   if (stats !== void 0) s.stats = stats;
@@ -426,6 +444,7 @@ function snapshot(input) {
   if (input.stats) s.stats = cloneStats(input.stats);
   if (input.wave !== void 0) s.wave = input.wave;
   if (input.difficulty !== void 0) s.difficulty = input.difficulty;
+  if (input.mission !== void 0) s.mission = input.mission;
   if (input.weather) s.weather = cloneWeather(input.weather);
   if (input.radar) s.radar = cloneRadar(input.radar);
   return s;
@@ -809,4 +828,40 @@ test("parse() still rejects what migrateSnapshot repairs", () => {
   const text = JSON.stringify({ version: 2, credits: "lots" });
   assert.equal(parse(text), null);
   assert.equal(migrateSnapshot(JSON.parse(text)).credits, 0);
+});
+test("mission label round-trips and validates like difficulty", () => {
+  const s = { ...state, mission: "allied-2" };
+  assert.deepEqual(parse(serialize(s)), s);
+  assert.equal(JSON.parse(serialize(s)).mission, "allied-2");
+  assert.deepEqual(parseResult(JSON.stringify({ ...state, mission: 2 })), {
+    ok: false,
+    reason: "bad-field:mission"
+  });
+  assert.equal(parse(JSON.stringify({ ...state, mission: ["m1"] })), null);
+  assert.equal(parse(serialize(state))?.mission, void 0);
+  const built = snapshot({ seed: 1, credits: 0, elapsed: 0, units: [], mission: "m1" });
+  assert.equal(built.mission, "m1");
+});
+test("migrateSnapshot keeps a valid mission label and drops bad ones", () => {
+  assert.equal(migrateSnapshot({ version: 1, mission: "soviet-4" }).mission, "soviet-4");
+  assert.equal(migrateSnapshot({ version: 2, mission: 7 }).mission, void 0);
+  assert.equal(migrateSnapshot({ version: 3, mission: null }).mission, void 0);
+});
+test("migrateSave repairs text-level blobs; only non-object JSON fails", () => {
+  const m = migrateSave(
+    JSON.stringify({
+      version: 1,
+      credits: -5,
+      units: [{ id: 1, kind: "rifle", x: 1, y: 2, hp: 10 }]
+    })
+  );
+  assert.equal(m?.version, SAVE_VERSION);
+  assert.equal(m?.credits, 0);
+  assert.equal(m?.units?.[0]?.kind, "rifle");
+  const v2 = JSON.stringify({ version: 2, credits: "lots" });
+  assert.equal(parse(v2), null);
+  assert.equal(migrateSave(v2)?.credits, 0);
+  assert.equal(migrateSave("{oops"), null);
+  assert.equal(migrateSave("[1,2]"), null);
+  assert.equal(migrateSave("42"), null);
 });
