@@ -5,6 +5,9 @@ import assert from "node:assert/strict";
 // src/game/effects.ts
 var EXPLOSION_TTL = 0.6;
 var TRACER_TTL = 0.15;
+var TRACER_HEAVY_TTL = 0.28;
+var TRACER_LIGHT_WIDTH = 1;
+var TRACER_HEAVY_WIDTH = 3;
 var DAMAGE_TEXT_TTL = 1;
 var DAMAGE_TEXT_RISE = 24;
 var SHOCKWAVE_TTL = 0.5;
@@ -12,6 +15,11 @@ var DEBRIS_TTL = 1.2;
 var DEBRIS_GRAVITY = 220;
 var SMOKE_TTL = 2.4;
 var SMOKE_RISE = 14;
+var SMOKE_COLUMN_TTL = 3.2;
+var SMOKE_COLUMN_RISE = 26;
+var DUST_TTL = 1.8;
+var DUST_RISE = 8;
+var COLLAPSE_DEBRIS_TTL = 1.6;
 var CRATER_TTL_MIN = 8;
 var CRATER_TTL_MAX = 15;
 var MAX_EFFECTS = 400;
@@ -26,8 +34,19 @@ function push(list, e) {
 function spawnExplosion(list, x, y, size = 24) {
   return push(list, { kind: "explosion", x, y, vx: 0, vy: 0, ttl: EXPLOSION_TTL, age: 0, size });
 }
-function spawnTracer(list, x1, y1, x2, y2) {
-  return push(list, { kind: "tracer", x: x1, y: y1, vx: x2, vy: y2, ttl: TRACER_TTL, age: 0, size: 0 });
+function spawnTracer(list, x1, y1, x2, y2, tier = "light") {
+  const heavy = tier === "heavy";
+  return push(list, {
+    kind: "tracer",
+    x: x1,
+    y: y1,
+    vx: x2,
+    vy: y2,
+    ttl: heavy ? TRACER_HEAVY_TTL : TRACER_TTL,
+    age: 0,
+    size: heavy ? TRACER_HEAVY_WIDTH : TRACER_LIGHT_WIDTH,
+    tier
+  });
 }
 function spawnDamageText(list, x, y, amount) {
   return push(list, {
@@ -63,6 +82,34 @@ function spawnSmoke(list, x, y, size = 10) {
     age: 0,
     size
   });
+}
+function spawnSmokeColumn(list, x, y, size = 14) {
+  return push(list, {
+    kind: "smokeColumn",
+    x,
+    y,
+    vx: 0,
+    vy: -SMOKE_COLUMN_RISE,
+    ttl: SMOKE_COLUMN_TTL,
+    age: 0,
+    size
+  });
+}
+function spawnDust(list, x, y, vx = 0, vy = -DUST_RISE, size = 12) {
+  return push(list, { kind: "dust", x, y, vx, vy, ttl: DUST_TTL, age: 0, size });
+}
+function spawnBuildingCollapse(list, x, y, size = 40) {
+  for (let i = 0; i < 6; i++) {
+    const v = debrisVelocity(i + 2, 120);
+    const d = spawnDebris(list, x, y, v.vx, v.vy, 3 + i % 3);
+    d.ttl = COLLAPSE_DEBRIS_TTL;
+  }
+  for (let i = 0; i < 5; i++) {
+    const angle = i * 2.399963229728653 + 0.4;
+    spawnDust(list, x, y, Math.cos(angle) * 16, -DUST_RISE, size * 0.3 + i % 3 * 2);
+  }
+  spawnSmokeColumn(list, x, y - size * 0.4, size * 0.4);
+  return list;
 }
 function updateEffects(list, dt) {
   if (dt <= 0) return;
@@ -255,6 +302,80 @@ test("shockwave and smoke expire on their own ttls", () => {
   assert.ok(s.y < 0);
   updateEffects(list, SMOKE_TTL);
   assert.equal(list.length, 0);
+});
+test("smoke column climbs each tick and is recycled at its ttl", () => {
+  const list = [];
+  const c = spawnSmokeColumn(list, 0, 100, 14);
+  assert.equal(c.kind, "smokeColumn");
+  assert.equal(c.ttl, SMOKE_COLUMN_TTL);
+  const y0 = c.y;
+  updateEffects(list, 0.5);
+  assert.ok(c.y < y0);
+  assert.equal(c.y, y0 - SMOKE_COLUMN_RISE * 0.5);
+  const y1 = c.y;
+  updateEffects(list, 0.5);
+  assert.ok(c.y < y1);
+  updateEffects(list, SMOKE_COLUMN_TTL);
+  assert.equal(list.length, 0);
+});
+test("smoke column outlives a damage smoke puff", () => {
+  const list = [];
+  spawnSmoke(list, 0, 0);
+  spawnSmokeColumn(list, 0, 0);
+  updateEffects(list, SMOKE_TTL + 0.01);
+  assert.equal(aliveCount(list, "smoke"), 0);
+  assert.equal(aliveCount(list, "smokeColumn"), 1);
+});
+test("building collapse spawns rubble debris, dust, and a smoke column", () => {
+  const list = [];
+  const out = spawnBuildingCollapse(list, 40, 60, 40);
+  assert.equal(out, list);
+  assert.equal(aliveCount(list, "debris"), 6);
+  assert.equal(aliveCount(list, "dust"), 5);
+  assert.equal(aliveCount(list, "smokeColumn"), 1);
+  for (const e of list) if (e.kind === "debris") assert.equal(e.ttl, COLLAPSE_DEBRIS_TTL);
+  const col = list.find((e) => e.kind === "smokeColumn");
+  assert.ok(col.y < 60);
+});
+test("collapse dust drifts outward, rises slowly, and settles on its ttl", () => {
+  const list = [];
+  const d = spawnDust(list, 10, 50, 16);
+  assert.equal(d.kind, "dust");
+  assert.equal(d.ttl, DUST_TTL);
+  updateEffects(list, 0.5);
+  assert.ok(d.x > 10);
+  assert.ok(d.y < 50);
+  updateEffects(list, DUST_TTL);
+  assert.equal(list.length, 0);
+});
+test("tracer tiers: heavy is wider, longer-lived, and tagged", () => {
+  const list = [];
+  const light = spawnTracer(list, 0, 0, 10, 10);
+  const heavy = spawnTracer(list, 0, 0, 10, 10, "heavy");
+  assert.equal(light.tier, "light");
+  assert.equal(heavy.tier, "heavy");
+  assert.equal(light.size, TRACER_LIGHT_WIDTH);
+  assert.equal(heavy.size, TRACER_HEAVY_WIDTH);
+  assert.equal(light.ttl, TRACER_TTL);
+  assert.equal(heavy.ttl, TRACER_HEAVY_TTL);
+  assert.ok(heavy.ttl > light.ttl);
+  assert.ok(heavy.size > light.size);
+  updateEffects(list, TRACER_TTL + 0.01);
+  assert.equal(aliveCount(list, "tracer"), 1);
+  assert.equal(list[0].tier, "heavy");
+  updateEffects(list, TRACER_HEAVY_TTL);
+  assert.equal(list.length, 0);
+});
+test("particle count stays bounded under repeated collapse spam", () => {
+  const list = [];
+  for (let i = 0; i < 100; i++) spawnBuildingCollapse(list, i, 0);
+  assert.ok(list.length <= MAX_EFFECTS);
+  for (let i = 0; i < 50; i++) {
+    spawnSmokeColumn(list, i, 0);
+    spawnDust(list, i, 0);
+    spawnTracer(list, 0, 0, 1, 1, "heavy");
+  }
+  assert.ok(list.length <= MAX_EFFECTS);
 });
 test("MAX_EFFECTS cap drops the oldest effects", () => {
   const list = [];
