@@ -6,10 +6,11 @@ import assert from "node:assert/strict";
 var CARD_GAP = 12;
 var CARD_MIN_H = 64;
 var CARD_MAX_H = 84;
+var TWO_COL_MIN_W = 720;
 var BTN_H = 52;
 var inRect = (r, x, y) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
 function campaignLayout(viewW, viewH, count, page = 0) {
-  const cols = viewW >= 900 ? 2 : 1;
+  const cols = viewW >= TWO_COL_MIN_W ? 2 : 1;
   const totalW = Math.min(viewW - 32, cols === 2 ? 1080 : 620);
   const w = (totalW - CARD_GAP * (cols - 1)) / cols;
   const x0 = (viewW - (w * cols + CARD_GAP * (cols - 1))) / 2;
@@ -45,8 +46,7 @@ function campaignLayout(viewW, viewH, count, page = 0) {
       }
     };
   });
-  const rowsUsed = Math.max(1, Math.ceil(Math.max(0, visible) / cols));
-  const gridBottom = visible > 0 ? offsetY + rowsUsed * cardH + (rowsUsed - 1) * CARD_GAP : offsetY;
+  const gridBottom = offsetY + rows * cardH + (rows - 1) * CARD_GAP;
   const backY = Math.min(viewH - bh - 12, gridBottom + CARD_GAP * 1.5);
   const back = { x: (viewW - 200) / 2, y: backY, w: 200, h: bh };
   const pw = 72;
@@ -116,6 +116,42 @@ function missionEndHit(l, x, y) {
   }
   return null;
 }
+function clampLine(text, maxW, measure) {
+  if (measure(text) <= maxW) return text;
+  let t = text;
+  while (t.length > 0 && measure(`${t}\u2026`) > maxW) t = t.slice(0, -1);
+  return `${t}\u2026`;
+}
+function wrapText(text, maxW, measure, maxLines = 2) {
+  const lines = [];
+  const chars = [...text];
+  let cur = "";
+  let i = 0;
+  while (i < chars.length && lines.length < maxLines) {
+    const ch = chars[i];
+    if (ch === "\n") {
+      lines.push(cur);
+      cur = "";
+      i++;
+      continue;
+    }
+    if (cur !== "" && measure(cur + ch) > maxW) {
+      lines.push(cur);
+      cur = "";
+      continue;
+    }
+    cur += ch;
+    i++;
+  }
+  const overflowed = i < chars.length;
+  if (lines.length < maxLines && cur !== "") lines.push(cur);
+  if (overflowed && lines.length > 0) {
+    let t = lines[lines.length - 1];
+    while (t.length > 0 && measure(`${t}\u2026`) > maxW) t = t.slice(0, -1);
+    lines[lines.length - 1] = `${t}\u2026`;
+  }
+  return lines;
+}
 
 // src/render/campaign.test.ts
 var VIEWPORTS = [
@@ -152,19 +188,20 @@ for (const [w, h] of VIEWPORTS) {
     for (let page = 0; page < 8; page++) {
       const l = campaignLayout(w, h, MISSION_COUNT, page);
       assert.ok(l.page >= 0 && l.page < l.pageCount);
-      for (const c of l.cards) {
-        assert.ok(inside(c.rect, w, h), `card ${c.index} inside viewport`);
-        assert.ok(!overlaps(c.rect, l.back));
-      }
-      for (let i = 1; i < l.cards.length; i++) {
-        assert.ok(!overlaps(l.cards[i - 1].rect, l.cards[i].rect));
+      const rects = [
+        ...l.cards.map((c) => c.rect),
+        l.back,
+        ...l.pager.prev ? [l.pager.prev] : [],
+        ...l.pager.next ? [l.pager.next] : []
+      ];
+      for (const r of rects) assert.ok(inside(r, w, h), `rect inside viewport`);
+      for (let i = 0; i < rects.length; i++) {
+        for (let j = i + 1; j < rects.length; j++) {
+          assert.ok(!overlaps(rects[i], rects[j]), `rects ${i}/${j} disjoint`);
+        }
       }
       for (const c of l.cards) assert.ok(c.rect.h >= 64 - 1e-6);
       assert.ok(l.back.h >= 40);
-      assert.ok(inside(l.back, w, h));
-      for (const r of [l.pager.prev, l.pager.next]) {
-        if (r) assert.ok(inside(r, w, h));
-      }
     }
   });
   test(`campaign ${w}x${h}: paging covers every mission exactly once`, () => {
@@ -193,7 +230,7 @@ for (const [w, h] of VIEWPORTS) {
       );
     }
     assert.equal(seen.size, MISSION_COUNT);
-    assert.equal(first.cols, w >= 900 ? 2 : 1);
+    assert.equal(first.cols, w >= 720 ? 2 : 1);
   });
   test(`missionEnd ${w}x${h}: win shows next/retry/menu, loss shows retry/menu`, () => {
     const win = missionEndLayout(w, h, true);
@@ -229,3 +266,63 @@ for (const [w, h] of VIEWPORTS) {
 function bandTop(l) {
   return Math.min(...l.buttons.map((b) => b.rect.y)) - 30;
 }
+test("campaign 780x380: 2x2 grid of exact rects + back/pager inside", () => {
+  const l = campaignLayout(780, 380, MISSION_COUNT);
+  assert.equal(l.cols, 2);
+  assert.equal(l.perPage, 4);
+  assert.equal(l.pageCount, 2);
+  assert.deepEqual(
+    l.cards.map((c) => ({ index: c.index, ...c.rect })),
+    [
+      { index: 0, x: 16, y: 84, w: 368, h: 84 },
+      { index: 1, x: 396, y: 84, w: 368, h: 84 },
+      { index: 2, x: 16, y: 180, w: 368, h: 84 },
+      { index: 3, x: 396, y: 180, w: 368, h: 84 }
+    ]
+  );
+  assert.deepEqual(l.back, { x: 290, y: 282, w: 200, h: 40 });
+  assert.equal(l.pager.prev, null);
+  assert.deepEqual(l.pager.next, { x: 502, y: 282, w: 72, h: 40 });
+  const p2 = campaignLayout(780, 380, MISSION_COUNT, 1);
+  assert.deepEqual(
+    p2.cards.map((c) => ({ index: c.index, ...c.rect })),
+    [{ index: 4, x: 16, y: 84, w: 368, h: 84 }]
+  );
+  assert.deepEqual(p2.pager.prev, { x: 206, y: 282, w: 72, h: 40 });
+  assert.equal(p2.pager.next, null);
+});
+test("missionEnd 780x380: three buttons side by side, fully inside", () => {
+  const l = missionEndLayout(780, 380, true);
+  assert.deepEqual(
+    l.buttons.map((b) => ({ id: b.id, ...b.rect })),
+    [
+      { id: "next", x: 119, y: 235, w: 170, h: 40 },
+      { id: "retry", x: 305, y: 235, w: 170, h: 40 },
+      { id: "menu", x: 491, y: 235, w: 170, h: 40 }
+    ]
+  );
+});
+test("clampLine: short text passes through, long text ellipsizes to fit", () => {
+  const w10 = (s) => s.length * 10;
+  assert.equal(clampLine("abc", 100, w10), "abc");
+  const out = clampLine("abcdefghijklmnop", 50, w10);
+  assert.ok(out.endsWith("\u2026"));
+  assert.ok(w10(out) <= 50);
+  assert.equal(clampLine("xyz", 10, w10), "\u2026");
+});
+test("wrapText: wraps at maxW, caps at maxLines, ellipsizes overflow", () => {
+  const w10 = (s) => s.length * 10;
+  const lines = wrapText("abcdefghijklmnopqr", 50, w10, 2);
+  assert.equal(lines.length, 2);
+  for (const line of lines) assert.ok(w10(line) <= 50);
+  assert.ok(lines[1].endsWith("\u2026"));
+  assert.equal(lines[0], "abcde");
+  assert.deepEqual(wrapText("abc", 50, w10, 2), ["abc"]);
+  assert.deepEqual(wrapText("abcde", 50, w10, 2), ["abcde"]);
+  assert.deepEqual(wrapText("abcde12345", 50, w10, 2), ["abcde", "12345"]);
+  assert.deepEqual(wrapText("ab\ncd", 50, w10, 2), ["ab", "cd"]);
+  const cjk = wrapText("\u76EE\u6807\uFF1A\u6B7C\u706D\u654C\u65B9\u5DE1\u903B\u961F\u3001\u6467\u6BC1\u524D\u54E8\u57FA\u5730\u5E76\u5360\u9886\u5168\u90E8\u6CB9\u4E95", 96, w10, 2);
+  assert.equal(cjk.length, 2);
+  for (const line of cjk) assert.ok(w10(line) <= 96);
+  assert.ok(cjk[1].endsWith("\u2026"));
+});

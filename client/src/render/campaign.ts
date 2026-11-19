@@ -20,7 +20,7 @@ export interface CampaignLayout {
   pageCount: number;
   /** 每页卡片数（rows × cols）。 */
   perPage: number;
-  /** 列数：viewW ≥ 900 两列，否则一列。 */
+  /** 列数：viewW ≥ TWO_COL_MIN_W 两列，否则一列。 */
   cols: number;
   /** 第一行卡片顶缘 y —— 按页/滚动绘制时的网格原点。 */
   offsetY: number;
@@ -49,6 +49,8 @@ export interface MissionEndLayout {
 const CARD_GAP = 12;
 const CARD_MIN_H = 64;
 const CARD_MAX_H = 84;
+/** 双列断点：780 宽的小横屏也要放下 2×2 = 每页 4 张卡。 */
+const TWO_COL_MIN_W = 720;
 const BTN_H = 52;
 const BTN_GAP = 14;
 
@@ -56,10 +58,10 @@ const inRect = (r: Rect, x: number, y: number): boolean =>
   x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
 
 /**
- * 关卡卡网格：宽屏（≥900）两列、窄屏一列；行高随可用高度伸缩，
+ * 关卡卡网格：宽屏（≥720）两列、窄屏一列；行高随可用高度伸缩，
  * 最低 64px。放不下时按页展示 —— cards 只含当前页，pageCount /
  * offsetY / pager 供调用方做翻页或滚动。`count` 注入而不是读
- * MISSIONS，保证布局函数纯几何。
+ * MISSIONS，保证布局函数纯几何。780×380 下为 2×2 = 每页 4 张。
  */
 export function campaignLayout(
   viewW: number,
@@ -67,7 +69,7 @@ export function campaignLayout(
   count: number,
   page = 0,
 ): CampaignLayout {
-  const cols = viewW >= 900 ? 2 : 1;
+  const cols = viewW >= TWO_COL_MIN_W ? 2 : 1;
   const totalW = Math.min(viewW - 32, cols === 2 ? 1080 : 620);
   const w = (totalW - CARD_GAP * (cols - 1)) / cols;
   const x0 = (viewW - (w * cols + CARD_GAP * (cols - 1))) / 2;
@@ -105,9 +107,8 @@ export function campaignLayout(
       },
     };
   });
-  const rowsUsed = Math.max(1, Math.ceil(Math.max(0, visible) / cols));
-  const gridBottom =
-    visible > 0 ? offsetY + rowsUsed * cardH + (rowsUsed - 1) * CARD_GAP : offsetY;
+  // 返回/翻页钮锚在满页网格底缘（而非当前页卡数底缘）—— 翻页时位置不跳。
+  const gridBottom = offsetY + rows * cardH + (rows - 1) * CARD_GAP;
   const backY = Math.min(viewH - bh - 12, gridBottom + CARD_GAP * 1.5);
   const back: Rect = { x: (viewW - 200) / 2, y: backY, w: 200, h: bh };
   // 翻页钮贴着返回钮左右排，只在可翻方向出现；命中走 campaignPageHit。
@@ -219,6 +220,60 @@ const WARN = '#ffd94d';
 const BAD = '#ff6b5d';
 const FONT = 'ui-monospace, Menlo, Consolas, monospace';
 
+/** 单行截断（纯函数）：超宽时尾部省略号，`measure` 注入便于 node 测试。 */
+export function clampLine(
+  text: string,
+  maxW: number,
+  measure: (s: string) => number,
+): string {
+  if (measure(text) <= maxW) return text;
+  let t = text;
+  while (t.length > 0 && measure(`${t}…`) > maxW) t = t.slice(0, -1);
+  return `${t}…`;
+}
+
+/**
+ * 贪心折行（纯函数）：按可用宽度 maxW 折行，CJK 任意处可断；
+ * 最多 maxLines 行，放不下的内容在最后一行尾部省略号。
+ * `measure` 注入字号对应的 measureText，便于 node --test 无 canvas 断言。
+ */
+export function wrapText(
+  text: string,
+  maxW: number,
+  measure: (s: string) => number,
+  maxLines = 2,
+): string[] {
+  const lines: string[] = [];
+  const chars = [...text];
+  let cur = '';
+  let i = 0;
+  while (i < chars.length && lines.length < maxLines) {
+    const ch = chars[i]!;
+    if (ch === '\n') {
+      lines.push(cur);
+      cur = '';
+      i++;
+      continue;
+    }
+    if (cur !== '' && measure(cur + ch) > maxW) {
+      lines.push(cur);
+      cur = '';
+      continue; // 该字符留到下一行重试
+    }
+    cur += ch;
+    i++;
+  }
+  const overflowed = i < chars.length;
+  if (lines.length < maxLines && cur !== '') lines.push(cur);
+  if (overflowed && lines.length > 0) {
+    // 截断标记不可省：末行恰满也要尾部省略号。
+    let t = lines[lines.length - 1]!;
+    while (t.length > 0 && measure(`${t}…`) > maxW) t = t.slice(0, -1);
+    lines[lines.length - 1] = `${t}…`;
+  }
+  return lines;
+}
+
 /** fillText capped at maxW — overlong strings ellipsize instead of bleeding. */
 function fitText(
   ctx: CanvasRenderingContext2D,
@@ -227,13 +282,7 @@ function fitText(
   y: number,
   maxW: number,
 ): void {
-  if (ctx.measureText(text).width <= maxW) {
-    ctx.fillText(text, x, y);
-    return;
-  }
-  let t = text;
-  while (t.length > 1 && ctx.measureText(`${t}…`).width > maxW) t = t.slice(0, -1);
-  ctx.fillText(`${t}…`, x, y);
+  ctx.fillText(clampLine(text, maxW, (s) => ctx.measureText(s).width), x, y);
 }
 
 function button(
@@ -321,6 +370,10 @@ export interface MissionCardModel {
   unlocked: boolean;
   /** 历史最佳 0–3。 */
   stars: number;
+  /** 已通关者的最佳用时文案（e.g. "3:24"）；无记录时省略不画。 */
+  bestTime?: string;
+  /** 未解锁卡片的解锁条件；缺省推导为「通关关卡 N 解锁」。 */
+  unlockHint?: string;
 }
 
 export interface CampaignModel {
@@ -328,6 +381,8 @@ export interface CampaignModel {
   /** 已通关数 / 总星数，副标题一行。 */
   cleared: number;
   totalStars: number;
+  /** 当前页（多页时）；缺省第 0 页。 */
+  page?: number;
   hover?: CampaignHit | null;
 }
 
@@ -340,7 +395,7 @@ export function drawCampaign(
   viewH: number,
   model: CampaignModel,
 ): void {
-  const l = campaignLayout(viewW, viewH, model.missions.length);
+  const l = campaignLayout(viewW, viewH, model.missions.length, model.page ?? 0);
 
   ctx.textAlign = 'center';
   ctx.fillStyle = ACCENT;
@@ -355,13 +410,15 @@ export function drawCampaign(
   );
   ctx.textAlign = 'left';
 
+  const measure = (s: string): number => ctx.measureText(s).width;
+
   for (const c of l.cards) {
     const m = model.missions[c.index];
     if (!m) continue;
     const r = c.rect;
     const dim = !m.unlocked;
     ctx.fillStyle = dim
-      ? 'rgba(255,255,255,0.025)'
+      ? 'rgba(255,255,255,0.02)'
       : hoverMission(model.hover, c.index)
         ? 'rgba(93,255,93,0.10)'
         : PANEL_BG;
@@ -371,31 +428,70 @@ export function drawCampaign(
     ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
 
     const pad = 14;
-    const row = (r.h - pad * 2 - 2) / 3;
-    // 右列星级/锁占 ~96px —— 文本行收窄省略，不压到控件上。
-    const textW = r.w - pad - 96;
-    // 关卡序号 + 名称（锁定时置灰）。
-    ctx.font = `bold ${r.h >= 66 ? 16 : 14}px ${FONT}`;
-    ctx.fillStyle = dim ? TEXT_DIM : ACCENT;
-    fitText(ctx, `${m.index + 1}. ${m.name}`, r.x + pad, r.y + pad + row, textW);
-    // 简报 + 目标行。
-    ctx.font = `12px ${FONT}`;
-    ctx.fillStyle = TEXT_DIM;
-    fitText(ctx, m.briefing, r.x + pad + 26, r.y + pad + row * 2, textW - 26);
-    ctx.fillStyle = dim ? TEXT_DIM : TEXT_MAIN;
-    fitText(ctx, m.objective, r.x + pad + 26, r.y + pad + row * 3, textW - 26);
+    const side = 92; // 右栏：星级+用时 / 锁，文本行避开不重叠。
+    const textX = r.x + pad;
+    const textW = Math.max(80, r.w - pad * 2 - side);
+    const indent = 20;
+    const bodyW = textW - indent;
 
-    // 右列：已解锁 → 星级；锁定 → 锁 + 未解锁。
+    // 正文行（卡高 ≥82 给 3 行，否则 2 行）：锁定卡首行写解锁条件，
+    // 目标文案按可用宽度折行（≤2 行，超出省略）；空出行补一行简报。
+    ctx.font = `12px ${FONT}`;
+    const maxBody = r.h >= 82 ? 3 : 2;
+    const hint = dim
+      ? clampLine(
+          m.unlockHint ?? (m.index > 0 ? `通关关卡 ${m.index} 解锁` : '未解锁'),
+          bodyW,
+          measure,
+        )
+      : null;
+    const objCap = Math.max(1, Math.min(2, maxBody - (hint ? 1 : 0)));
+    const objLines = wrapText(m.objective, bodyW, measure, objCap);
+    const body: { text: string; color: string }[] = [];
+    if (hint) body.push({ text: hint, color: 'rgba(255,217,77,0.6)' });
+    if (body.length + objLines.length < maxBody) {
+      body.push({ text: clampLine(m.briefing, bodyW, measure), color: TEXT_DIM });
+    }
+    for (const t of objLines) body.push({ text: t, color: dim ? TEXT_DIM : TEXT_MAIN });
+
+    // 名称行 + 正文行整体垂直居中。
+    const nameSize = r.h >= 66 ? 15 : 14;
+    const lineH = 14.5;
+    const blockH = nameSize + body.length * lineH;
+    let cy = r.y + Math.max(6, (r.h - blockH) / 2) + nameSize / 2;
+    ctx.textBaseline = 'middle';
+    ctx.font = `bold ${nameSize}px ${FONT}`;
+    ctx.fillStyle = dim ? TEXT_DIM : ACCENT;
+    fitText(ctx, `${m.index + 1}. ${m.name}`, textX, cy, textW);
+    cy += nameSize / 2 + lineH / 2;
+    ctx.font = `12px ${FONT}`;
+    for (const row of body) {
+      ctx.fillStyle = row.color;
+      ctx.fillText(row.text, textX + indent, cy);
+      cy += lineH;
+    }
+
+    // 右栏：已解锁 → 星级(+最佳用时)；锁定 → 锁 + 未解锁。
+    const rcx = r.x + r.w - 46;
     if (m.unlocked) {
-      drawStars(ctx, r.x + r.w - 64, r.y + r.h / 2, 9, m.stars);
+      const starY = m.bestTime ? r.y + r.h / 2 - 8 : r.y + r.h / 2;
+      drawStars(ctx, rcx, starY, r.h >= 78 ? 8.5 : 8, m.stars);
+      if (m.bestTime) {
+        ctx.font = `10px ${FONT}`;
+        ctx.fillStyle = TEXT_DIM;
+        ctx.textAlign = 'center';
+        ctx.fillText(clampLine(`最佳 ${m.bestTime}`, side, measure), rcx, r.y + r.h / 2 + 13);
+        ctx.textAlign = 'left';
+      }
     } else {
-      drawLock(ctx, r.x + r.w - 44, r.y + r.h / 2 - 4, 13);
-      ctx.font = `11px ${FONT}`;
+      drawLock(ctx, rcx, r.y + r.h / 2 - 5, 12);
+      ctx.font = `10px ${FONT}`;
       ctx.fillStyle = TEXT_DIM;
       ctx.textAlign = 'center';
-      ctx.fillText('未解锁', r.x + r.w - 44, r.y + r.h / 2 + 22);
+      ctx.fillText('未解锁', rcx, r.y + r.h / 2 + 13);
       ctx.textAlign = 'left';
     }
+    ctx.textBaseline = 'alphabetic';
   }
 
   button(ctx, l.back, '返回菜单', { hover: model.hover?.kind === 'back' });
@@ -450,8 +546,10 @@ export function drawMissionEnd(
 
   ctx.font = `14px ${FONT}`;
   ctx.fillStyle = TEXT_MAIN;
-  m.lines.forEach((line, i) => {
-    ctx.fillText(line, viewW / 2, l.objectiveY + i * l.lineGap);
+  const lineMaxW = viewW - 48;
+  const measure = (s: string): number => ctx.measureText(s).width;
+  m.lines.slice(0, 3).forEach((line, i) => {
+    ctx.fillText(clampLine(line, lineMaxW, measure), viewW / 2, l.objectiveY + i * l.lineGap);
   });
   ctx.textAlign = 'left';
 
