@@ -252,3 +252,11 @@
 - [x] F1222 新手引导纵深：game/onboarding.ts 把首次对局拆成分步任务（采矿→造兵→造电厂→探图→首胜），每步有高亮目标与完成判定、可重看、老玩家可一键跳过并写入注入的 storage；纯逻辑可测，补 onboarding.test.ts 用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/onboarding.test.js && (cd client && npx tsc --noEmit)｜risk: low
 - [x] F1223 战后复盘与统计面板：game/stats.ts 采集分项统计（采矿总量、单位/建筑损失、杀敌数、APM 近似、资金曲线采样）并输出结构化数据；render/panel.ts 加复盘页（分栏 + 单位损失按兵种排行）；stats 旧导出签名不变，补 stats.test.ts 用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/stats.test.js && (cd client && npx tsc --noEmit)｜risk: med
 - [x] F1224 帧率自适应与卡顿治理：game/perf.ts 加自适应画质档（按滚动帧时均值升降：单位/特效/天气叠层档位）、单帧预算告警、实体超限时合并绘制裁定；perf 导出只增不改，补 perf.test.ts 用例断言档位切换阈值与迟滞｜verify: bash scripts/build-tests.sh && node --test client/src/game/perf.test.js && (cd client && npx tsc --noEmit)｜risk: med
+
+## M13 并行车道批（2026-11-19 03:45 UTC）— 上轮失败项收口 + 战斗/经济纵深
+
+> 追加原因：M12 后只剩 4 条未勾选（F1201/F1216 上轮撞免费额度未落地），本轮 6 条车道，补 2 条。
+> 每条独占列出的文件与测试文件；禁止改 FEATURES.md；禁止互相 import 对方新增符号；旧导出签名只增不改。
+
+- [ ] F1225 战斗克制与护甲纵深：game/combat.ts 加护甲类型（步兵/车辆/建筑）与武器克制矩阵（轻武器打步兵强、打车辆弱；反装甲反之）、溅射与误伤、掩体/高地加成、最小伤害下限；既有导出签名不变（新增能力走可选参数），纯函数可测，补 combat.test.ts 用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/combat.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F1226 采集经济纵深：game/harvest.ts 加矿点储量枯竭与缓慢再生、多矿车按距离与负载调度、矿车拥堵让位与排队、满载回程优先、矿厂被毁时矿车改投最近矿厂；harvest 旧导出签名不变，补 harvest.test.ts 用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/harvest.test.js && (cd client && npx tsc --noEmit)｜risk: med
