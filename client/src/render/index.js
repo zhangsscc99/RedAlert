@@ -4,3 +4,4 @@
 import "./campaign.test.js";
 import "./hud.test.js";
 import "./menu.test.js";
+import "./panel.test.js";
