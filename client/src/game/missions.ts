@@ -55,11 +55,27 @@ export interface EscortObjective extends ObjectiveBase {
   dest: TileRect;
 }
 
+/** 限时防守：撑满 seconds 秒即完成；防守建筑（默认总部）被毁则任务失败。 */
+export interface HoldObjective extends ObjectiveBase {
+  kind: 'hold';
+  seconds: number;
+  building?: BuildingKind; // 必须存活的建筑类型，默认 'hq'
+}
+
+/** 限时歼灭：seconds 秒内清空 target（默认 'all'）；超时未清完则任务失败。 */
+export interface EliminateObjective extends ObjectiveBase {
+  kind: 'eliminate';
+  seconds: number;
+  target?: 'units' | 'buildings' | 'all'; // 默认 'all'
+}
+
 export type ObjectiveDef =
   | DestroyObjective
   | CaptureObjective
   | SurviveObjective
-  | EscortObjective;
+  | EscortObjective
+  | HoldObjective
+  | EliminateObjective;
 
 /** 难度偏置：由接线层映射到 createGame 的 GameOpts。 */
 export interface DifficultyBias {
@@ -202,6 +218,50 @@ export const MISSIONS: MissionDef[] = [
     ],
     par: { three: { time: 360, losses: 6 }, two: { time: 600, losses: 10 } },
   },
+  {
+    id: 'm6',
+    name: '钢铁防线',
+    briefing: '敌方装甲集群正在合围——总部必须撑过 150 秒的围攻。',
+    credits: 8000,
+    playerUnits: [
+      { kind: 'infantry', count: 10 },
+      { kind: 'tank', count: 3 },
+      { kind: 'harvester', count: 1 },
+    ],
+    enemyUnits: [
+      { kind: 'infantry', count: 14 },
+      { kind: 'tank', count: 5 },
+    ],
+    enemyBuildings: [],
+    buildable: ['barracks', 'power', 'refinery', 'turret', 'wall'],
+    bias: { enemyStrength: 1.45, waveIntervalScale: 0.6 },
+    objectives: [
+      { kind: 'hold', id: 'hold-base', label: '坚守总部 150 秒', seconds: 150 },
+    ],
+    par: { three: { time: 160, losses: 6 }, two: { time: 190, losses: 12 } },
+  },
+  {
+    id: 'm7',
+    name: '最后通牒',
+    briefing: '敌军增援将于 180 秒后抵达——在那之前抹掉整座基地。',
+    credits: 9000,
+    playerUnits: [
+      { kind: 'infantry', count: 10 },
+      { kind: 'tank', count: 4 },
+      { kind: 'harvester', count: 1 },
+    ],
+    enemyUnits: [
+      { kind: 'infantry', count: 12 },
+      { kind: 'tank', count: 4 },
+    ],
+    enemyBuildings: ['hq', 'turret', 'turret'],
+    buildable: ['barracks', 'power', 'refinery', 'turret', 'wall'],
+    bias: { enemyStrength: 1.6, waveIntervalScale: 0.5 },
+    objectives: [
+      { kind: 'eliminate', id: 'blitz', label: '180 秒内全歼敌军', seconds: 180 },
+    ],
+    par: { three: { time: 150, losses: 5 }, two: { time: 178, losses: 10 } },
+  },
 ];
 
 // -------------------------------------------------------------- 状态 ----
@@ -337,10 +397,36 @@ function stepEscort(o: ObjectiveState, ctx: MissionCtx): boolean {
   return true;
 }
 
+/** 防守建筑先判后计时：本帧被毁即便恰好到达时限也记失败。 */
+function stepHold(o: ObjectiveState, ctx: MissionCtx, dt: number): boolean {
+  const d = o.def as HoldObjective;
+  const kind = d.building ?? 'hq';
+  if (!ctx.playerBuildings.some((b) => b.kind === kind && b.hp > 0)) return false;
+  o.t += dt;
+  o.done = o.t >= d.seconds;
+  o.progress = clamp01(o.t / d.seconds);
+  return true;
+}
+
+/** 歼灭在时限内完成优先：同帧清场与超时并存时算赢。 */
+function stepEliminate(o: ObjectiveState, ctx: MissionCtx, dt: number): boolean {
+  const d = o.def as EliminateObjective;
+  const target = d.target ?? 'all';
+  const remaining =
+    (target !== 'buildings' ? ctx.enemyUnits.length : 0) +
+    (target !== 'units' ? ctx.enemyBuildings.length : 0);
+  if (o.total === undefined) o.total = remaining; // 首帧锁定目标总数
+  o.done = remaining === 0;
+  o.progress = o.total > 0 ? clamp01(1 - remaining / o.total) : 1;
+  if (o.done) return true;
+  o.t += dt;
+  return o.t < d.seconds;
+}
+
 /**
  * 推进所有目标一帧，返回 HUD 用的 {objectives, status} 快照。
- * 胜利 = 全部目标完成；失败 = 护送目标死亡，或玩家单位+建筑全灭。
- * 终局后状态冻结，再调用只是回读缓存。
+ * 胜利 = 全部目标完成；失败 = 护送目标死亡、防守建筑被毁、歼灭超时，
+ * 或玩家单位+建筑全灭。终局后状态冻结，再调用只是回读缓存。
  */
 export function updateMission(s: MissionState, ctx: MissionCtx, dt: number): MissionReport {
   if (s.status === 'active' && dt > 0) {
@@ -359,6 +445,12 @@ export function updateMission(s: MissionState, ctx: MissionCtx, dt: number): Mis
           break;
         case 'escort':
           if (!stepEscort(o, ctx)) s.failReason = 'escort-lost';
+          break;
+        case 'hold':
+          if (!stepHold(o, ctx, dt)) s.failReason = 'defend-lost';
+          break;
+        case 'eliminate':
+          if (!stepEliminate(o, ctx, dt)) s.failReason = 'time-up';
           break;
       }
     }
