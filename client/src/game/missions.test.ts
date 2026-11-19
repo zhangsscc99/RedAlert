@@ -264,6 +264,117 @@ test('escort fails immediately when no unit carries the tag', () => {
   assert.equal(r.status, 'failed');
 });
 
+// ---------------------------------------------------------------- hold ---
+
+test('hold completes after surviving the full duration with HQ standing', () => {
+  const s = createMissionState(
+    def([{ kind: 'hold', id: 'h', label: '守住总部 10 秒', seconds: 10 }]),
+  );
+  let r = updateMission(s, ctx(), 4);
+  assert.equal(r.objectives[0].progress, 0.4);
+  assert.equal(r.status, 'active');
+
+  r = updateMission(s, ctx(), 6); // t = 10 exactly
+  assert.equal(r.objectives[0].done, true);
+  assert.equal(r.objectives[0].progress, 1);
+  assert.equal(r.status, 'won');
+});
+
+test('hold fails the instant the HQ falls, even with units alive', () => {
+  const s = createMissionState(
+    def([{ kind: 'hold', id: 'h', label: '守住总部 10 秒', seconds: 10 }]),
+  );
+  const r = updateMission(s, ctx({ playerBuildings: [] }), 5);
+  assert.equal(r.status, 'failed');
+  assert.equal(s.failReason, 'defend-lost');
+  assert.equal(r.objectives[0].done, false);
+});
+
+test('hold checks the building before crediting the frame', () => {
+  // HQ destroyed on the exact frame the timer would complete → still fails.
+  const s = createMissionState(
+    def([{ kind: 'hold', id: 'h', label: '守住总部 10 秒', seconds: 10 }]),
+  );
+  updateMission(s, ctx(), 9);
+  const r = updateMission(s, ctx({ playerBuildings: [] }), 5);
+  assert.equal(r.status, 'failed');
+  assert.equal(s.failReason, 'defend-lost');
+});
+
+test('hold can defend a non-HQ building kind', () => {
+  const s = createMissionState(
+    def([
+      { kind: 'hold', id: 'h', label: '保住雷达站', seconds: 5, building: 'turret' },
+    ]),
+  );
+  const withTurret = ctx({
+    playerBuildings: [
+      { id: 100, kind: 'hq', x: center(8), y: center(8), hp: 2000 },
+      { id: 101, kind: 'turret', x: center(12), y: center(12), hp: 300 },
+    ],
+  });
+  let r = updateMission(s, withTurret, 3);
+  assert.equal(r.objectives[0].progress, 0.6);
+
+  // HQ intact but the turret is gone → defend-lost.
+  r = updateMission(s, ctx(), 3);
+  assert.equal(r.status, 'failed');
+  assert.equal(s.failReason, 'defend-lost');
+});
+
+// ------------------------------------------------------------ eliminate --
+
+test('eliminate tracks kills and wins when everything dies before the deadline', () => {
+  const s = createMissionState(
+    def([{ kind: 'eliminate', id: 'e', label: '限时清场', seconds: 10 }]),
+  );
+  const foes = [u(9, 40, 40), u(10, 41, 40)];
+
+  let r = updateMission(s, ctx({ enemyUnits: foes }), 1); // locks total = 2
+  assert.equal(r.objectives[0].progress, 0);
+
+  r = updateMission(s, ctx({ enemyUnits: foes.slice(0, 1) }), 4);
+  assert.equal(r.objectives[0].progress, 0.5);
+  assert.equal(r.status, 'active');
+
+  r = updateMission(s, ctx({ enemyUnits: [] }), 5); // last kill lands at t = 10
+  assert.equal(r.objectives[0].done, true);
+  assert.equal(r.status, 'won');
+});
+
+test('eliminate fails when the clock runs out with enemies left', () => {
+  const s = createMissionState(
+    def([{ kind: 'eliminate', id: 'e', label: '限时清场', seconds: 5 }]),
+  );
+  updateMission(s, ctx({ enemyUnits: [u(9, 40, 40)] }), 4);
+  const r = updateMission(s, ctx({ enemyUnits: [u(9, 40, 40)] }), 1);
+  assert.equal(r.status, 'failed');
+  assert.equal(s.failReason, 'time-up');
+  assert.equal(r.objectives[0].done, false);
+});
+
+test('eliminate counts both units and buildings for target all', () => {
+  const s = createMissionState(
+    def([
+      { kind: 'eliminate', id: 'e', label: '限时全灭', seconds: 30, target: 'all' },
+    ]),
+  );
+  const foes = {
+    enemyUnits: [u(9, 40, 40)],
+    enemyBuildings: [{ id: 50, kind: 'hq' as const, x: center(40), y: center(41), hp: 2000 }],
+  };
+  let r = updateMission(s, ctx(foes), 1); // total = 2
+  assert.equal(r.objectives[0].progress, 0);
+
+  // Units gone but the HQ stands → still active, clock keeps burning.
+  r = updateMission(s, ctx({ ...foes, enemyUnits: [] }), 10);
+  assert.equal(r.objectives[0].progress, 0.5);
+  assert.equal(r.status, 'active');
+
+  r = updateMission(s, ctx(), 1);
+  assert.equal(r.status, 'won');
+});
+
 // -------------------------------------------------------------- status --
 
 test('multi-objective mission needs every objective done to win', () => {
@@ -392,7 +503,7 @@ test('parseMission rejects bad input without throwing', () => {
 // ------------------------------------------------------------- config ---
 
 test('MISSIONS table is well-formed and gets harder', () => {
-  assert.equal(MISSIONS.length, 5);
+  assert.equal(MISSIONS.length, 7);
 
   const ids = new Set(MISSIONS.map((m) => m.id));
   assert.equal(ids.size, MISSIONS.length);
@@ -425,12 +536,35 @@ test('MISSIONS table is well-formed and gets harder', () => {
   }
 });
 
-test('MISSIONS arc: tutorial is a single destroy, finale is survive+destroy', () => {
+test('MISSIONS arc: tutorial destroy-only, m5 survive+destroy, m6 hold, m7 eliminate', () => {
   const first = MISSIONS[0];
   assert.equal(first.objectives.length, 1);
   assert.equal(first.objectives[0].kind, 'destroy');
 
-  const last = MISSIONS[4];
-  const kinds = last.objectives.map((o) => o.kind).sort();
+  const m5 = MISSIONS[4];
+  const kinds = m5.objectives.map((o) => o.kind).sort();
   assert.deepEqual(kinds, ['destroy', 'survive']);
+
+  assert.equal(MISSIONS[5].id, 'm6');
+  assert.deepEqual(MISSIONS[5].objectives.map((o) => o.kind), ['hold']);
+  assert.equal(MISSIONS[6].id, 'm7');
+  assert.deepEqual(MISSIONS[6].objectives.map((o) => o.kind), ['eliminate']);
+});
+
+test('legacy missions keep their original win/loss judgements', () => {
+  // m1: destroy(units) → wiping the patrol still wins on the first frame.
+  const s1 = createMissionState(MISSIONS[0]);
+  assert.equal(updateMission(s1, ctx({ enemyUnits: [] }), 1).status, 'won');
+
+  // m4: escort still fails outright when no tagged unit exists.
+  const s4 = createMissionState(MISSIONS[3]);
+  assert.equal(updateMission(s4, ctx(), 1).status, 'failed');
+  assert.equal(s4.failReason, 'escort-lost');
+
+  // m5: survive+destroy → all foes dead but clock unfinished stays active.
+  const s5 = createMissionState(MISSIONS[4]);
+  const r5 = updateMission(s5, ctx(), 10);
+  assert.equal(r5.status, 'active');
+  assert.equal(r5.objectives[0].done, false);
+  assert.equal(r5.objectives[1].done, true);
 });

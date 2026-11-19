@@ -121,6 +121,50 @@ var MISSIONS = [
       { kind: "destroy", id: "annihilate", label: "\u5168\u6B7C\u654C\u519B", target: "all" }
     ],
     par: { three: { time: 360, losses: 6 }, two: { time: 600, losses: 10 } }
+  },
+  {
+    id: "m6",
+    name: "\u94A2\u94C1\u9632\u7EBF",
+    briefing: "\u654C\u65B9\u88C5\u7532\u96C6\u7FA4\u6B63\u5728\u5408\u56F4\u2014\u2014\u603B\u90E8\u5FC5\u987B\u6491\u8FC7 150 \u79D2\u7684\u56F4\u653B\u3002",
+    credits: 8e3,
+    playerUnits: [
+      { kind: "infantry", count: 10 },
+      { kind: "tank", count: 3 },
+      { kind: "harvester", count: 1 }
+    ],
+    enemyUnits: [
+      { kind: "infantry", count: 14 },
+      { kind: "tank", count: 5 }
+    ],
+    enemyBuildings: [],
+    buildable: ["barracks", "power", "refinery", "turret", "wall"],
+    bias: { enemyStrength: 1.45, waveIntervalScale: 0.6 },
+    objectives: [
+      { kind: "hold", id: "hold-base", label: "\u575A\u5B88\u603B\u90E8 150 \u79D2", seconds: 150 }
+    ],
+    par: { three: { time: 160, losses: 6 }, two: { time: 190, losses: 12 } }
+  },
+  {
+    id: "m7",
+    name: "\u6700\u540E\u901A\u7252",
+    briefing: "\u654C\u519B\u589E\u63F4\u5C06\u4E8E 180 \u79D2\u540E\u62B5\u8FBE\u2014\u2014\u5728\u90A3\u4E4B\u524D\u62B9\u6389\u6574\u5EA7\u57FA\u5730\u3002",
+    credits: 9e3,
+    playerUnits: [
+      { kind: "infantry", count: 10 },
+      { kind: "tank", count: 4 },
+      { kind: "harvester", count: 1 }
+    ],
+    enemyUnits: [
+      { kind: "infantry", count: 12 },
+      { kind: "tank", count: 4 }
+    ],
+    enemyBuildings: ["hq", "turret", "turret"],
+    buildable: ["barracks", "power", "refinery", "turret", "wall"],
+    bias: { enemyStrength: 1.6, waveIntervalScale: 0.5 },
+    objectives: [
+      { kind: "eliminate", id: "blitz", label: "180 \u79D2\u5185\u5168\u6B7C\u654C\u519B", seconds: 180 }
+    ],
+    par: { three: { time: 150, losses: 5 }, two: { time: 178, losses: 10 } }
   }
 ];
 function createMissionState(def2) {
@@ -185,6 +229,26 @@ function stepEscort(o, ctx2) {
   }
   return true;
 }
+function stepHold(o, ctx2, dt) {
+  const d = o.def;
+  const kind = d.building ?? "hq";
+  if (!ctx2.playerBuildings.some((b) => b.kind === kind && b.hp > 0)) return false;
+  o.t += dt;
+  o.done = o.t >= d.seconds;
+  o.progress = clamp01(o.t / d.seconds);
+  return true;
+}
+function stepEliminate(o, ctx2, dt) {
+  const d = o.def;
+  const target = d.target ?? "all";
+  const remaining = (target !== "buildings" ? ctx2.enemyUnits.length : 0) + (target !== "units" ? ctx2.enemyBuildings.length : 0);
+  if (o.total === void 0) o.total = remaining;
+  o.done = remaining === 0;
+  o.progress = o.total > 0 ? clamp01(1 - remaining / o.total) : 1;
+  if (o.done) return true;
+  o.t += dt;
+  return o.t < d.seconds;
+}
 function updateMission(s, ctx2, dt) {
   if (s.status === "active" && dt > 0) {
     s.elapsed += dt;
@@ -202,6 +266,12 @@ function updateMission(s, ctx2, dt) {
           break;
         case "escort":
           if (!stepEscort(o, ctx2)) s.failReason = "escort-lost";
+          break;
+        case "hold":
+          if (!stepHold(o, ctx2, dt)) s.failReason = "defend-lost";
+          break;
+        case "eliminate":
+          if (!stepEliminate(o, ctx2, dt)) s.failReason = "time-up";
           break;
       }
     }
@@ -546,6 +616,96 @@ test("escort fails immediately when no unit carries the tag", () => {
   const r = updateMission(s, ctx(), 1);
   assert.equal(r.status, "failed");
 });
+test("hold completes after surviving the full duration with HQ standing", () => {
+  const s = createMissionState(
+    def([{ kind: "hold", id: "h", label: "\u5B88\u4F4F\u603B\u90E8 10 \u79D2", seconds: 10 }])
+  );
+  let r = updateMission(s, ctx(), 4);
+  assert.equal(r.objectives[0].progress, 0.4);
+  assert.equal(r.status, "active");
+  r = updateMission(s, ctx(), 6);
+  assert.equal(r.objectives[0].done, true);
+  assert.equal(r.objectives[0].progress, 1);
+  assert.equal(r.status, "won");
+});
+test("hold fails the instant the HQ falls, even with units alive", () => {
+  const s = createMissionState(
+    def([{ kind: "hold", id: "h", label: "\u5B88\u4F4F\u603B\u90E8 10 \u79D2", seconds: 10 }])
+  );
+  const r = updateMission(s, ctx({ playerBuildings: [] }), 5);
+  assert.equal(r.status, "failed");
+  assert.equal(s.failReason, "defend-lost");
+  assert.equal(r.objectives[0].done, false);
+});
+test("hold checks the building before crediting the frame", () => {
+  const s = createMissionState(
+    def([{ kind: "hold", id: "h", label: "\u5B88\u4F4F\u603B\u90E8 10 \u79D2", seconds: 10 }])
+  );
+  updateMission(s, ctx(), 9);
+  const r = updateMission(s, ctx({ playerBuildings: [] }), 5);
+  assert.equal(r.status, "failed");
+  assert.equal(s.failReason, "defend-lost");
+});
+test("hold can defend a non-HQ building kind", () => {
+  const s = createMissionState(
+    def([
+      { kind: "hold", id: "h", label: "\u4FDD\u4F4F\u96F7\u8FBE\u7AD9", seconds: 5, building: "turret" }
+    ])
+  );
+  const withTurret = ctx({
+    playerBuildings: [
+      { id: 100, kind: "hq", x: center(8), y: center(8), hp: 2e3 },
+      { id: 101, kind: "turret", x: center(12), y: center(12), hp: 300 }
+    ]
+  });
+  let r = updateMission(s, withTurret, 3);
+  assert.equal(r.objectives[0].progress, 0.6);
+  r = updateMission(s, ctx(), 3);
+  assert.equal(r.status, "failed");
+  assert.equal(s.failReason, "defend-lost");
+});
+test("eliminate tracks kills and wins when everything dies before the deadline", () => {
+  const s = createMissionState(
+    def([{ kind: "eliminate", id: "e", label: "\u9650\u65F6\u6E05\u573A", seconds: 10 }])
+  );
+  const foes = [u(9, 40, 40), u(10, 41, 40)];
+  let r = updateMission(s, ctx({ enemyUnits: foes }), 1);
+  assert.equal(r.objectives[0].progress, 0);
+  r = updateMission(s, ctx({ enemyUnits: foes.slice(0, 1) }), 4);
+  assert.equal(r.objectives[0].progress, 0.5);
+  assert.equal(r.status, "active");
+  r = updateMission(s, ctx({ enemyUnits: [] }), 5);
+  assert.equal(r.objectives[0].done, true);
+  assert.equal(r.status, "won");
+});
+test("eliminate fails when the clock runs out with enemies left", () => {
+  const s = createMissionState(
+    def([{ kind: "eliminate", id: "e", label: "\u9650\u65F6\u6E05\u573A", seconds: 5 }])
+  );
+  updateMission(s, ctx({ enemyUnits: [u(9, 40, 40)] }), 4);
+  const r = updateMission(s, ctx({ enemyUnits: [u(9, 40, 40)] }), 1);
+  assert.equal(r.status, "failed");
+  assert.equal(s.failReason, "time-up");
+  assert.equal(r.objectives[0].done, false);
+});
+test("eliminate counts both units and buildings for target all", () => {
+  const s = createMissionState(
+    def([
+      { kind: "eliminate", id: "e", label: "\u9650\u65F6\u5168\u706D", seconds: 30, target: "all" }
+    ])
+  );
+  const foes = {
+    enemyUnits: [u(9, 40, 40)],
+    enemyBuildings: [{ id: 50, kind: "hq", x: center(40), y: center(41), hp: 2e3 }]
+  };
+  let r = updateMission(s, ctx(foes), 1);
+  assert.equal(r.objectives[0].progress, 0);
+  r = updateMission(s, ctx({ ...foes, enemyUnits: [] }), 10);
+  assert.equal(r.objectives[0].progress, 0.5);
+  assert.equal(r.status, "active");
+  r = updateMission(s, ctx(), 1);
+  assert.equal(r.status, "won");
+});
 test("multi-objective mission needs every objective done to win", () => {
   const s = createMissionState(
     def([
@@ -651,7 +811,7 @@ test("parseMission rejects bad input without throwing", () => {
   assert.equal(s.objectives[0].done, false);
 });
 test("MISSIONS table is well-formed and gets harder", () => {
-  assert.equal(MISSIONS.length, 5);
+  assert.equal(MISSIONS.length, 7);
   const ids = new Set(MISSIONS.map((m) => m.id));
   assert.equal(ids.size, MISSIONS.length);
   for (const m of MISSIONS) {
@@ -676,11 +836,27 @@ test("MISSIONS table is well-formed and gets harder", () => {
     assert.ok(MISSIONS[i].bias.waveIntervalScale < MISSIONS[i - 1].bias.waveIntervalScale);
   }
 });
-test("MISSIONS arc: tutorial is a single destroy, finale is survive+destroy", () => {
+test("MISSIONS arc: tutorial destroy-only, m5 survive+destroy, m6 hold, m7 eliminate", () => {
   const first = MISSIONS[0];
   assert.equal(first.objectives.length, 1);
   assert.equal(first.objectives[0].kind, "destroy");
-  const last = MISSIONS[4];
-  const kinds = last.objectives.map((o) => o.kind).sort();
+  const m5 = MISSIONS[4];
+  const kinds = m5.objectives.map((o) => o.kind).sort();
   assert.deepEqual(kinds, ["destroy", "survive"]);
+  assert.equal(MISSIONS[5].id, "m6");
+  assert.deepEqual(MISSIONS[5].objectives.map((o) => o.kind), ["hold"]);
+  assert.equal(MISSIONS[6].id, "m7");
+  assert.deepEqual(MISSIONS[6].objectives.map((o) => o.kind), ["eliminate"]);
+});
+test("legacy missions keep their original win/loss judgements", () => {
+  const s1 = createMissionState(MISSIONS[0]);
+  assert.equal(updateMission(s1, ctx({ enemyUnits: [] }), 1).status, "won");
+  const s4 = createMissionState(MISSIONS[3]);
+  assert.equal(updateMission(s4, ctx(), 1).status, "failed");
+  assert.equal(s4.failReason, "escort-lost");
+  const s5 = createMissionState(MISSIONS[4]);
+  const r5 = updateMission(s5, ctx(), 10);
+  assert.equal(r5.status, "active");
+  assert.equal(r5.objectives[0].done, false);
+  assert.equal(r5.objectives[1].done, true);
 });

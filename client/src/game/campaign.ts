@@ -59,6 +59,10 @@ export function missionFailText(reason: string | undefined): string {
   switch (reason) {
     case 'escort-lost':
       return '护送目标已损失';
+    case 'defend-lost':
+      return '防守目标被摧毁';
+    case 'time-up':
+      return '时间耗尽，目标未完成';
     case 'wiped':
       return '部队全军覆没';
     default:

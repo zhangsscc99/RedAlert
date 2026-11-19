@@ -230,6 +230,50 @@ var MISSIONS = [
       { kind: "destroy", id: "annihilate", label: "\u5168\u6B7C\u654C\u519B", target: "all" }
     ],
     par: { three: { time: 360, losses: 6 }, two: { time: 600, losses: 10 } }
+  },
+  {
+    id: "m6",
+    name: "\u94A2\u94C1\u9632\u7EBF",
+    briefing: "\u654C\u65B9\u88C5\u7532\u96C6\u7FA4\u6B63\u5728\u5408\u56F4\u2014\u2014\u603B\u90E8\u5FC5\u987B\u6491\u8FC7 150 \u79D2\u7684\u56F4\u653B\u3002",
+    credits: 8e3,
+    playerUnits: [
+      { kind: "infantry", count: 10 },
+      { kind: "tank", count: 3 },
+      { kind: "harvester", count: 1 }
+    ],
+    enemyUnits: [
+      { kind: "infantry", count: 14 },
+      { kind: "tank", count: 5 }
+    ],
+    enemyBuildings: [],
+    buildable: ["barracks", "power", "refinery", "turret", "wall"],
+    bias: { enemyStrength: 1.45, waveIntervalScale: 0.6 },
+    objectives: [
+      { kind: "hold", id: "hold-base", label: "\u575A\u5B88\u603B\u90E8 150 \u79D2", seconds: 150 }
+    ],
+    par: { three: { time: 160, losses: 6 }, two: { time: 190, losses: 12 } }
+  },
+  {
+    id: "m7",
+    name: "\u6700\u540E\u901A\u7252",
+    briefing: "\u654C\u519B\u589E\u63F4\u5C06\u4E8E 180 \u79D2\u540E\u62B5\u8FBE\u2014\u2014\u5728\u90A3\u4E4B\u524D\u62B9\u6389\u6574\u5EA7\u57FA\u5730\u3002",
+    credits: 9e3,
+    playerUnits: [
+      { kind: "infantry", count: 10 },
+      { kind: "tank", count: 4 },
+      { kind: "harvester", count: 1 }
+    ],
+    enemyUnits: [
+      { kind: "infantry", count: 12 },
+      { kind: "tank", count: 4 }
+    ],
+    enemyBuildings: ["hq", "turret", "turret"],
+    buildable: ["barracks", "power", "refinery", "turret", "wall"],
+    bias: { enemyStrength: 1.6, waveIntervalScale: 0.5 },
+    objectives: [
+      { kind: "eliminate", id: "blitz", label: "180 \u79D2\u5185\u5168\u6B7C\u654C\u519B", seconds: 180 }
+    ],
+    par: { three: { time: 150, losses: 5 }, two: { time: 178, losses: 10 } }
   }
 ];
 function createMissionState(def) {
@@ -294,6 +338,26 @@ function stepEscort(o, ctx) {
   }
   return true;
 }
+function stepHold(o, ctx, dt) {
+  const d = o.def;
+  const kind = d.building ?? "hq";
+  if (!ctx.playerBuildings.some((b) => b.kind === kind && b.hp > 0)) return false;
+  o.t += dt;
+  o.done = o.t >= d.seconds;
+  o.progress = clamp01(o.t / d.seconds);
+  return true;
+}
+function stepEliminate(o, ctx, dt) {
+  const d = o.def;
+  const target = d.target ?? "all";
+  const remaining = (target !== "buildings" ? ctx.enemyUnits.length : 0) + (target !== "units" ? ctx.enemyBuildings.length : 0);
+  if (o.total === void 0) o.total = remaining;
+  o.done = remaining === 0;
+  o.progress = o.total > 0 ? clamp01(1 - remaining / o.total) : 1;
+  if (o.done) return true;
+  o.t += dt;
+  return o.t < d.seconds;
+}
 function updateMission(s, ctx, dt) {
   if (s.status === "active" && dt > 0) {
     s.elapsed += dt;
@@ -311,6 +375,12 @@ function updateMission(s, ctx, dt) {
           break;
         case "escort":
           if (!stepEscort(o, ctx)) s.failReason = "escort-lost";
+          break;
+        case "hold":
+          if (!stepHold(o, ctx, dt)) s.failReason = "defend-lost";
+          break;
+        case "eliminate":
+          if (!stepEliminate(o, ctx, dt)) s.failReason = "time-up";
           break;
       }
     }
@@ -381,6 +451,10 @@ function missionFailText(reason) {
   switch (reason) {
     case "escort-lost":
       return "\u62A4\u9001\u76EE\u6807\u5DF2\u635F\u5931";
+    case "defend-lost":
+      return "\u9632\u5B88\u76EE\u6807\u88AB\u6467\u6BC1";
+    case "time-up":
+      return "\u65F6\u95F4\u8017\u5C3D\uFF0C\u76EE\u6807\u672A\u5B8C\u6210";
     case "wiped":
       return "\u90E8\u961F\u5168\u519B\u8986\u6CA1";
     default:
@@ -1076,8 +1150,35 @@ test("manualEnd suppresses annihilation win/lose in tickGame", () => {
 });
 test("missionFailText maps every known reason", () => {
   assert.equal(missionFailText("escort-lost"), "\u62A4\u9001\u76EE\u6807\u5DF2\u635F\u5931");
+  assert.equal(missionFailText("defend-lost"), "\u9632\u5B88\u76EE\u6807\u88AB\u6467\u6BC1");
+  assert.equal(missionFailText("time-up"), "\u65F6\u95F4\u8017\u5C3D\uFF0C\u76EE\u6807\u672A\u5B8C\u6210");
   assert.equal(missionFailText("wiped"), "\u90E8\u961F\u5168\u519B\u8986\u6CA1");
   assert.equal(missionFailText(void 0), "\u4EFB\u52A1\u76EE\u6807\u5931\u8D25");
+});
+test("m6 hold mission spawns a real HQ and fails when it falls", () => {
+  const m6 = MISSIONS[5];
+  const g = createGame(7, missionGameOpts(m6));
+  assert.ok(g.buildings.some((b) => b.kind === "hq"), "player HQ should spawn");
+  const s = createMissionState(m6);
+  let rep = updateMission(s, missionCtx(g), 30);
+  assert.equal(rep.status, "active");
+  assert.ok(rep.objectives[0].progress > 0 && rep.objectives[0].progress < 1);
+  g.buildings = g.buildings.filter((b) => b.kind !== "hq");
+  rep = updateMission(s, missionCtx(g), 30);
+  assert.equal(rep.status, "failed");
+  assert.equal(s.failReason, "defend-lost");
+});
+test("m7 eliminate mission wins inside the deadline when the base is razed", () => {
+  const m7 = MISSIONS[6];
+  const g = createGame(7, missionGameOpts(m7));
+  assert.ok(g.enemyUnits.length > 0 && g.enemyBuildings.length > 0);
+  const s = createMissionState(m7);
+  let rep = updateMission(s, missionCtx(g), 1);
+  assert.equal(rep.status, "active");
+  g.enemyUnits = [];
+  g.enemyBuildings = [];
+  rep = updateMission(s, missionCtx(g), 60);
+  assert.equal(rep.status, "won");
 });
 test("loadProgress defaults on empty/corrupt storage", () => {
   assert.deepEqual(loadProgress(null), defaultProgress());

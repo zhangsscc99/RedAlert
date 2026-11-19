@@ -107,8 +107,41 @@ test('manualEnd suppresses annihilation win/lose in tickGame', () => {
 
 test('missionFailText maps every known reason', () => {
   assert.equal(missionFailText('escort-lost'), '护送目标已损失');
+  assert.equal(missionFailText('defend-lost'), '防守目标被摧毁');
+  assert.equal(missionFailText('time-up'), '时间耗尽，目标未完成');
   assert.equal(missionFailText('wiped'), '部队全军覆没');
   assert.equal(missionFailText(undefined), '任务目标失败');
+});
+
+test('m6 hold mission spawns a real HQ and fails when it falls', () => {
+  const m6 = MISSIONS[5]!;
+  const g = createGame(7, missionGameOpts(m6));
+  assert.ok(g.buildings.some((b) => b.kind === 'hq'), 'player HQ should spawn');
+
+  const s = createMissionState(m6);
+  let rep = updateMission(s, missionCtx(g), 30);
+  assert.equal(rep.status, 'active');
+  assert.ok(rep.objectives[0].progress > 0 && rep.objectives[0].progress < 1);
+
+  g.buildings = g.buildings.filter((b) => b.kind !== 'hq');
+  rep = updateMission(s, missionCtx(g), 30);
+  assert.equal(rep.status, 'failed');
+  assert.equal(s.failReason, 'defend-lost');
+});
+
+test('m7 eliminate mission wins inside the deadline when the base is razed', () => {
+  const m7 = MISSIONS[6]!;
+  const g = createGame(7, missionGameOpts(m7));
+  assert.ok(g.enemyUnits.length > 0 && g.enemyBuildings.length > 0);
+
+  const s = createMissionState(m7);
+  let rep = updateMission(s, missionCtx(g), 1); // locks the target total
+  assert.equal(rep.status, 'active');
+
+  g.enemyUnits = [];
+  g.enemyBuildings = [];
+  rep = updateMission(s, missionCtx(g), 60); // well under the 180s limit
+  assert.equal(rep.status, 'won');
 });
 
 // ------------------------------------------------------------ progress ----
