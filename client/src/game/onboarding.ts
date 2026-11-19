@@ -217,6 +217,215 @@ export function reset(o: Onboarding): void {
   o.frozenDone = fresh.frozenDone;
 }
 
+// ---------------------------------------------------------------------------
+// First-match guide ("纵深"): a stricter, step-locked mission chain for the
+// very first game: 采矿 -> 造兵 -> 造电厂 -> 探图 -> 首胜. Unlike the loose
+// tutorial above, steps here must be completed in order (jump protection),
+// each step exposes a highlight target id plus a pure completion predicate,
+// and veteran players can skip once — the skip is persisted through an
+// injected storage so it survives reloads. Still no DOM, no clock.
+
+export type GuideStepId =
+  | 'guideHarvest'
+  | 'guideArmy'
+  | 'guidePower'
+  | 'guideScout'
+  | 'guideWin'
+  | 'guideDone';
+
+export type GuideHighlight =
+  | 'refineryZone'
+  | 'barracksMenu'
+  | 'powerMenu'
+  | 'mapEdge'
+  | 'enemyBase';
+
+/** Minimal storage contract (window.localStorage-compatible), injected. */
+export interface GuideStorage {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+}
+
+export interface GuideGoal {
+  id: GuideStepId;
+  title: string;
+  body: string;
+  /** DOM element / map-region id the UI should highlight. */
+  highlight: GuideHighlight;
+}
+
+export interface GuideFlags {
+  harvested: boolean;
+  army: number;
+  powerPlant: boolean;
+  scouted: boolean;
+  won: boolean;
+}
+
+export interface FirstMatchGuide {
+  status: OnboardingStatus;
+  stepIndex: number;
+  flags: GuideFlags;
+  storage?: GuideStorage;
+  storageKey: string;
+}
+
+interface GuideStepDef {
+  id: GuideStepId;
+  title: string;
+  body: string;
+  highlight: GuideHighlight;
+  done(f: GuideFlags): boolean;
+}
+
+const GUIDE_STEPS: GuideStepDef[] = [
+  {
+    id: 'guideHarvest',
+    title: '恢复经济',
+    body: '命令矿车采满第一车矿并送回精炼厂。',
+    highlight: 'refineryZone',
+    done: (f) => f.harvested,
+  },
+  {
+    id: 'guideArmy',
+    title: '组建部队',
+    body: '训练至少 3 名作战单位。',
+    highlight: 'barracksMenu',
+    done: (f) => f.army >= 3,
+  },
+  {
+    id: 'guidePower',
+    title: '保障电力',
+    body: '建造一座发电厂，避免基地断电减产。',
+    highlight: 'powerMenu',
+    done: (f) => f.powerPlant,
+  },
+  {
+    id: 'guideScout',
+    title: '侦察敌情',
+    body: '派单位走到地图边缘，揭开战争迷雾找到敌人。',
+    highlight: 'mapEdge',
+    done: (f) => f.scouted,
+  },
+  {
+    id: 'guideWin',
+    title: '夺取首胜',
+    body: '集中兵力摧毁敌方主基地，赢下第一局。',
+    highlight: 'enemyBase',
+    done: (f) => f.won,
+  },
+];
+
+export const GUIDE_SKIP_KEY = 'redalert.guideSkipped';
+
+export function createGuide(
+  storage?: GuideStorage,
+  storageKey: string = GUIDE_SKIP_KEY,
+): FirstMatchGuide {
+  const g: FirstMatchGuide = {
+    status: 'active',
+    stepIndex: 0,
+    flags: { harvested: false, army: 0, powerPlant: false, scouted: false, won: false },
+    storageKey,
+  };
+  if (storage) {
+    g.storage = storage;
+    if (storage.getItem(storageKey) === '1') g.status = 'skipped';
+  }
+  return g;
+}
+
+function guideAdvance(g: FirstMatchGuide): void {
+  if (g.status !== 'active') return;
+  while (
+    g.stepIndex < GUIDE_STEPS.length &&
+    GUIDE_STEPS[g.stepIndex].done(g.flags)
+  ) {
+    g.stepIndex++;
+  }
+  if (g.stepIndex >= GUIDE_STEPS.length) g.status = 'done';
+}
+
+/** Current step id ('guideDone' when finished). Pure w.r.t. callers: it only mutates cached index. */
+export function guideStep(g: FirstMatchGuide): GuideStepId {
+  guideAdvance(g);
+  return g.status === 'done' ? 'guideDone' : GUIDE_STEPS[g.stepIndex].id;
+}
+
+/** Current goal including the highlight target id. */
+export function guideGoal(g: FirstMatchGuide): GuideGoal | null {
+  guideAdvance(g);
+  if (g.status !== 'active' || g.stepIndex >= GUIDE_STEPS.length) return null;
+  const s = GUIDE_STEPS[g.stepIndex];
+  return { id: s.id, title: s.title, body: s.body, highlight: s.highlight };
+}
+
+/** Pure completion predicate for a given step id. */
+export function guideStepDone(id: GuideStepId, f: GuideFlags): boolean {
+  const s = GUIDE_STEPS.find((d) => d.id === id);
+  return s ? s.done(f) : id === 'guideDone' && f.won;
+}
+
+export function guideNotify(g: FirstMatchGuide, evt: OnboardingEvent): void {
+  if (g.status !== 'active') return;
+  switch (evt.type) {
+    case 'harvested':
+      if ((evt.credits ?? 1) > 0) g.flags.harvested = true;
+      break;
+    case 'unitTrained':
+      if (evt.unit !== 'harvester') g.flags.army += Math.max(1, evt.count ?? 1);
+      break;
+    case 'buildingDone':
+      if (evt.building === 'power') g.flags.powerPlant = true;
+      break;
+    case 'unitMovedTo':
+      if (evt.region === 'edge' || evt.region === 'enemyTerritory') g.flags.scouted = true;
+      break;
+    case 'enemyBuildingDestroyed':
+      if (!evt.building || evt.building === 'hq') g.flags.won = true;
+      break;
+    default:
+      return;
+  }
+  guideAdvance(g);
+}
+
+/**
+ * Jump protection: only allows moving forward to a step whose prerequisites
+ * are all satisfied (or moving backwards to review). Returns false on refusal.
+ */
+export function guideJumpTo(g: FirstMatchGuide, id: GuideStepId): boolean {
+  if (g.status !== 'active') return false;
+  const target = GUIDE_STEPS.findIndex((s) => s.id === id);
+  if (target < 0) return false;
+  for (let i = 0; i < target; i++) {
+    if (!GUIDE_STEPS[i].done(g.flags)) return false;
+  }
+  g.stepIndex = target;
+  guideAdvance(g);
+  return true;
+}
+
+/** Veteran skip: marks the guide skipped and persists it via injected storage. */
+export function guideSkip(g: FirstMatchGuide): void {
+  if (g.status !== 'active') return;
+  g.status = 'skipped';
+  g.storage?.setItem(g.storageKey, '1');
+}
+
+/** Re-watch: clears the persisted skip and restarts the chain. */
+export function guideRestart(g: FirstMatchGuide): void {
+  g.storage?.setItem(g.storageKey, '0');
+  g.status = 'active';
+  g.stepIndex = 0;
+  g.flags = { harvested: false, army: 0, powerPlant: false, scouted: false, won: false };
+}
+
+export function guideProgress(g: FirstMatchGuide): { done: number; total: number } {
+  const done = g.status === 'done' ? GUIDE_STEPS.length : g.stepIndex;
+  return { done, total: GUIDE_STEPS.length };
+}
+
 export function progress(o: Onboarding): { done: number; total: number } {
   const done =
     o.status === 'done'

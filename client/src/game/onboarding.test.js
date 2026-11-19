@@ -135,12 +135,141 @@ function reset(o) {
   o.infantryTrained = fresh.infantryTrained;
   o.frozenDone = fresh.frozenDone;
 }
+var GUIDE_STEPS = [
+  {
+    id: "guideHarvest",
+    title: "\u6062\u590D\u7ECF\u6D4E",
+    body: "\u547D\u4EE4\u77FF\u8F66\u91C7\u6EE1\u7B2C\u4E00\u8F66\u77FF\u5E76\u9001\u56DE\u7CBE\u70BC\u5382\u3002",
+    highlight: "refineryZone",
+    done: (f) => f.harvested
+  },
+  {
+    id: "guideArmy",
+    title: "\u7EC4\u5EFA\u90E8\u961F",
+    body: "\u8BAD\u7EC3\u81F3\u5C11 3 \u540D\u4F5C\u6218\u5355\u4F4D\u3002",
+    highlight: "barracksMenu",
+    done: (f) => f.army >= 3
+  },
+  {
+    id: "guidePower",
+    title: "\u4FDD\u969C\u7535\u529B",
+    body: "\u5EFA\u9020\u4E00\u5EA7\u53D1\u7535\u5382\uFF0C\u907F\u514D\u57FA\u5730\u65AD\u7535\u51CF\u4EA7\u3002",
+    highlight: "powerMenu",
+    done: (f) => f.powerPlant
+  },
+  {
+    id: "guideScout",
+    title: "\u4FA6\u5BDF\u654C\u60C5",
+    body: "\u6D3E\u5355\u4F4D\u8D70\u5230\u5730\u56FE\u8FB9\u7F18\uFF0C\u63ED\u5F00\u6218\u4E89\u8FF7\u96FE\u627E\u5230\u654C\u4EBA\u3002",
+    highlight: "mapEdge",
+    done: (f) => f.scouted
+  },
+  {
+    id: "guideWin",
+    title: "\u593A\u53D6\u9996\u80DC",
+    body: "\u96C6\u4E2D\u5175\u529B\u6467\u6BC1\u654C\u65B9\u4E3B\u57FA\u5730\uFF0C\u8D62\u4E0B\u7B2C\u4E00\u5C40\u3002",
+    highlight: "enemyBase",
+    done: (f) => f.won
+  }
+];
+var GUIDE_SKIP_KEY = "redalert.guideSkipped";
+function createGuide(storage, storageKey = GUIDE_SKIP_KEY) {
+  const g = {
+    status: "active",
+    stepIndex: 0,
+    flags: { harvested: false, army: 0, powerPlant: false, scouted: false, won: false },
+    storageKey
+  };
+  if (storage) {
+    g.storage = storage;
+    if (storage.getItem(storageKey) === "1") g.status = "skipped";
+  }
+  return g;
+}
+function guideAdvance(g) {
+  if (g.status !== "active") return;
+  while (g.stepIndex < GUIDE_STEPS.length && GUIDE_STEPS[g.stepIndex].done(g.flags)) {
+    g.stepIndex++;
+  }
+  if (g.stepIndex >= GUIDE_STEPS.length) g.status = "done";
+}
+function guideStep(g) {
+  guideAdvance(g);
+  return g.status === "done" ? "guideDone" : GUIDE_STEPS[g.stepIndex].id;
+}
+function guideGoal(g) {
+  guideAdvance(g);
+  if (g.status !== "active" || g.stepIndex >= GUIDE_STEPS.length) return null;
+  const s = GUIDE_STEPS[g.stepIndex];
+  return { id: s.id, title: s.title, body: s.body, highlight: s.highlight };
+}
+function guideStepDone(id, f) {
+  const s = GUIDE_STEPS.find((d) => d.id === id);
+  return s ? s.done(f) : id === "guideDone" && f.won;
+}
+function guideNotify(g, evt) {
+  if (g.status !== "active") return;
+  switch (evt.type) {
+    case "harvested":
+      if ((evt.credits ?? 1) > 0) g.flags.harvested = true;
+      break;
+    case "unitTrained":
+      if (evt.unit !== "harvester") g.flags.army += Math.max(1, evt.count ?? 1);
+      break;
+    case "buildingDone":
+      if (evt.building === "power") g.flags.powerPlant = true;
+      break;
+    case "unitMovedTo":
+      if (evt.region === "edge" || evt.region === "enemyTerritory") g.flags.scouted = true;
+      break;
+    case "enemyBuildingDestroyed":
+      if (!evt.building || evt.building === "hq") g.flags.won = true;
+      break;
+    default:
+      return;
+  }
+  guideAdvance(g);
+}
+function guideJumpTo(g, id) {
+  if (g.status !== "active") return false;
+  const target = GUIDE_STEPS.findIndex((s) => s.id === id);
+  if (target < 0) return false;
+  for (let i = 0; i < target; i++) {
+    if (!GUIDE_STEPS[i].done(g.flags)) return false;
+  }
+  g.stepIndex = target;
+  guideAdvance(g);
+  return true;
+}
+function guideSkip(g) {
+  if (g.status !== "active") return;
+  g.status = "skipped";
+  g.storage?.setItem(g.storageKey, "1");
+}
+function guideRestart(g) {
+  g.storage?.setItem(g.storageKey, "0");
+  g.status = "active";
+  g.stepIndex = 0;
+  g.flags = { harvested: false, army: 0, powerPlant: false, scouted: false, won: false };
+}
+function guideProgress(g) {
+  const done = g.status === "done" ? GUIDE_STEPS.length : g.stepIndex;
+  return { done, total: GUIDE_STEPS.length };
+}
 function progress(o) {
   const done = o.status === "done" ? STEPS.length : o.status === "skipped" ? o.frozenDone ?? o.stepIndex : o.stepIndex;
   return { done, total: STEPS.length };
 }
 
 // src/game/onboarding.test.ts
+function memStorage(init = {}) {
+  const map = new Map(Object.entries(init));
+  return {
+    map,
+    getItem: (k) => map.has(k) ? map.get(k) : null,
+    setItem: (k, v) => void map.set(k, v)
+  };
+}
 test("in-order walkthrough reaches done through all 5 steps", () => {
   const o = createOnboarding();
   assert.equal(step(o), "mine");
@@ -263,4 +392,112 @@ test("shouldRun covers skirmish and campaign only", () => {
   assert.equal(shouldRun("replay"), false);
   assert.equal(shouldRun("spectate"), false);
   assert.equal(shouldRun(""), false);
+});
+test("guide: five steps advance in order to first win", () => {
+  const g = createGuide();
+  assert.equal(guideStep(g), "guideHarvest");
+  assert.equal(guideGoal(g)?.highlight, "refineryZone");
+  guideNotify(g, { type: "harvested", credits: 100 });
+  assert.equal(guideStep(g), "guideArmy");
+  assert.equal(guideGoal(g)?.highlight, "barracksMenu");
+  guideNotify(g, { type: "unitTrained", unit: "infantry", count: 2 });
+  assert.equal(guideStep(g), "guideArmy");
+  guideNotify(g, { type: "unitTrained", unit: "tank" });
+  assert.equal(guideStep(g), "guidePower");
+  assert.equal(guideGoal(g)?.highlight, "powerMenu");
+  guideNotify(g, { type: "buildingDone", building: "power" });
+  assert.equal(guideStep(g), "guideScout");
+  assert.equal(guideGoal(g)?.highlight, "mapEdge");
+  guideNotify(g, { type: "unitMovedTo", region: "edge" });
+  assert.equal(guideStep(g), "guideWin");
+  assert.equal(guideGoal(g)?.highlight, "enemyBase");
+  guideNotify(g, { type: "enemyBuildingDestroyed", building: "hq" });
+  assert.equal(guideStep(g), "guideDone");
+  assert.equal(g.status, "done");
+  assert.equal(guideGoal(g), null);
+  assert.deepEqual(guideProgress(g), { done: 5, total: 5 });
+});
+test("guide: harvester training does not count toward army size", () => {
+  const g = createGuide();
+  guideNotify(g, { type: "harvested" });
+  guideNotify(g, { type: "unitTrained", unit: "harvester" });
+  guideNotify(g, { type: "unitTrained", unit: "harvester" });
+  guideNotify(g, { type: "unitTrained", unit: "harvester" });
+  assert.equal(guideStep(g), "guideArmy");
+  guideNotify(g, { type: "unitTrained", unit: "infantry", count: 3 });
+  assert.equal(guideStep(g), "guidePower");
+});
+test("guide: jump protection refuses to skip unfinished prerequisites", () => {
+  const g = createGuide();
+  assert.equal(guideJumpTo(g, "guideWin"), false);
+  assert.equal(guideJumpTo(g, "guidePower"), false);
+  assert.equal(guideStep(g), "guideHarvest");
+  guideNotify(g, { type: "harvested" });
+  guideNotify(g, { type: "unitTrained", unit: "infantry", count: 3 });
+  assert.equal(guideJumpTo(g, "guidePower"), true);
+  assert.equal(guideStep(g), "guidePower");
+  assert.equal(guideJumpTo(g, "guideDone"), false);
+});
+test("guide: jumping backwards to review is always allowed", () => {
+  const g = createGuide();
+  guideNotify(g, { type: "harvested" });
+  guideNotify(g, { type: "unitTrained", unit: "infantry", count: 3 });
+  assert.equal(guideStep(g), "guidePower");
+  assert.equal(guideJumpTo(g, "guideHarvest"), true);
+  assert.equal(guideStep(g), "guidePower");
+});
+test("guide: skip persists through injected storage", () => {
+  const store = memStorage();
+  const g = createGuide(store);
+  guideNotify(g, { type: "harvested" });
+  guideSkip(g);
+  assert.equal(g.status, "skipped");
+  assert.equal(store.map.get(GUIDE_SKIP_KEY), "1");
+  const g2 = createGuide(store);
+  assert.equal(g2.status, "skipped");
+});
+test("guide: restart clears persisted skip and rewinds (re-watch)", () => {
+  const store = memStorage({ [GUIDE_SKIP_KEY]: "1" });
+  const g = createGuide(store);
+  assert.equal(g.status, "skipped");
+  guideRestart(g);
+  assert.equal(g.status, "active");
+  assert.equal(guideStep(g), "guideHarvest");
+  assert.equal(store.map.get(GUIDE_SKIP_KEY), "0");
+  const g2 = createGuide(store);
+  assert.equal(g2.status, "active");
+});
+test("guide: works without storage (skip is in-memory only)", () => {
+  const g = createGuide();
+  guideSkip(g);
+  assert.equal(g.status, "skipped");
+  guideNotify(g, { type: "harvested" });
+  assert.equal(guideStep(g), "guideHarvest");
+  const g2 = createGuide();
+  assert.equal(g2.status, "active");
+});
+test("guide: pure completion predicates per step", () => {
+  const none = { harvested: false, army: 0, powerPlant: false, scouted: false, won: false };
+  const all = { harvested: true, army: 3, powerPlant: true, scouted: true, won: true };
+  assert.equal(guideStepDone("guideHarvest", none), false);
+  assert.equal(guideStepDone("guideHarvest", all), true);
+  assert.equal(guideStepDone("guideArmy", { ...all, army: 2 }), false);
+  assert.equal(guideStepDone("guidePower", all), true);
+  assert.equal(guideStepDone("guideScout", none), false);
+  assert.equal(guideStepDone("guideWin", all), true);
+});
+test("guide: progress tracks the step-locked index", () => {
+  const g = createGuide();
+  assert.deepEqual(guideProgress(g), { done: 0, total: 5 });
+  guideNotify(g, { type: "harvested" });
+  guideNotify(g, { type: "unitTrained", unit: "infantry", count: 3 });
+  assert.deepEqual(guideProgress(g), { done: 2, total: 5 });
+});
+test("guide: irrelevant events do not advance or corrupt flags", () => {
+  const g = createGuide();
+  guideNotify(g, { type: "unitMovedTo", region: "center" });
+  guideNotify(g, { type: "buildingDone", building: "turret" });
+  guideNotify(g, { type: "harvested", credits: 0 });
+  assert.equal(guideStep(g), "guideHarvest");
+  assert.deepEqual(guideProgress(g), { done: 0, total: 5 });
 });
