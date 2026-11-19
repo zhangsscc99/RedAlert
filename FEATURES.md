@@ -225,3 +225,16 @@
 - [x] F1208 战役内容扩充：game/missions.ts 与 game/campaign.ts 新增两关（限时防守关、歼灭/护送关）与新的目标类型（守住 N 秒、护送单位到点、限时歼灭），带目标提示文案与失败条件；关卡列表由战役 UI 自动读取，旧关卡与旧导出签名不变并补用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/missions.test.js && node --test client/src/game/campaign.test.js && (cd client && npx tsc --noEmit)｜risk: med
 - [x] F1209 战场氛围细化：render/fog.ts 记忆层边缘柔化与可见区平滑、render/weather.ts 天气叠层避开 HUD 区且雨丝随相机偏移、render/effects.ts 爆炸烟尘与弹道拖尾分层；导出签名不变｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
 - [x] F1210 地形与矿脉表现：render/terrain.ts 与 render/textures.ts 加矿脉储量可视化（枯竭变暗、富矿高光）、土路与地基过渡、水岸波光与岸线阴影，预渲染路径（prerenderMap/prerenderGrid）不变｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+
+## M11b 并行车道批补充（2026-11-19 01:30 UTC）— 指挥 / 氛围 / 内容多样性
+
+> 追加原因：M11 只剩 4 条未勾选，本轮要开 10 条车道。新增条目各自独占文件，
+> 与 F1201（main.ts/hud.ts/index.html）、F1202（render/units.ts）、F1204（render/menu.ts）、
+> F1207（server/*）不重叠，禁止改 FEATURES.md，禁止互相 import 对方新增符号。
+
+- [ ] F1211 小地图指挥纵深化：input/minimap.ts 加相机视口矩形、敌方来袭红点（含淡出与闪烁）、点击/拖拽持续平移、右键在小地图下令（回调由调用方注入）、缩放档位与小地图上的己方单位密度点；导出签名只增不改（新参数可选），补 input/minimap 用例｜verify: bash scripts/build-tests.sh && node --test client/src/input/ && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F1212 昼夜与光照氛围：render/weather.ts 加昼夜时段（黎明/白昼/黄昏/夜战）色调渐变、夜间单位/建筑灯光晕、月光与阴影方向随时间变化、天气与昼夜叠层不打架；既有导出签名不变，纯绘制无新依赖｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F1213 战斗视觉层次：render/effects.ts 加爆炸烟柱上升与残留、建筑倒塌碎块与尘土、弹道曳光分层（轻重武器不同粗细）、冲击波环与地面焦痕随时间衰减；updateEffects/drawEffects 签名不变｜verify: bash scripts/build-tests.sh && node --test client/src/game/effects.test.js && (cd client && npx tsc --noEmit)｜risk: low
+- [ ] F1214 战役简报与地图预览：render/campaign.ts 关卡卡片加简报文字（目标/敌军编成/提示）与程序化生成的地形缩略图预览（按 missond 的种子画矿脉与水域）、目标类型图标与失败条件说明；780×380 下可折叠不溢出，导出签名不变，补 render/campaign 用例｜verify: bash scripts/build-tests.sh && node --test client/src/render/campaign.test.js && (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F1215 编队与姿态控制纵深：game/commands.ts 加编队增删改（Shift 加编队、双击编队居中）、姿态循环（aggressive/defensive/hold）与对索敌/开火条件的影响、攻击移动队列与停止清空、编队阵型选择（宽/纵/楔形）；纯逻辑可测，旧导出签名不变并补 commands.test.ts 用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/commands.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F1216 地图多样性：game/grid.ts 加地图生成预设（河谷/双矿对峙/岛屿/城市废墟，含对称性与矿脉可达性校验），generateMap 保持旧签名与默认行为不变、新预设走可选参数，补 grid.test.ts 用例断言每种预设矿脉可达、双方出生点对称、中心留空地｜verify: bash scripts/build-tests.sh && node --test client/src/game/grid.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
