@@ -14,7 +14,7 @@ import {
   type PlaceFailReason,
 } from './buildings.js';
 import { UNIT_STATS, type UnitKind } from './units.js';
-import { inBounds, isPassable, type GameMap } from './grid.js';
+import { inBounds, isPassable, oreTiles, tileCenter, type GameMap } from './grid.js';
 import type { Point } from './selection.js';
 import {
   UPGRADE_TABLE,
@@ -175,6 +175,12 @@ export interface UnitOrder extends QueueItem {
   priority?: number;
   /** Idempotency token stamped by settleOrders; dedups retried requests. */
   requestId?: string;
+  /**
+   * Credits already drained toward `cost`. Absent means paid in full at
+   * enqueue; deferred orders start at 0 and are charged continuously by
+   * tickProductionFunded, pausing whenever the wallet runs dry.
+   */
+  paid?: number;
 }
 
 /**
@@ -193,6 +199,8 @@ export interface UpgradeOrder extends QueueItem {
   multiplier: number;
   /** Queue priority — same lane semantics as UnitOrder.priority. */
   priority?: number;
+  /** Credits drained so far — same deferred-funding semantics as UnitOrder.paid. */
+  paid?: number;
 }
 
 export type ProductionOrder = UnitOrder | UpgradeOrder;
@@ -401,6 +409,15 @@ export interface EnqueueUnitOpts {
    * charges nothing, so a retried enqueue can never double-spend.
    */
   requestId?: string;
+  /**
+   * Deferred funding: enqueue without paying up front — the order starts
+   * with `paid: 0` and tickProductionFunded drains credits as it builds,
+   * pausing (queue kept) whenever funds run out and resuming when they
+   * return. Deferred orders never fail with 'funds'; 'requires' still
+   * applies. Callers must tick them with tickProductionFunded, not the
+   * funding-agnostic tickProduction.
+   */
+  deferred?: boolean;
 }
 
 /**
@@ -440,7 +457,11 @@ export function enqueueUnitChecked(
     const p = opts.rally?.get(opts.barracksId);
     if (p) order.rally = { x: p.x, y: p.y };
   }
-  if (!spend(e, order.cost)) return { ok: false, reason: 'funds' };
+  if (opts.deferred === true) {
+    order.paid = 0;
+  } else if (!spend(e, order.cost)) {
+    return { ok: false, reason: 'funds' };
+  }
   q.splice(laneInsertIndex(q, order), 0, order);
   return { ok: true, order };
 }
@@ -729,6 +750,118 @@ export function tickProduction(
   return done;
 }
 
+/** Credits/sec an active order still owes; prepaid orders burn nothing. */
+function burnRate(o: ProductionOrder): number {
+  const owed = o.cost - (o.paid ?? o.cost);
+  const remain = o.buildTime - o.elapsed;
+  return owed > 0 && remain > 0 ? owed / remain : 0;
+}
+
+/**
+ * Advance one lane group under continuous funding: active orders each get
+ * `dt`, but every second of progress on a deferred order drains its
+ * remaining-cost burn rate from `e`. When the wallet empties mid-step the
+ * lane freezes in place — elapsed and paid keep their values, the queue is
+ * never dropped — and resumes exactly where it stalled once credits return.
+ * A stalled head blocks its lane (FIFO), never other producers' lanes.
+ */
+function tickLanesFunded(
+  list: ProductionOrder[],
+  dt: number,
+  lanes: number,
+  e: Economy,
+  done: ProductionOrder[],
+): void {
+  let remaining = dt;
+  while (remaining > 0) {
+    const active = Math.min(lanes, list.length);
+    if (active === 0) break;
+    let minNeed = Infinity;
+    let burn = 0;
+    const rates: number[] = [];
+    for (let i = 0; i < active; i++) {
+      const o = list[i]!;
+      minNeed = Math.min(minNeed, o.buildTime - o.elapsed);
+      rates[i] = burnRate(o);
+      burn += rates[i]!;
+    }
+    let step = Math.min(remaining, Math.max(0, minNeed));
+    if (burn > 0) step = Math.min(step, e.credits / burn);
+    if (!(step > 0)) {
+      // Out of funds with paying work ahead — stall, keep the queue. A
+      // zero-need pass still falls through so finished orders are collected.
+      if (minNeed > 0) break;
+      step = 0;
+    }
+    let drained = 0;
+    for (let i = 0; i < active; i++) {
+      const o = list[i]!;
+      const r = rates[i]!;
+      if (r > 0) {
+        const pay = Math.min(r * step, Math.max(0, e.credits - drained));
+        o.paid = (o.paid ?? 0) + pay;
+        drained += pay;
+      }
+      o.elapsed += step;
+    }
+    if (drained > 0) spend(e, drained);
+    remaining -= step;
+    let removed = 0;
+    for (let i = 0; i < active; i++) {
+      const o = list[i - removed];
+      if (o!.elapsed >= o!.buildTime) {
+        done.push(o!);
+        list.splice(i - removed, 1);
+        removed++;
+      }
+    }
+  }
+}
+
+/**
+ * tickProduction with pay-as-you-build funding: orders enqueued with
+ * `deferred` (paid < cost) drain their remaining cost over their remaining
+ * build time; orders paid up front build for free. When the economy runs
+ * dry the affected lanes pause in place — nothing is dropped or refunded —
+ * and resume automatically once credit returns, the same pause-on-empty
+ * rule tickDepotRepair uses. Lane grouping, parallel capacity, queue
+ * regrouping and the return value all match tickProduction.
+ */
+export function tickProductionFunded(
+  q: UnitQueue,
+  e: Economy,
+  dt: number,
+  parallel = PARALLEL_PER_BARRACKS,
+): ProductionOrder[] {
+  const done: ProductionOrder[] = [];
+  if (!(dt > 0)) return done;
+  const lanes = Math.max(1, Math.floor(parallel));
+  const groups = new Map<number | undefined, ProductionOrder[]>();
+  for (const o of q) {
+    const k = laneKey(o);
+    const list = groups.get(k);
+    if (list) list.push(o);
+    else groups.set(k, [o]);
+  }
+  const rest: ProductionOrder[] = [];
+  for (const list of groups.values()) {
+    tickLanesFunded(list, dt, lanes, e, done);
+    rest.push(...list);
+  }
+  q.length = 0;
+  q.push(...rest);
+  return done;
+}
+
+/**
+ * True when the queue holds work that still owes credits the wallet cannot
+ * cover — i.e. the next tickProductionFunded would stall a lane. Pure
+ * predicate for UI badges/alerts; nothing is mutated.
+ */
+export function fundsStalled(q: UnitQueue, e: Economy): boolean {
+  return e.credits <= 0 && q.some((o) => burnRate(o) > 0);
+}
+
 /**
  * Move the order at `index` to the front of its producer's lane so it
  * builds ahead of its lane siblings: it is reinserted before the first
@@ -751,6 +884,7 @@ export function promoteOrder(q: UnitQueue, index: number): boolean {
  * Remove an order (unit or upgrade) and refund what hasn't been produced:
  * 0% elapsed refunds the full cost, 100% refunds nothing. `policy` tunes
  * the refund rate; the payout is floored and never exceeds the price paid.
+ * Deferred orders refund against `paid` — only the funded share can return.
  */
 export function cancelUnit(
   q: UnitQueue,
@@ -760,8 +894,87 @@ export function cancelUnit(
 ): boolean {
   if (index < 0 || index >= q.length) return false;
   const [o] = q.splice(index, 1);
-  credit(e, refundAmount(o!.cost, o!.elapsed, o!.buildTime, policy));
+  credit(e, refundAmount(o!.paid ?? o!.cost, o!.elapsed, o!.buildTime, policy));
   return true;
+}
+
+/** A producer's queued orders in lane order (unit and upgrade jobs mixed). */
+export function laneOrders(
+  q: UnitQueue,
+  buildingId: number | undefined,
+): ProductionOrder[] {
+  return q.filter((o) => laneKey(o) === buildingId);
+}
+
+/** Queue index of the `pos`-th order inside `buildingId`'s lane, -1 when absent. */
+function laneSlot(q: UnitQueue, buildingId: number | undefined, pos: number): number {
+  if (pos < 0) return -1;
+  let seen = 0;
+  for (let i = 0; i < q.length; i++) {
+    if (laneKey(q[i]!) !== buildingId) continue;
+    if (seen++ === pos) return i;
+  }
+  return -1;
+}
+
+/**
+ * Cancel the `pos`-th order inside one producer's lane (0 = the building's
+ * active head) and refund it by progress — the per-building counterpart of
+ * cancelUnit, so the UI can drop a single entry from a barracks' queue
+ * without knowing the order's global index. Siblings behind it move up;
+ * other lanes are untouched. Returns false on a bad slot.
+ */
+export function cancelInLane(
+  q: UnitQueue,
+  e: Economy,
+  buildingId: number | undefined,
+  pos: number,
+  policy: RefundPolicy = {},
+): boolean {
+  const i = laneSlot(q, buildingId, pos);
+  return i >= 0 && cancelUnit(q, e, i, policy);
+}
+
+/**
+ * Move the `pos`-th order inside `buildingId`'s lane to the lane head —
+ * per-building 置顶. The head itself and bad slots are no-ops/false; in
+ * progress work is not preempted by orders on other lanes.
+ */
+export function promoteInLane(
+  q: UnitQueue,
+  buildingId: number | undefined,
+  pos: number,
+): boolean {
+  const i = laneSlot(q, buildingId, pos);
+  return i >= 0 && promoteOrder(q, i);
+}
+
+/**
+ * A producer building was destroyed: drop every order in its lane and
+ * refund each by its unfinished progress — the same pro-rata rule
+ * cancelUnit uses, paid-aware for deferred orders. Other producers' lanes
+ * are untouched. Pass `rally` to also forget the dead building's rally
+ * point. Returns the removed orders in queue order.
+ */
+export function producerDestroyed(
+  q: UnitQueue,
+  e: Economy,
+  buildingId: number,
+  opts: { policy?: RefundPolicy; rally?: RallyPoints } = {},
+): ProductionOrder[] {
+  const removed: ProductionOrder[] = [];
+  for (let i = q.length - 1; i >= 0; i--) {
+    const o = q[i]!;
+    if (laneKey(o) !== buildingId) continue;
+    q.splice(i, 1);
+    removed.unshift(o);
+    credit(
+      e,
+      refundAmount(o.paid ?? o.cost, o.elapsed, o.buildTime, opts.policy ?? {}),
+    );
+  }
+  opts.rally?.delete(buildingId);
+  return removed;
 }
 
 // -------------------------------------------------------------- spawning ---
@@ -861,6 +1074,47 @@ export function assignSpawnTiles(
     if (t) taken.add(tileIndex(map, t.x, t.y));
     return t;
   });
+}
+
+/**
+ * The ore tile closest to (tx,ty) in squared tile distance, scan order on
+ * ties — the "nearest vein" a fresh harvester drives toward. Undefined on
+ * a map with no ore left.
+ */
+export function nearestOreTile(map: GameMap, tx: number, ty: number): Point | undefined {
+  let best: Point | undefined;
+  let bestD = Infinity;
+  for (const t of oreTiles(map)) {
+    const d = (t.x - tx) ** 2 + (t.y - ty) ** 2;
+    if (d < bestD) {
+      bestD = d;
+      best = { x: t.x, y: t.y };
+    }
+  }
+  return best;
+}
+
+/**
+ * Where a just-completed unit should head: a fresh harvester auto-routes to
+ * the ore vein nearest its producer's exit row (world-space tile centre,
+ * no manual rally needed); every other unit follows its stamped rally
+ * point. A harvester on an ore-free map — or a combat order with no rally —
+ * yields undefined, letting the caller leave the unit at its spawn tile.
+ */
+export function spawnDestination(
+  o: UnitOrder,
+  buildings: readonly Building[],
+  map?: GameMap,
+): Point | undefined {
+  if (o.kind === 'harvester' && map !== undefined) {
+    const rax = producerFor(o, buildings);
+    if (rax) {
+      const def = BUILDING_DEFS[rax.kind];
+      const ore = nearestOreTile(map, rax.gx + (def.w >> 1), rax.gy + def.h);
+      if (ore) return { x: tileCenter(ore.x), y: tileCenter(ore.y) };
+    }
+  }
+  return o.rally ? { x: o.rally.x, y: o.rally.y } : undefined;
 }
 
 // ------------------------------------------------------ AI suggestions ----

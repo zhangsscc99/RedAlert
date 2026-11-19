@@ -73,6 +73,18 @@ function inBounds(map, x, y) {
 function isPassable(map, x, y) {
   return inBounds(map, x, y) && map.tiles[idx(map, x, y)] === GRASS;
 }
+function oreTiles(map) {
+  const out = [];
+  for (let y = 0; y < map.h; y++) {
+    for (let x = 0; x < map.w; x++) {
+      if (map.tiles[y * map.w + x] === ORE) out.push({ x, y });
+    }
+  }
+  return out;
+}
+function tileCenter(t) {
+  return t * TILE_SIZE + TILE_SIZE / 2;
+}
 
 // src/game/upgrades.ts
 var stock = (effect) => ({
@@ -328,7 +340,11 @@ function enqueueUnitChecked(q, e, kind, opts = {}) {
     const p = opts.rally?.get(opts.barracksId);
     if (p) order.rally = { x: p.x, y: p.y };
   }
-  if (!spend(e, order.cost)) return { ok: false, reason: "funds" };
+  if (opts.deferred === true) {
+    order.paid = 0;
+  } else if (!spend(e, order.cost)) {
+    return { ok: false, reason: "funds" };
+  }
   q.splice(laneInsertIndex(q, order), 0, order);
   return { ok: true, order };
 }
@@ -457,6 +473,78 @@ function tickProduction(q, dt, parallel = PARALLEL_PER_BARRACKS) {
   q.push(...rest);
   return done;
 }
+function burnRate(o) {
+  const owed = o.cost - (o.paid ?? o.cost);
+  const remain = o.buildTime - o.elapsed;
+  return owed > 0 && remain > 0 ? owed / remain : 0;
+}
+function tickLanesFunded(list, dt, lanes, e, done) {
+  let remaining = dt;
+  while (remaining > 0) {
+    const active = Math.min(lanes, list.length);
+    if (active === 0) break;
+    let minNeed = Infinity;
+    let burn = 0;
+    const rates = [];
+    for (let i = 0; i < active; i++) {
+      const o = list[i];
+      minNeed = Math.min(minNeed, o.buildTime - o.elapsed);
+      rates[i] = burnRate(o);
+      burn += rates[i];
+    }
+    let step = Math.min(remaining, Math.max(0, minNeed));
+    if (burn > 0) step = Math.min(step, e.credits / burn);
+    if (!(step > 0)) {
+      if (minNeed > 0) break;
+      step = 0;
+    }
+    let drained = 0;
+    for (let i = 0; i < active; i++) {
+      const o = list[i];
+      const r = rates[i];
+      if (r > 0) {
+        const pay = Math.min(r * step, Math.max(0, e.credits - drained));
+        o.paid = (o.paid ?? 0) + pay;
+        drained += pay;
+      }
+      o.elapsed += step;
+    }
+    if (drained > 0) spend(e, drained);
+    remaining -= step;
+    let removed = 0;
+    for (let i = 0; i < active; i++) {
+      const o = list[i - removed];
+      if (o.elapsed >= o.buildTime) {
+        done.push(o);
+        list.splice(i - removed, 1);
+        removed++;
+      }
+    }
+  }
+}
+function tickProductionFunded(q, e, dt, parallel = PARALLEL_PER_BARRACKS) {
+  const done = [];
+  if (!(dt > 0)) return done;
+  const lanes = Math.max(1, Math.floor(parallel));
+  const groups = /* @__PURE__ */ new Map();
+  for (const o of q) {
+    const k = laneKey(o);
+    const list = groups.get(k);
+    if (list) list.push(o);
+    else groups.set(k, [o]);
+  }
+  const rest = [];
+  for (const list of groups.values()) {
+    tickLanesFunded(list, dt, lanes, e, done);
+    rest.push(...list);
+  }
+  q.length = 0;
+  q.push(...rest);
+  return done;
+}
+function fundsStalled(q, e) {
+  return e.credits <= 0 && q.some((o) => burnRate(o) > 0);
+}
 function promoteOrder(q, index) {
   if (index < 0 || index >= q.length) return false;
   const [o] = q.splice(index, 1);
@@ -469,8 +557,43 @@ function promoteOrder(q, index) {
 function cancelUnit(q, e, index, policy = {}) {
   if (index < 0 || index >= q.length) return false;
   const [o] = q.splice(index, 1);
-  credit(e, refundAmount(o.cost, o.elapsed, o.buildTime, policy));
+  credit(e, refundAmount(o.paid ?? o.cost, o.elapsed, o.buildTime, policy));
   return true;
+}
+function laneOrders(q, buildingId) {
+  return q.filter((o) => laneKey(o) === buildingId);
+}
+function laneSlot(q, buildingId, pos) {
+  if (pos < 0) return -1;
+  let seen = 0;
+  for (let i = 0; i < q.length; i++) {
+    if (laneKey(q[i]) !== buildingId) continue;
+    if (seen++ === pos) return i;
+  }
+  return -1;
+}
+function cancelInLane(q, e, buildingId, pos, policy = {}) {
+  const i = laneSlot(q, buildingId, pos);
+  return i >= 0 && cancelUnit(q, e, i, policy);
+}
+function promoteInLane(q, buildingId, pos) {
+  const i = laneSlot(q, buildingId, pos);
+  return i >= 0 && promoteOrder(q, i);
+}
+function producerDestroyed(q, e, buildingId, opts = {}) {
+  const removed = [];
+  for (let i = q.length - 1; i >= 0; i--) {
+    const o = q[i];
+    if (laneKey(o) !== buildingId) continue;
+    q.splice(i, 1);
+    removed.unshift(o);
+    credit(
+      e,
+      refundAmount(o.paid ?? o.cost, o.elapsed, o.buildTime, opts.policy ?? {})
+    );
+  }
+  opts.rally?.delete(buildingId);
+  return removed;
 }
 function producerFor(o, buildings) {
   return (o.barracksId !== void 0 ? buildings.find((b) => b.id === o.barracksId && b.done) : void 0) ?? buildings.find((b) => b.kind === "barracks" && b.done) ?? buildings.find((b) => b.done) ?? buildings[0];
@@ -512,6 +635,29 @@ function assignSpawnTiles(map, buildings, orders, occupied = [], maxR = 20) {
     if (t) taken.add(tileIndex(map, t.x, t.y));
     return t;
   });
+}
+function nearestOreTile(map, tx, ty) {
+  let best;
+  let bestD = Infinity;
+  for (const t of oreTiles(map)) {
+    const d = (t.x - tx) ** 2 + (t.y - ty) ** 2;
+    if (d < bestD) {
+      bestD = d;
+      best = { x: t.x, y: t.y };
+    }
+  }
+  return best;
+}
+function spawnDestination(o, buildings, map) {
+  if (o.kind === "harvester" && map !== void 0) {
+    const rax = producerFor(o, buildings);
+    if (rax) {
+      const def = BUILDING_DEFS[rax.kind];
+      const ore = nearestOreTile(map, rax.gx + (def.w >> 1), rax.gy + def.h);
+      if (ore) return { x: tileCenter(ore.x), y: tileCenter(ore.y) };
+    }
+  }
+  return o.rally ? { x: o.rally.x, y: o.rally.y } : void 0;
 }
 function suggestProduction(input) {
   const out = [];
@@ -1363,4 +1509,199 @@ test("suggestProduction is pure and respects funds, tech chain, and owned units"
     s4.map((s) => s.kind),
     ["infantry"]
   );
+});
+test("laneOrders lists each building's own multi-unit queue", () => {
+  const e = createEconomy(1e4);
+  const q = createUnitQueue();
+  enqueueUnitTo(q, e, "infantry", 7);
+  enqueueUnitTo(q, e, "tank", 7);
+  enqueueUnitTo(q, e, "harvester", 7);
+  enqueueUnitTo(q, e, "infantry", 9);
+  assert.deepEqual(
+    laneOrders(q, 7).map((o) => o.kind),
+    ["infantry", "tank", "harvester"]
+  );
+  assert.deepEqual(
+    laneOrders(q, 9).map((o) => o.kind),
+    ["infantry"]
+  );
+  assert.deepEqual(laneOrders(q, 42), []);
+  assert.deepEqual(laneOrders(q, void 0), []);
+});
+test("cancelInLane drops one queued unit of a building and refunds progress", () => {
+  const e = createEconomy(1e4);
+  const q = createUnitQueue();
+  enqueueUnitTo(q, e, "infantry", 7);
+  enqueueUnitTo(q, e, "tank", 7);
+  enqueueUnitTo(q, e, "infantry", 9);
+  tickProduction(q, 2);
+  const before = e.credits;
+  assert.equal(cancelInLane(q, e, 7, 0), true);
+  assert.equal(e.credits, before + Math.floor(UNIT_STATS.infantry.cost * 0.5));
+  assert.deepEqual(
+    laneOrders(q, 7).map((o) => o.kind),
+    ["tank"]
+  );
+  assert.equal(laneOrders(q, 9).length, 1);
+  assert.equal(laneOrders(q, 9)[0].elapsed, 2);
+  assert.equal(cancelInLane(q, e, 7, 3), false);
+  assert.equal(cancelInLane(q, e, 42, 0), false);
+});
+test("promoteInLane moves a queued unit to the top of its building only", () => {
+  const e = createEconomy(1e4);
+  const q = createUnitQueue();
+  enqueueUnitTo(q, e, "infantry", 7);
+  enqueueUnitTo(q, e, "tank", 7);
+  enqueueUnitTo(q, e, "infantry", 9);
+  assert.equal(promoteInLane(q, 7, 1), true);
+  assert.deepEqual(
+    laneOrders(q, 7).map((o) => o.kind),
+    ["tank", "infantry"]
+  );
+  assert.deepEqual(
+    laneOrders(q, 9).map((o) => o.kind),
+    ["infantry"]
+  );
+  assert.equal(laneOrders(q, 7)[0].barracksId, 7);
+  assert.equal(promoteInLane(q, 7, 0), true);
+  assert.equal(promoteInLane(q, 7, 9), false);
+  assert.equal(promoteInLane(q, 42, 0), false);
+});
+test("spawnDestination sends combat units to their stamped rally point", () => {
+  const buildings = [];
+  const rax = place(buildings, "barracks", 4, 4, 7);
+  rax.done = true;
+  const order = {
+    type: "unit",
+    key: "infantry",
+    kind: "infantry",
+    cost: 0,
+    buildTime: 4,
+    elapsed: 4,
+    barracksId: 7,
+    rally: { x: 320, y: 160 }
+  };
+  assert.deepEqual(spawnDestination(order, buildings), { x: 320, y: 160 });
+  const { rally: _rally, ...bare } = order;
+  assert.equal(spawnDestination(bare, buildings), void 0);
+});
+test("spawnDestination auto-routes fresh harvesters to the nearest ore vein", () => {
+  const map = openMap();
+  map.tiles[10 * map.w + 2] = ORE;
+  map.tiles[3 * map.w + 20] = ORE;
+  const buildings = [];
+  const rax = place(buildings, "barracks", 4, 4, 7);
+  rax.done = true;
+  assert.deepEqual(nearestOreTile(map, 5, 6), { x: 2, y: 10 });
+  const order = {
+    type: "unit",
+    key: "harvester",
+    kind: "harvester",
+    cost: UNIT_STATS.harvester.cost,
+    buildTime: UNIT_STATS.harvester.buildTime,
+    elapsed: UNIT_STATS.harvester.buildTime,
+    barracksId: 7
+  };
+  assert.deepEqual(spawnDestination(order, buildings, map), { x: 80, y: 336 });
+});
+test("spawnDestination harvester falls back to rally when the field is mined out", () => {
+  const map = openMap();
+  const buildings = [];
+  const rax = place(buildings, "barracks", 4, 4, 7);
+  rax.done = true;
+  const order = {
+    type: "unit",
+    key: "harvester",
+    kind: "harvester",
+    cost: 0,
+    buildTime: 20,
+    elapsed: 20,
+    barracksId: 7,
+    rally: { x: 64, y: 96 }
+  };
+  assert.equal(nearestOreTile(map, 5, 6), void 0);
+  assert.deepEqual(spawnDestination(order, buildings, map), { x: 64, y: 96 });
+  const { rally: _rally, ...bare } = order;
+  assert.equal(spawnDestination(bare, buildings, map), void 0);
+});
+test("deferred orders queue without paying and stall while the wallet is empty", () => {
+  const e = createEconomy(0);
+  const q = createUnitQueue();
+  const r = enqueueUnitChecked(q, e, "infantry", { deferred: true, barracksId: 7 });
+  if (!r.ok) assert.fail("deferred enqueue needs no funds");
+  assert.equal(r.order.paid, 0);
+  assert.equal(e.credits, 0);
+  assert.equal(q.length, 1);
+  assert.equal(fundsStalled(q, e), true);
+  assert.deepEqual(tickProductionFunded(q, e, 4), []);
+  assert.equal(q.length, 1);
+  assert.equal(q[0].elapsed, 0);
+  assert.equal(q[0].paid, 0);
+});
+test("tickProductionFunded drains credits mid-build, pauses dry, resumes on credit", () => {
+  const e = createEconomy(50);
+  const q = createUnitQueue();
+  enqueueUnitChecked(q, e, "infantry", { deferred: true, barracksId: 7 });
+  assert.deepEqual(tickProductionFunded(q, e, 4), []);
+  assert.equal(q.length, 1);
+  assert.equal(q[0].elapsed, 2);
+  assert.equal(q[0].paid, 50);
+  assert.equal(e.credits, 0);
+  assert.equal(fundsStalled(q, e), true);
+  credit(e, 50);
+  assert.equal(fundsStalled(q, e), false);
+  const done = tickProductionFunded(q, e, 2);
+  assert.equal(done.length, 1);
+  assert.equal(done[0].kind, "infantry");
+  assert.equal(done[0].paid, 100);
+  assert.equal(e.credits, 0);
+  assert.equal(q.length, 0);
+});
+test("a prepaid lane keeps building while a broke deferred lane stalls", () => {
+  const e = createEconomy(UNIT_STATS.infantry.cost);
+  const q = createUnitQueue();
+  enqueueUnitTo(q, e, "infantry", 9);
+  enqueueUnitChecked(q, e, "tank", { deferred: true, barracksId: 7 });
+  assert.equal(e.credits, 0);
+  const done = tickProductionFunded(q, e, UNIT_STATS.infantry.buildTime);
+  assert.equal(done.length, 1);
+  assert.equal(done[0].barracksId, 9);
+  const tank = laneOrders(q, 7)[0];
+  assert.equal(tank.elapsed, 0);
+  assert.equal(tank.paid, 0);
+});
+test("producerDestroyed clears the dead building's queue and refunds pro-rata", () => {
+  const e = createEconomy(1e4);
+  const q = createUnitQueue();
+  enqueueUnitTo(q, e, "infantry", 7);
+  enqueueUnitTo(q, e, "tank", 7);
+  enqueueUnitTo(q, e, "infantry", 9);
+  tickProduction(q, 2);
+  const before = e.credits;
+  const removed = producerDestroyed(q, e, 7);
+  assert.deepEqual(
+    removed.map((o) => o.kind),
+    ["infantry", "tank"]
+  );
+  const refund = Math.floor(UNIT_STATS.infantry.cost * 0.5) + UNIT_STATS.tank.cost;
+  assert.equal(e.credits, before + refund);
+  assert.equal(q.length, 1);
+  assert.equal(q[0].barracksId, 9);
+  assert.equal(q[0].elapsed, 2);
+});
+test("producerDestroyed refunds deferred orders by funded share and clears rally", () => {
+  const e = createEconomy(0);
+  const q = createUnitQueue();
+  const rally = createRallyPoints();
+  enqueueUnitChecked(q, e, "infantry", { deferred: true, barracksId: 7 });
+  enqueueUnitChecked(q, e, "tank", { deferred: true, barracksId: 7 });
+  setRallyPoint(rally, q, 7, { x: 64, y: 64 });
+  credit(e, 50);
+  tickProductionFunded(q, e, 2);
+  const before = e.credits;
+  const removed = producerDestroyed(q, e, 7, { rally });
+  assert.equal(removed.length, 2);
+  assert.equal(e.credits - before, Math.floor(50 * 0.5));
+  assert.equal(q.length, 0);
+  assert.equal(rally.has(7), false);
 });

@@ -930,7 +930,11 @@ function enqueueUnitChecked(q, e, kind, opts = {}) {
     const p = opts.rally?.get(opts.barracksId);
     if (p) order.rally = { x: p.x, y: p.y };
   }
-  if (!spend(e, order.cost)) return { ok: false, reason: "funds" };
+  if (opts.deferred === true) {
+    order.paid = 0;
+  } else if (!spend(e, order.cost)) {
+    return { ok: false, reason: "funds" };
+  }
   q.splice(laneInsertIndex(q, order), 0, order);
   return { ok: true, order };
 }

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createEconomy } from './economy.js';
-import { GRASS, WATER, type GameMap } from './grid.js';
+import { createEconomy, credit } from './economy.js';
+import { GRASS, ORE, WATER, type GameMap } from './grid.js';
 import { BUILDING_DEFS, place, type Building, type BuildingKind } from './buildings.js';
 import { UNIT_STATS } from './units.js';
 import { UPGRADE_TABLE } from './upgrades.js';
@@ -37,6 +37,14 @@ import {
   producerFor,
   spawnTileNear,
   assignSpawnTiles,
+  spawnDestination,
+  nearestOreTile,
+  laneOrders,
+  cancelInLane,
+  promoteInLane,
+  producerDestroyed,
+  tickProductionFunded,
+  fundsStalled,
   suggestProduction,
   type Construction,
   type UnitOrder,
@@ -1111,4 +1119,254 @@ test('suggestProduction is pure and respects funds, tech chain, and owned units'
     s4.map((s) => s.kind),
     ['infantry'],
   );
+});
+
+// --------------------------------------------------- per-building queue ----
+
+test('laneOrders lists each building\'s own multi-unit queue', () => {
+  const e = createEconomy(10000);
+  const q = createUnitQueue();
+  enqueueUnitTo(q, e, 'infantry', 7);
+  enqueueUnitTo(q, e, 'tank', 7);
+  enqueueUnitTo(q, e, 'harvester', 7);
+  enqueueUnitTo(q, e, 'infantry', 9);
+
+  // Barracks 7 holds a three-unit queue of its own; rax 9's queue is its own.
+  assert.deepEqual(
+    laneOrders(q, 7).map((o) => o.kind),
+    ['infantry', 'tank', 'harvester'],
+  );
+  assert.deepEqual(
+    laneOrders(q, 9).map((o) => o.kind),
+    ['infantry'],
+  );
+  assert.deepEqual(laneOrders(q, 42), []);
+  // The default lane holds only unassigned orders.
+  assert.deepEqual(laneOrders(q, undefined), []);
+});
+
+test('cancelInLane drops one queued unit of a building and refunds progress', () => {
+  const e = createEconomy(10000);
+  const q = createUnitQueue();
+  enqueueUnitTo(q, e, 'infantry', 7); // lane 7 head
+  enqueueUnitTo(q, e, 'tank', 7); // lane 7 slot 1
+  enqueueUnitTo(q, e, 'infantry', 9); // other producer
+
+  tickProduction(q, 2); // rax 7 head at 50% (2s of 4s)
+  const before = e.credits;
+
+  assert.equal(cancelInLane(q, e, 7, 0), true);
+  assert.equal(e.credits, before + Math.floor(UNIT_STATS.infantry.cost * 0.5));
+  assert.deepEqual(
+    laneOrders(q, 7).map((o) => o.kind),
+    ['tank'],
+  );
+  // rax 9's lane was never touched — its order keeps its progress.
+  assert.equal(laneOrders(q, 9).length, 1);
+  assert.equal(laneOrders(q, 9)[0]!.elapsed, 2);
+
+  // Bad slots and unknown producers refuse politely.
+  assert.equal(cancelInLane(q, e, 7, 3), false);
+  assert.equal(cancelInLane(q, e, 42, 0), false);
+});
+
+test('promoteInLane moves a queued unit to the top of its building only', () => {
+  const e = createEconomy(10000);
+  const q = createUnitQueue();
+  enqueueUnitTo(q, e, 'infantry', 7);
+  enqueueUnitTo(q, e, 'tank', 7);
+  enqueueUnitTo(q, e, 'infantry', 9);
+
+  assert.equal(promoteInLane(q, 7, 1), true); // tank tops rax 7's queue
+  assert.deepEqual(
+    laneOrders(q, 7).map((o) => o.kind),
+    ['tank', 'infantry'],
+  );
+  // rax 9's queue order is untouched.
+  assert.deepEqual(
+    laneOrders(q, 9).map((o) => o.kind),
+    ['infantry'],
+  );
+  assert.equal((laneOrders(q, 7)[0]! as UnitOrder).barracksId, 7);
+
+  assert.equal(promoteInLane(q, 7, 0), true); // head is a no-op
+  assert.equal(promoteInLane(q, 7, 9), false); // out-of-range slot
+  assert.equal(promoteInLane(q, 42, 0), false); // unknown producer
+});
+
+// ------------------------------------------------------- spawn direction ---
+
+test('spawnDestination sends combat units to their stamped rally point', () => {
+  const buildings: Building[] = [];
+  const rax = place(buildings, 'barracks', 4, 4, 7);
+  rax.done = true;
+
+  const order: UnitOrder = {
+    type: 'unit',
+    key: 'infantry',
+    kind: 'infantry',
+    cost: 0,
+    buildTime: 4,
+    elapsed: 4,
+    barracksId: 7,
+    rally: { x: 320, y: 160 },
+  };
+  assert.deepEqual(spawnDestination(order, buildings), { x: 320, y: 160 });
+
+  // No rally stamped → nowhere to go; caller leaves the unit at its spawn.
+  const { rally: _rally, ...bare } = order;
+  assert.equal(spawnDestination(bare, buildings), undefined);
+});
+
+test('spawnDestination auto-routes fresh harvesters to the nearest ore vein', () => {
+  const map = openMap();
+  // Two veins: (2,10) is nearer the barracks exit than (20,3).
+  map.tiles[10 * map.w + 2] = ORE;
+  map.tiles[3 * map.w + 20] = ORE;
+  const buildings: Building[] = [];
+  const rax = place(buildings, 'barracks', 4, 4, 7);
+  rax.done = true;
+
+  // nearestOreTile picks by squared tile distance from the exit (5,6).
+  assert.deepEqual(nearestOreTile(map, 5, 6), { x: 2, y: 10 });
+
+  const order: UnitOrder = {
+    type: 'unit',
+    key: 'harvester',
+    kind: 'harvester',
+    cost: UNIT_STATS.harvester.cost,
+    buildTime: UNIT_STATS.harvester.buildTime,
+    elapsed: UNIT_STATS.harvester.buildTime,
+    barracksId: 7,
+  };
+  // No rally set — the fresh harvester still heads for the nearest vein.
+  assert.deepEqual(spawnDestination(order, buildings, map), { x: 80, y: 336 });
+});
+
+test('spawnDestination harvester falls back to rally when the field is mined out', () => {
+  const map = openMap(); // all grass: no ore
+  const buildings: Building[] = [];
+  const rax = place(buildings, 'barracks', 4, 4, 7);
+  rax.done = true;
+  const order: UnitOrder = {
+    type: 'unit',
+    key: 'harvester',
+    kind: 'harvester',
+    cost: 0,
+    buildTime: 20,
+    elapsed: 20,
+    barracksId: 7,
+    rally: { x: 64, y: 96 },
+  };
+  assert.equal(nearestOreTile(map, 5, 6), undefined);
+  assert.deepEqual(spawnDestination(order, buildings, map), { x: 64, y: 96 });
+  const { rally: _rally, ...bare } = order;
+  assert.equal(spawnDestination(bare, buildings, map), undefined);
+});
+
+// ----------------------------------------------------- deferred funding ----
+
+test('deferred orders queue without paying and stall while the wallet is empty', () => {
+  const e = createEconomy(0);
+  const q = createUnitQueue();
+
+  const r = enqueueUnitChecked(q, e, 'infantry', { deferred: true, barracksId: 7 });
+  if (!r.ok) assert.fail('deferred enqueue needs no funds');
+  assert.equal(r.order.paid, 0);
+  assert.equal(e.credits, 0); // nothing charged at enqueue
+  assert.equal(q.length, 1);
+
+  // Broke: the funded tick pauses — nothing advances, nothing is dropped.
+  assert.equal(fundsStalled(q, e), true);
+  assert.deepEqual(tickProductionFunded(q, e, 4), []);
+  assert.equal(q.length, 1);
+  assert.equal(q[0]!.elapsed, 0);
+  assert.equal(q[0]!.paid, 0);
+});
+
+test('tickProductionFunded drains credits mid-build, pauses dry, resumes on credit', () => {
+  const e = createEconomy(50);
+  const q = createUnitQueue();
+  enqueueUnitChecked(q, e, 'infantry', { deferred: true, barracksId: 7 });
+  // Burn rate = 100/4 = 25 cr/s; the wallet buys 2s of progress.
+  assert.deepEqual(tickProductionFunded(q, e, 4), []);
+  assert.equal(q.length, 1); // queue kept through the stall
+  assert.equal(q[0]!.elapsed, 2);
+  assert.equal(q[0]!.paid, 50);
+  assert.equal(e.credits, 0);
+  assert.equal(fundsStalled(q, e), true);
+
+  // Funds return → the same order resumes from 2s, no re-queue needed.
+  credit(e, 50);
+  assert.equal(fundsStalled(q, e), false);
+  const done = tickProductionFunded(q, e, 2);
+  assert.equal(done.length, 1);
+  assert.equal(done[0]!.kind, 'infantry');
+  assert.equal(done[0]!.paid, 100);
+  assert.equal(e.credits, 0);
+  assert.equal(q.length, 0);
+});
+
+test('a prepaid lane keeps building while a broke deferred lane stalls', () => {
+  const e = createEconomy(UNIT_STATS.infantry.cost);
+  const q = createUnitQueue();
+  enqueueUnitTo(q, e, 'infantry', 9); // paid up front: wallet now empty
+  enqueueUnitChecked(q, e, 'tank', { deferred: true, barracksId: 7 });
+  assert.equal(e.credits, 0);
+
+  const done = tickProductionFunded(q, e, UNIT_STATS.infantry.buildTime);
+  // rax 9's paid-up infantry finishes on schedule; rax 7's tank froze at 0
+  // because there was nothing left to fund it with.
+  assert.equal(done.length, 1);
+  assert.equal((done[0]! as UnitOrder).barracksId, 9);
+  const tank = laneOrders(q, 7)[0]!;
+  assert.equal(tank.elapsed, 0);
+  assert.equal(tank.paid, 0);
+});
+
+// ------------------------------------------------------ producer destroyed -
+
+test('producerDestroyed clears the dead building\'s queue and refunds pro-rata', () => {
+  const e = createEconomy(10000);
+  const q = createUnitQueue();
+  enqueueUnitTo(q, e, 'infantry', 7); // head of rax 7's lane
+  enqueueUnitTo(q, e, 'tank', 7); // waiting on rax 7
+  enqueueUnitTo(q, e, 'infantry', 9); // different producer, untouched
+
+  tickProduction(q, 2); // rax 7 head at 50%, rax 9 head at 50%
+  const before = e.credits;
+
+  const removed = producerDestroyed(q, e, 7);
+  assert.deepEqual(
+    removed.map((o) => o.kind),
+    ['infantry', 'tank'],
+  );
+  // Half-built infantry refunds 50; the waiting tank refunds in full.
+  const refund = Math.floor(UNIT_STATS.infantry.cost * 0.5) + UNIT_STATS.tank.cost;
+  assert.equal(e.credits, before + refund);
+  // rax 9's queue survives, progress and all.
+  assert.equal(q.length, 1);
+  assert.equal((q[0]! as UnitOrder).barracksId, 9);
+  assert.equal(q[0]!.elapsed, 2);
+});
+
+test('producerDestroyed refunds deferred orders by funded share and clears rally', () => {
+  const e = createEconomy(0);
+  const q = createUnitQueue();
+  const rally = createRallyPoints();
+  enqueueUnitChecked(q, e, 'infantry', { deferred: true, barracksId: 7 });
+  enqueueUnitChecked(q, e, 'tank', { deferred: true, barracksId: 7 });
+  setRallyPoint(rally, q, 7, { x: 64, y: 64 });
+
+  credit(e, 50);
+  tickProductionFunded(q, e, 2); // head: 2s elapsed, 50 paid of 100
+  const before = e.credits; // 0
+
+  const removed = producerDestroyed(q, e, 7, { rally });
+  assert.equal(removed.length, 2);
+  // Only the funded share can come back: 50 paid, half unbuilt → 25.
+  // The waiting tank paid nothing and refunds nothing.
+  assert.equal(e.credits - before, Math.floor(50 * 0.5));
+  assert.equal(q.length, 0);
+  assert.equal(rally.has(7), false);
 });
