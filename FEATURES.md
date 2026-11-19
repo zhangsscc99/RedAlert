@@ -258,8 +258,8 @@
 > 追加原因：M12 后只剩 4 条未勾选（F1201/F1216 上轮撞免费额度未落地），本轮 6 条车道，补 2 条。
 > 每条独占列出的文件与测试文件；禁止改 FEATURES.md；禁止互相 import 对方新增符号；旧导出签名只增不改。
 
-- [ ] F1225 战斗克制与护甲纵深：game/combat.ts 加护甲类型（步兵/车辆/建筑）与武器克制矩阵（轻武器打步兵强、打车辆弱；反装甲反之）、溅射与误伤、掩体/高地加成、最小伤害下限；既有导出签名不变（新增能力走可选参数），纯函数可测，补 combat.test.ts 用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/combat.test.js && (cd client && npx tsc --noEmit)｜risk: med
-- [ ] F1226 采集经济纵深：game/harvest.ts 加矿点储量枯竭与缓慢再生、多矿车按距离与负载调度、矿车拥堵让位与排队、满载回程优先、矿厂被毁时矿车改投最近矿厂；harvest 旧导出签名不变，补 harvest.test.ts 用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/harvest.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [x] F1225 战斗克制与护甲纵深：game/combat.ts 加护甲类型（步兵/车辆/建筑）与武器克制矩阵（轻武器打步兵强、打车辆弱；反装甲反之）、溅射与误伤、掩体/高地加成、最小伤害下限；既有导出签名不变（新增能力走可选参数），纯函数可测，补 combat.test.ts 用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/combat.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [x] F1226 采集经济纵深：game/harvest.ts 加矿点储量枯竭与缓慢再生、多矿车按距离与负载调度、矿车拥堵让位与排队、满载回程优先、矿厂被毁时矿车改投最近矿厂；harvest 旧导出签名不变，补 harvest.test.ts 用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/harvest.test.js && (cd client && npx tsc --noEmit)｜risk: med
 
 ## M14 并行车道批（美术与手感）— 强制遵循 `docs/ART-SPEC.md`
 
