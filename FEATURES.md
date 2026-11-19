@@ -238,3 +238,17 @@
 - [x] F1214 战役简报与地图预览：render/campaign.ts 关卡卡片加简报文字（目标/敌军编成/提示）与程序化生成的地形缩略图预览（按 missond 的种子画矿脉与水域）、目标类型图标与失败条件说明；780×380 下可折叠不溢出，导出签名不变，补 render/campaign 用例｜verify: bash scripts/build-tests.sh && node --test client/src/render/campaign.test.js && (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
 - [x] F1215 编队与姿态控制纵深：game/commands.ts 加编队增删改（Shift 加编队、双击编队居中）、姿态循环（aggressive/defensive/hold）与对索敌/开火条件的影响、攻击移动队列与停止清空、编队阵型选择（宽/纵/楔形）；纯逻辑可测，旧导出签名不变并补 commands.test.ts 用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/commands.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
 - [ ] F1216 地图多样性：game/grid.ts 加地图生成预设（河谷/双矿对峙/岛屿/城市废墟，含对称性与矿脉可达性校验），generateMap 保持旧签名与默认行为不变、新预设走可选参数，补 grid.test.ts 用例断言每种预设矿脉可达、双方出生点对称、中心留空地｜verify: bash scripts/build-tests.sh && node --test client/src/game/grid.test.js && node --test client/src/game/gameState.test.js && (cd client && npx tsc --noEmit)｜risk: med
+
+## M12 并行车道批（2026-11-19 02:30 UTC）— AI / 寻路 / 生产 / 存档 / 触屏 / 复盘
+
+> 追加原因：M11 完成后 FEATURES.md 只剩 2 条未勾选，本轮要开 10 条车道，补 8 条。
+> 每条独占列出的文件与测试文件；禁止改 FEATURES.md；禁止互相 import 对方新增符号；旧导出签名只增不改。
+
+- [ ] F1217 敌方 AI 行为纵深：game/enemyAI.ts 加难度分层（简易/普通/困难各自的进攻间隔、编队规模与侦查倾向）、集结波次（先攒够 N 个单位再成波进攻，而非零散送人头）、经济骚扰（派小队打矿车/矿厂）、劣势退守与重建；updateEnemy 签名不变，AI 决策纯函数可测，补 enemyAI.test.ts 用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/enemyAI.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F1218 寻路与单位拥挤治理：game/pathfind.ts 加同目标批量寻路共享、被占格自动绕行与等待队列、每帧 A* 次数上限（分帧计算）、目标不可达时回退最近可达点并清目的、连续 M 帧位移≈0 自动重派路径；findPath 旧签名不变，补 pathfind.test.ts 用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/pathfind.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F1219 生产队列与集结点：game/production.ts 支持每建筑多单位排队（可取消单项、可置顶）、建筑集结点（新单位出生即前往，矿车自动去最近矿脉）、资金不足时暂停而非丢队列、建筑被毁清空队列并按比例退款；旧导出签名不变，补 production.test.ts 用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/production.test.js && node --test client/src/game/economy.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F1220 存档槽位与自动存档：game/save.ts / game/saveload.ts 加多槽位（≥3 槽 + 自动存档槽）、每槽元数据（关卡/时刻/资金/用时）、损坏存档返回可诊断错误而不崩溃、旧版本存档可读（版本迁移）；导出只增不改，补 save.test.ts 与 saveload.test.ts 用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/save.test.js && node --test client/src/game/saveload.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F1221 触屏手势纵深：input/gestures.ts 加双指缩放锚点跟随、长按环形选择、拖拽平移惯性衰减与边界夹紧、双击选中同类、触屏防误触阈值；手势回调注入方式不变，补 gestures.test.ts 用例｜verify: bash scripts/build-tests.sh && node --test client/src/input/gestures.test.js && (cd client && npx tsc --noEmit)｜risk: low
+- [ ] F1222 新手引导纵深：game/onboarding.ts 把首次对局拆成分步任务（采矿→造兵→造电厂→探图→首胜），每步有高亮目标与完成判定、可重看、老玩家可一键跳过并写入注入的 storage；纯逻辑可测，补 onboarding.test.ts 用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/onboarding.test.js && (cd client && npx tsc --noEmit)｜risk: low
+- [ ] F1223 战后复盘与统计面板：game/stats.ts 采集分项统计（采矿总量、单位/建筑损失、杀敌数、APM 近似、资金曲线采样）并输出结构化数据；render/panel.ts 加复盘页（分栏 + 单位损失按兵种排行）；stats 旧导出签名不变，补 stats.test.ts 用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/stats.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F1224 帧率自适应与卡顿治理：game/perf.ts 加自适应画质档（按滚动帧时均值升降：单位/特效/天气叠层档位）、单帧预算告警、实体超限时合并绘制裁定；perf 导出只增不改，补 perf.test.ts 用例断言档位切换阈值与迟滞｜verify: bash scripts/build-tests.sh && node --test client/src/game/perf.test.js && (cd client && npx tsc --noEmit)｜risk: med
