@@ -10,12 +10,20 @@ function createGestureRecognizer(opts = {}) {
   const lpTolerance = opts.longPressMoveTolerance ?? 12;
   const doubleTapMs = opts.doubleTapMs ?? 300;
   const doubleTapPx = opts.doubleTapPx ?? 24;
+  const tapMaxPx = opts.tapMaxPx ?? dragThreshold;
+  const tapMaxMs = opts.tapMaxMs ?? longPressMs;
+  const ringStart = opts.ringStartRadiusPx ?? 24;
+  const ringGrowth = opts.ringGrowthPxPerSec ?? 60;
+  const ringMinHold = opts.ringMinHoldMs ?? 150;
+  const flingMinSpeed = opts.flingMinSpeedPxPerSec ?? 50;
   const pts = /* @__PURE__ */ new Map();
   const ignored = /* @__PURE__ */ new Set();
   let outbox = [];
   let lastTap = null;
   let prevMid = { x: 0, y: 0 };
   let prevSpread = 0;
+  let prevFrameT = 0;
+  const vel = { vx: 0, vy: 0 };
   const twoFinger = () => pts.size === 2;
   function frameOf() {
     const [a, b] = [...pts.values()];
@@ -24,11 +32,14 @@ function createGestureRecognizer(opts = {}) {
       spread: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y))
     };
   }
-  function enterTwoFinger() {
+  function enterTwoFinger(t) {
     for (const p of pts.values()) p.phase = "consumed";
     const f = frameOf();
     prevMid = f.mid;
     prevSpread = f.spread;
+    prevFrameT = t;
+    vel.vx = 0;
+    vel.vy = 0;
   }
   function restartRemaining(t) {
     for (const p of pts.values()) {
@@ -37,6 +48,7 @@ function createGestureRecognizer(opts = {}) {
       p.sy = p.y;
       p.downT = t;
       p.lastT = t;
+      p.lpT = void 0;
     }
   }
   function drain() {
@@ -60,7 +72,7 @@ function createGestureRecognizer(opts = {}) {
         return;
       }
       pts.set(id, { id, sx: x, sy: y, x, y, downT: t, lastT: t, phase: "pending" });
-      if (twoFinger()) enterTwoFinger();
+      if (twoFinger()) enterTwoFinger(t);
     },
     move(id, x, y, t) {
       const p = pts.get(id);
@@ -73,10 +85,15 @@ function createGestureRecognizer(opts = {}) {
         const dx = f.mid.x - prevMid.x;
         const dy = f.mid.y - prevMid.y;
         const scale = f.spread / prevSpread;
+        const dt = Math.max(1, t - prevFrameT);
+        vel.vx = 0.5 * vel.vx + 0.5 * dx * 1e3 / dt;
+        vel.vy = 0.5 * vel.vy + 0.5 * dy * 1e3 / dt;
         if (dx !== 0 || dy !== 0) outbox.push({ type: "pan", dx, dy });
-        if (scale !== 1) outbox.push({ type: "pinch", center: f.mid, scale });
+        if (scale !== 1)
+          outbox.push({ type: "pinch", center: f.mid, scale, prevCenter: { ...prevMid } });
         prevMid = f.mid;
         prevSpread = f.spread;
+        prevFrameT = t;
         return;
       }
       if ((p.phase === "pending" || p.phase === "consumed") && dist({ x: p.sx, y: p.sy }, p) >= Math.max(dragThreshold, lpTolerance)) {
@@ -91,14 +108,30 @@ function createGestureRecognizer(opts = {}) {
       p.y = y;
       p.lastT = t;
       pts.delete(id);
-      if (pts.size === 1) restartRemaining(t);
+      const pairEnded = pts.size === 1;
+      if (pairEnded) restartRemaining(t);
       const out = drain();
+      if (pairEnded) {
+        if (Math.hypot(vel.vx, vel.vy) >= flingMinSpeed)
+          out.push({ type: "fling", vx: vel.vx, vy: vel.vy });
+        vel.vx = 0;
+        vel.vy = 0;
+      }
       if (p.phase === "drag") {
+        lastTap = null;
         out.push({ type: "dragbox", from: { x: p.sx, y: p.sy }, to: { x: p.x, y: p.y } });
+      } else if (p.phase === "consumed" && p.lpT !== void 0) {
+        if (t - p.lpT >= ringMinHold)
+          out.push({
+            type: "ringselect",
+            x: p.sx,
+            y: p.sy,
+            radius: ringStart + ringGrowth * (t - p.lpT) / 1e3
+          });
       } else if (p.phase === "pending") {
         const dur = t - p.downT;
         const d = dist({ x: p.sx, y: p.sy }, p);
-        if (d < dragThreshold && dur < longPressMs) {
+        if (d < tapMaxPx && dur < tapMaxMs) {
           if (lastTap && t - lastTap.t <= doubleTapMs && Math.hypot(p.x - lastTap.x, p.y - lastTap.y) <= doubleTapPx) {
             lastTap = null;
             out.push({ type: "doubletap", x: p.x, y: p.y });
@@ -106,8 +139,10 @@ function createGestureRecognizer(opts = {}) {
             lastTap = { x: p.x, y: p.y, t };
             out.push({ type: "tap", x: p.x, y: p.y });
           }
-        } else if (d < lpTolerance && dur >= longPressMs)
+        } else if (d < lpTolerance && dur >= longPressMs) {
+          lastTap = null;
           out.push({ type: "longpress", x: p.x, y: p.y });
+        } else lastTap = null;
       }
       return out;
     },
@@ -124,10 +159,84 @@ function createGestureRecognizer(opts = {}) {
         const p = pts.values().next().value;
         if (p.phase === "pending" && now - p.downT >= longPressMs && dist({ x: p.sx, y: p.sy }, p) < lpTolerance) {
           p.phase = "consumed";
+          p.lpT = now;
           out.push({ type: "longpress", x: p.x, y: p.y });
+        } else if (p.phase === "consumed" && p.lpT !== void 0 && now > p.lpT) {
+          out.push({
+            type: "ring",
+            x: p.sx,
+            y: p.sy,
+            radius: ringStart + ringGrowth * (now - p.lpT) / 1e3
+          });
         }
       }
       return out;
+    }
+  };
+}
+var clampNum = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+function createPanInertia(opts) {
+  const decay = opts.decayPerSec ?? 0.1;
+  const minSpeed = opts.minSpeedPxPerSec ?? 8;
+  const b = opts.bounds;
+  let x = clampNum(opts.x ?? 0, b.minX, b.maxX);
+  let y = clampNum(opts.y ?? 0, b.minY, b.maxY);
+  let vx = 0;
+  let vy = 0;
+  let lastT = 0;
+  let on = false;
+  return {
+    get x() {
+      return x;
+    },
+    get y() {
+      return y;
+    },
+    get moving() {
+      return on;
+    },
+    flick(nvx, nvy, t) {
+      vx = nvx;
+      vy = nvy;
+      lastT = t;
+      on = Math.hypot(vx, vy) >= minSpeed;
+    },
+    tick(now) {
+      if (!on) return null;
+      const dt = Math.max(0, (now - lastT) / 1e3);
+      lastT = now;
+      let dx = vx * dt;
+      let dy = vy * dt;
+      const nx = clampNum(x + dx, b.minX, b.maxX);
+      const ny = clampNum(y + dy, b.minY, b.maxY);
+      if (nx !== x + dx) {
+        dx = nx - x;
+        vx = 0;
+      }
+      if (ny !== y + dy) {
+        dy = ny - y;
+        vy = 0;
+      }
+      x = nx;
+      y = ny;
+      const k = Math.pow(decay, dt);
+      vx *= k;
+      vy *= k;
+      if (Math.hypot(vx, vy) < minSpeed) {
+        on = false;
+        vx = 0;
+        vy = 0;
+      }
+      return { dx, dy };
+    },
+    setPosition(nx, ny) {
+      x = clampNum(nx, b.minX, b.maxX);
+      y = clampNum(ny, b.minY, b.maxY);
+    },
+    stop() {
+      on = false;
+      vx = 0;
+      vy = 0;
     }
   };
 }
@@ -375,4 +484,156 @@ test("doubletap: a third quick tap starts a fresh pair", () => {
     const out = g.up(1, 10, 10, T0 + i * 200 + 60);
     assert.equal(out[0].type, want);
   }
+});
+test("pinch anchor follows the midpoint: prevCenter chains across moves (no jump)", () => {
+  const g = createGestureRecognizer();
+  g.down(1, 100, 100, T0);
+  g.down(2, 200, 100, T0 + 10);
+  g.move(2, 240, 100, T0 + 20);
+  g.move(1, 120, 120, T0 + 30);
+  const pinches = g.tick(T0 + 40).filter((x) => x.type === "pinch");
+  assert.equal(pinches.length, 2);
+  assert.deepEqual(pinches[0].prevCenter, { x: 150, y: 100 });
+  assert.deepEqual(pinches[0].center, { x: 170, y: 100 });
+  assert.deepEqual(pinches[1].prevCenter, pinches[0].center);
+  assert.deepEqual(pinches[1].center, { x: 180, y: 110 });
+});
+test("pinch anchor: symmetric spread keeps the anchor fixed", () => {
+  const g = createGestureRecognizer();
+  g.down(1, 100, 100, T0);
+  g.down(2, 200, 100, T0 + 10);
+  g.move(1, 90, 100, T0 + 20);
+  g.move(2, 210, 100, T0 + 25);
+  const pinches = g.tick(T0 + 30).filter((x) => x.type === "pinch");
+  assert.equal(pinches.length, 2);
+  assert.deepEqual(pinches[1].center, { x: 150, y: 100 });
+  assert.deepEqual(pinches[1].prevCenter, pinches[0].center);
+  const scale = pinches.reduce((s, p) => s * p.scale, 1);
+  assert.ok(Math.abs(scale - 1.2) < 1e-9);
+});
+test("ring select: held longpress emits growing ring preview at the anchor", () => {
+  const g = createGestureRecognizer();
+  g.down(1, 50, 50, T0);
+  g.move(1, 53, 51, T0 + 100);
+  assert.equal(g.tick(T0 + 520)[0].type, "longpress");
+  const r1 = g.tick(T0 + 620)[0];
+  assert.equal(r1.type, "ring");
+  assert.deepEqual({ x: r1.x, y: r1.y }, { x: 50, y: 50 });
+  const r2 = g.tick(T0 + 720)[0];
+  assert.equal(r2.type, "ring");
+  assert.equal(r1.radius, 24 + 60 * 0.1);
+  assert.equal(r2.radius, 24 + 60 * 0.2);
+});
+test("ringselect commits on release after holding past the ring minimum", () => {
+  const g = createGestureRecognizer();
+  g.down(1, 50, 50, T0);
+  g.tick(T0 + 520);
+  g.tick(T0 + 800);
+  const out = g.up(1, 50, 50, T0 + 900);
+  assert.equal(out.length, 1);
+  assert.deepEqual(out[0], { type: "ringselect", x: 50, y: 50, radius: 24 + 60 * 0.38 });
+});
+test("ring select aborts when the finger converts to a dragbox", () => {
+  const g = createGestureRecognizer();
+  g.down(1, 50, 50, T0);
+  g.tick(T0 + 520);
+  g.move(1, 90, 80, T0 + 700);
+  assert.deepEqual(g.tick(T0 + 800).filter((x) => x.type === "ring"), []);
+  const out = g.up(1, 90, 80, T0 + 900);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].type, "dragbox");
+});
+test("ring preview honors injectable start radius and growth rate", () => {
+  const g = createGestureRecognizer({
+    longPressMs: 200,
+    ringStartRadiusPx: 40,
+    ringGrowthPxPerSec: 100
+  });
+  g.down(1, 0, 0, T0);
+  g.tick(T0 + 200);
+  const ring = g.tick(T0 + 500)[0];
+  assert.equal(ring.type, "ring");
+  assert.equal(ring.radius, 40 + 100 * 0.3);
+});
+test("fling: releasing a fast two-finger pan emits midpoint velocity (px/s)", () => {
+  const g = createGestureRecognizer();
+  g.down(1, 0, 0, T0);
+  g.down(2, 100, 0, T0 + 10);
+  g.move(1, 20, 0, T0 + 110);
+  g.move(2, 120, 0, T0 + 210);
+  g.tick(T0 + 220);
+  const out = g.up(1, 20, 0, T0 + 230);
+  const fling = out.find((x) => x.type === "fling");
+  assert.ok(fling);
+  assert.ok(Math.abs(fling.vx - 75) < 1e-9);
+  assert.equal(fling.vy, 0);
+});
+test("fling: a slow two-finger release stays quiet", () => {
+  const g = createGestureRecognizer();
+  g.down(1, 0, 0, T0);
+  g.down(2, 100, 0, T0 + 10);
+  g.move(2, 101, 0, T0 + 400);
+  g.tick(T0 + 410);
+  assert.deepEqual(g.up(1, 0, 0, T0 + 420), []);
+});
+test("inertia: velocity decays exponentially and the pan comes to rest", () => {
+  const inertia = createPanInertia({
+    bounds: { minX: -1e6, minY: -1e6, maxX: 1e6, maxY: 1e6 }
+  });
+  inertia.flick(600, 0, T0);
+  const d1 = inertia.tick(T0 + 500);
+  const d2 = inertia.tick(T0 + 1e3);
+  assert.ok(d1.dx > 0 && d2.dx > 0);
+  assert.ok(d2.dx < d1.dx);
+  let steps = 0;
+  while (inertia.moving && steps++ < 200) inertia.tick(T0 + 1e3 + steps * 500);
+  assert.equal(inertia.moving, false);
+  assert.equal(inertia.tick(T0 + 2e5), null);
+});
+test("inertia: offset is clamped at bounds and velocity dies on the wall", () => {
+  const inertia = createPanInertia({ bounds: { minX: 0, minY: 0, maxX: 100, maxY: 50 }, x: 90, y: 25 });
+  inertia.flick(1e3, -500, T0);
+  inertia.tick(T0 + 200);
+  assert.ok(inertia.x <= 100 && inertia.x >= 0);
+  assert.ok(inertia.y <= 50 && inertia.y >= 0);
+  assert.equal(inertia.x, 100);
+  assert.equal(inertia.y, 0);
+  assert.equal(inertia.moving, false);
+});
+test("inertia: a fresh grab can reposition, a weak flick never starts", () => {
+  const inertia = createPanInertia({ bounds: { minX: 0, minY: 0, maxX: 10, maxY: 10 }, x: 5, y: 5 });
+  inertia.flick(4, 0, T0);
+  assert.equal(inertia.moving, false);
+  inertia.setPosition(99, -3);
+  assert.equal(inertia.x, 10);
+  assert.equal(inertia.y, 0);
+});
+test("anti-mistouch: injectable tap distance/time thresholds", () => {
+  const g = createGestureRecognizer({ tapMaxPx: 4, tapMaxMs: 150 });
+  g.down(1, 0, 0, T0);
+  assert.deepEqual(g.up(1, 6, 0, T0 + 80), []);
+  g.down(1, 0, 0, T0 + 200);
+  assert.deepEqual(g.up(1, 3, 0, T0 + 380), []);
+  g.down(1, 0, 0, T0 + 500);
+  assert.equal(g.up(1, 3, 0, T0 + 580)[0].type, "tap");
+});
+test("doubletap select-same-kind: taps at the window edge still pair up", () => {
+  const g = createGestureRecognizer();
+  g.down(1, 100, 100, T0);
+  g.up(1, 100, 100, T0 + 60);
+  g.down(1, 100, 100, T0 + 320);
+  const out = g.up(1, 100, 100, T0 + 360);
+  assert.equal(out.length, 1);
+  assert.deepEqual(out[0], { type: "doubletap", x: 100, y: 100 });
+});
+test("doubletap select-same-kind: a dragged second press cannot pair", () => {
+  const g = createGestureRecognizer();
+  g.down(1, 0, 0, T0);
+  g.up(1, 0, 0, T0 + 60);
+  g.down(1, 5, 5, T0 + 100);
+  g.move(1, 40, 40, T0 + 140);
+  const out = g.up(1, 40, 40, T0 + 180);
+  assert.equal(out[0].type, "dragbox");
+  g.down(1, 5, 5, T0 + 220);
+  assert.equal(g.up(1, 5, 5, T0 + 280)[0].type, "tap");
 });
