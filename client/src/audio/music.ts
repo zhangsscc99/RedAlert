@@ -2,6 +2,13 @@
 // Presentation layer only: must not be imported from client/src/game/**.
 // The AudioContext is injected by the caller; nothing touches the DOM here.
 
+import {
+  defaultAudioStorage,
+  loadAudioState,
+  saveAudioState,
+  type AudioStorageLike,
+} from './sfx.js';
+
 export type MusicTrack = 'menu' | 'battle';
 
 export interface NoteEvent {
@@ -62,8 +69,17 @@ export interface TrackDef {
 export interface Music {
   play(track: MusicTrack): void;
   stop(): void;
+  /** Music bus level 0..1; the master bus level multiplies on top. */
   setVolume(v: number): void;
   readonly volume: number;
+  /** Master bus level 0..1, shared with the sfx mixer — persisted. */
+  setMasterVolume(v: number): void;
+  readonly masterVolume: number;
+  readonly muted: boolean;
+  /**
+   * Switch tracks with an equal-power-style crossfade; `seconds` is
+   * clamped into the 0.3–0.6s scene-transition window.
+   */
   crossfade(track: MusicTrack, seconds: number): void;
   /**
    * Combat intensity 0..1, fed per-frame; rebalances stems in place.
@@ -403,11 +419,23 @@ function mulberry32(seed: number): () => number {
 
 const LOOKAHEAD_SEC = 0.25;
 const TICK_MS = 60;
+/** Scene-switch crossfade window: 300–600ms. */
+const CROSSFADE_MIN_SEC = 0.3;
+const CROSSFADE_MAX_SEC = 0.6;
 
-export function createMusic(ac: AudioContext): Music {
+/** Optional injection: persistent mixer storage shared with the sfx bus. */
+export interface MusicOptions {
+  storage?: AudioStorageLike;
+}
+
+export function createMusic(ac: AudioContext, options: MusicOptions = {}): Music {
+  const storage =
+    options.storage !== undefined ? options.storage : defaultAudioStorage();
+  const persisted = loadAudioState(storage);
   let master: GainNode | null = null;
-  let volume = 0.25;
-  let muted = false;
+  let volume = Math.min(MAX_VOLUME, persisted.music);
+  let masterVol = persisted.master;
+  let muted = persisted.muted;
   let intensity = 0;
   let disposed = false;
   let noiseBuf: AudioBuffer | null = null;
@@ -429,8 +457,9 @@ export function createMusic(ac: AudioContext): Music {
   }
   let current: Playing | null = null;
 
+  // Two-level bus: master gain node carries masterVol * music level.
   function masterTarget(): number {
-    return muted ? 0 : volume;
+    return muted ? 0 : masterVol * volume;
   }
 
   function ensureMaster(): GainNode {
@@ -617,9 +646,24 @@ export function createMusic(ac: AudioContext): Music {
     setTimeout(() => p.gain.disconnect(), (fadeSec + 0.2) * 1000);
   }
 
+  function retargetMaster(): void {
+    if (master) {
+      const now = ac.currentTime;
+      master.gain.cancelScheduledValues(now);
+      master.gain.setValueAtTime(master.gain.value, now);
+      master.gain.linearRampToValueAtTime(masterTarget(), now + 0.05);
+    }
+  }
+
   return {
     get volume() {
       return volume;
+    },
+    get masterVolume() {
+      return masterVol;
+    },
+    get muted() {
+      return muted;
     },
     play(track) {
       if (disposed) return;
@@ -640,12 +684,13 @@ export function createMusic(ac: AudioContext): Music {
     },
     setVolume(v) {
       volume = Math.min(MAX_VOLUME, Math.max(0, v));
-      if (master) {
-        const now = ac.currentTime;
-        master.gain.cancelScheduledValues(now);
-        master.gain.setValueAtTime(master.gain.value, now);
-        master.gain.linearRampToValueAtTime(masterTarget(), now + 0.05);
-      }
+      saveAudioState(storage, { music: volume });
+      retargetMaster();
+    },
+    setMasterVolume(v) {
+      masterVol = Math.min(1, Math.max(0, v));
+      saveAudioState(storage, { master: masterVol });
+      retargetMaster();
     },
     setIntensity(v, opts) {
       const x = Math.min(1, Math.max(0, v));
@@ -656,6 +701,7 @@ export function createMusic(ac: AudioContext): Music {
     setMuted(m) {
       if (muted === m) return;
       muted = m;
+      saveAudioState(storage, { muted });
       if (master) {
         master.gain.setTargetAtTime(masterTarget(), ac.currentTime, 0.05);
       }
@@ -663,9 +709,15 @@ export function createMusic(ac: AudioContext): Music {
     crossfade(track, seconds) {
       if (disposed) return;
       if (current?.track === track) return;
-      if (current) killPlaying(current, seconds);
+      // Clamp into the 0.3–0.6s window so scene switches always
+      // crossfade instead of hard-cutting or dragging out.
+      const sec = Math.min(
+        CROSSFADE_MAX_SEC,
+        Math.max(CROSSFADE_MIN_SEC, seconds),
+      );
+      if (current) killPlaying(current, sec);
       try {
-        current = startTrack(track, seconds);
+        current = startTrack(track, sec);
       } catch {
         current = null;
       }
