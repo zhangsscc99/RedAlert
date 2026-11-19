@@ -146,3 +146,201 @@ export function advice(p: Perf, cap?: EntityCap): PerfAdvice {
   }
   return isSlow(p) ? 'reduce-effects' : 'ok';
 }
+
+// ---------------------------------------------------------------------------
+// F1224: adaptive quality tiers, frame-budget alarms, merge-draw verdicts.
+// ---------------------------------------------------------------------------
+
+export type QualityChannel = 'units' | 'effects' | 'weather';
+export const QUALITY_CHANNELS: readonly QualityChannel[] = ['units', 'effects', 'weather'];
+
+export interface QualityGovernorOptions {
+  windowSize?: number; // rolling-mean window (frames), default 30
+  downgradeMs?: number; // rolling mean above this → step down, default 24
+  upgradeMs?: number; // rolling mean below this → step up, default 16
+  hysteresis?: number; // consecutive qualifying frames before switching, default 45
+  tiers?: number; // number of tiers per channel (>=2), default 3 (0 = lowest)
+}
+
+export interface QualityGovernor {
+  windowSize: number;
+  downgradeMs: number;
+  upgradeMs: number;
+  hysteresis: number;
+  tiers: number;
+  ring: number[]; // circular buffer of frame times (ms)
+  ringIdx: number;
+  ringLen: number; // populated count (<= windowSize)
+  downStreak: number; // consecutive frames whose rolling mean > downgradeMs
+  upStreak: number; // consecutive frames whose rolling mean < upgradeMs
+  quality: Record<QualityChannel, number>; // current tier per channel
+  changes: Record<QualityChannel, number>; // tier-change count per channel
+}
+
+export function createQualityGovernor(opts: QualityGovernorOptions = {}): QualityGovernor {
+  const tiers = Math.max(2, opts.tiers ?? 3);
+  const top = tiers - 1;
+  return {
+    windowSize: Math.max(1, opts.windowSize ?? 30),
+    downgradeMs: opts.downgradeMs ?? 24,
+    upgradeMs: opts.upgradeMs ?? 16,
+    hysteresis: Math.max(1, opts.hysteresis ?? 45),
+    tiers,
+    ring: [],
+    ringIdx: 0,
+    ringLen: 0,
+    downStreak: 0,
+    upStreak: 0,
+    quality: { units: top, effects: top, weather: top },
+    changes: { units: 0, effects: 0, weather: 0 },
+  };
+}
+
+/** Rolling mean frame time (ms) over the populated window; 0 before samples. */
+export function rollingMeanMs(g: QualityGovernor): number {
+  if (g.ringLen === 0) return 0;
+  let sum = 0;
+  for (let i = 0; i < g.ringLen; i++) sum += g.ring[i];
+  return sum / g.ringLen;
+}
+
+/**
+ * Feed one frame time (ms). Updates the rolling mean and steps every channel
+ * down one tier after `hysteresis` consecutive frames above `downgradeMs`,
+ * or up one tier after `hysteresis` consecutive frames below `upgradeMs`.
+ * The two streaks are mutually exclusive, so a tier cannot oscillate within
+ * a single hysteresis window. Returns true when a tier changed this frame.
+ */
+export function updateQuality(g: QualityGovernor, frameDtMs: number): boolean {
+  if (g.ringLen < g.windowSize) {
+    g.ring.push(frameDtMs);
+    g.ringLen += 1;
+  } else {
+    g.ring[g.ringIdx] = frameDtMs;
+  }
+  g.ringIdx = (g.ringIdx + 1) % g.windowSize;
+
+  const mean = rollingMeanMs(g);
+  if (mean > g.downgradeMs) {
+    g.downStreak += 1;
+    g.upStreak = 0;
+  } else if (mean < g.upgradeMs) {
+    g.upStreak += 1;
+    g.downStreak = 0;
+  } else {
+    // Dead zone between thresholds: hold both streaks, never switch.
+    return false;
+  }
+
+  let changed = false;
+  if (g.downStreak >= g.hysteresis) {
+    for (const ch of QUALITY_CHANNELS) {
+      if (g.quality[ch] > 0) {
+        g.quality[ch] -= 1;
+        g.changes[ch] += 1;
+        changed = true;
+      }
+    }
+    g.downStreak = 0;
+  } else if (g.upStreak >= g.hysteresis) {
+    for (const ch of QUALITY_CHANNELS) {
+      if (g.quality[ch] < g.tiers - 1) {
+        g.quality[ch] += 1;
+        g.changes[ch] += 1;
+        changed = true;
+      }
+    }
+    g.upStreak = 0;
+  }
+  return changed;
+}
+
+/** Current tier for a channel (0 = lowest quality). */
+export function qualityTier(g: QualityGovernor, channel: QualityChannel): number {
+  return g.quality[channel];
+}
+
+// --- Frame budget alarm -----------------------------------------------------
+
+export const DEFAULT_FRAME_BUDGET_MS = 16.7;
+
+export interface FrameBudget {
+  budgetMs: number;
+  frames: number; // total frames measured
+  overCount: number; // frames that exceeded the budget
+  worstMs: number; // largest frame time seen
+  reasons: Record<string, number>; // over-budget count per reported cause
+  lastReason: string | null; // cause of the most recent over-budget frame
+}
+
+export function createFrameBudget(budgetMs: number = DEFAULT_FRAME_BUDGET_MS): FrameBudget {
+  return { budgetMs, frames: 0, overCount: 0, worstMs: 0, reasons: {}, lastReason: null };
+}
+
+/**
+ * Record one frame's cost (ms). `reason` labels the suspected cause when the
+ * frame is over budget (e.g. 'render', 'pathfind', 'effects'); it is only
+ * counted for over-budget frames. Returns true when this frame blew the budget.
+ */
+export function recordFrameCost(b: FrameBudget, dtMs: number, reason?: string): boolean {
+  b.frames += 1;
+  if (dtMs > b.worstMs) b.worstMs = dtMs;
+  if (dtMs <= b.budgetMs) return false;
+  b.overCount += 1;
+  const cause = reason ?? 'unknown';
+  b.reasons[cause] = (b.reasons[cause] ?? 0) + 1;
+  b.lastReason = cause;
+  return true;
+}
+
+export interface BudgetReport {
+  overCount: number;
+  overRatio: number; // overCount / frames (0 when no frames)
+  worstMs: number;
+  topReason: string | null; // most frequent over-budget cause
+  reasons: Record<string, number>;
+}
+
+export function budgetReport(b: FrameBudget): BudgetReport {
+  let topReason: string | null = null;
+  let top = 0;
+  for (const [k, v] of Object.entries(b.reasons)) {
+    if (v > top) {
+      top = v;
+      topReason = k;
+    }
+  }
+  return {
+    overCount: b.overCount,
+    overRatio: b.frames === 0 ? 0 : b.overCount / b.frames,
+    worstMs: b.worstMs,
+    topReason,
+    reasons: { ...b.reasons },
+  };
+}
+
+// --- Merge-draw verdict -----------------------------------------------------
+
+export const DEFAULT_MERGED_DRAW_LIMIT = 200;
+
+export interface MergeVerdict {
+  count: number;
+  merge: boolean; // true → take the merged-draw path this frame
+  perFrameCap: number; // max entities drawn individually this frame
+  overflow: number; // entities that must be merged/dropped (count - perFrameCap)
+}
+
+/**
+ * Decide whether the renderer should take the merged-draw path. Below or at
+ * `maxEntities` everything is drawn individually (perFrameCap = count). Above
+ * it, `perFrameCap` individual draws are kept and the rest are merged.
+ */
+export function mergeDrawVerdict(
+  count: number,
+  maxEntities: number = DEFAULT_MAX_ENTITIES,
+  perFrameCap: number = DEFAULT_MERGED_DRAW_LIMIT,
+): MergeVerdict {
+  const merge = count > maxEntities;
+  const cap = merge ? Math.max(0, Math.min(perFrameCap, maxEntities)) : count;
+  return { count, merge, perFrameCap: cap, overflow: Math.max(0, count - cap) };
+}

@@ -77,6 +77,111 @@ function advice(p, cap) {
   }
   return isSlow(p) ? "reduce-effects" : "ok";
 }
+var QUALITY_CHANNELS = ["units", "effects", "weather"];
+function createQualityGovernor(opts = {}) {
+  const tiers = Math.max(2, opts.tiers ?? 3);
+  const top = tiers - 1;
+  return {
+    windowSize: Math.max(1, opts.windowSize ?? 30),
+    downgradeMs: opts.downgradeMs ?? 24,
+    upgradeMs: opts.upgradeMs ?? 16,
+    hysteresis: Math.max(1, opts.hysteresis ?? 45),
+    tiers,
+    ring: [],
+    ringIdx: 0,
+    ringLen: 0,
+    downStreak: 0,
+    upStreak: 0,
+    quality: { units: top, effects: top, weather: top },
+    changes: { units: 0, effects: 0, weather: 0 }
+  };
+}
+function rollingMeanMs(g) {
+  if (g.ringLen === 0) return 0;
+  let sum = 0;
+  for (let i = 0; i < g.ringLen; i++) sum += g.ring[i];
+  return sum / g.ringLen;
+}
+function updateQuality(g, frameDtMs) {
+  if (g.ringLen < g.windowSize) {
+    g.ring.push(frameDtMs);
+    g.ringLen += 1;
+  } else {
+    g.ring[g.ringIdx] = frameDtMs;
+  }
+  g.ringIdx = (g.ringIdx + 1) % g.windowSize;
+  const mean = rollingMeanMs(g);
+  if (mean > g.downgradeMs) {
+    g.downStreak += 1;
+    g.upStreak = 0;
+  } else if (mean < g.upgradeMs) {
+    g.upStreak += 1;
+    g.downStreak = 0;
+  } else {
+    return false;
+  }
+  let changed = false;
+  if (g.downStreak >= g.hysteresis) {
+    for (const ch of QUALITY_CHANNELS) {
+      if (g.quality[ch] > 0) {
+        g.quality[ch] -= 1;
+        g.changes[ch] += 1;
+        changed = true;
+      }
+    }
+    g.downStreak = 0;
+  } else if (g.upStreak >= g.hysteresis) {
+    for (const ch of QUALITY_CHANNELS) {
+      if (g.quality[ch] < g.tiers - 1) {
+        g.quality[ch] += 1;
+        g.changes[ch] += 1;
+        changed = true;
+      }
+    }
+    g.upStreak = 0;
+  }
+  return changed;
+}
+function qualityTier(g, channel) {
+  return g.quality[channel];
+}
+var DEFAULT_FRAME_BUDGET_MS = 16.7;
+function createFrameBudget(budgetMs = DEFAULT_FRAME_BUDGET_MS) {
+  return { budgetMs, frames: 0, overCount: 0, worstMs: 0, reasons: {}, lastReason: null };
+}
+function recordFrameCost(b, dtMs, reason) {
+  b.frames += 1;
+  if (dtMs > b.worstMs) b.worstMs = dtMs;
+  if (dtMs <= b.budgetMs) return false;
+  b.overCount += 1;
+  const cause = reason ?? "unknown";
+  b.reasons[cause] = (b.reasons[cause] ?? 0) + 1;
+  b.lastReason = cause;
+  return true;
+}
+function budgetReport(b) {
+  let topReason = null;
+  let top = 0;
+  for (const [k, v] of Object.entries(b.reasons)) {
+    if (v > top) {
+      top = v;
+      topReason = k;
+    }
+  }
+  return {
+    overCount: b.overCount,
+    overRatio: b.frames === 0 ? 0 : b.overCount / b.frames,
+    worstMs: b.worstMs,
+    topReason,
+    reasons: { ...b.reasons }
+  };
+}
+var DEFAULT_MERGED_DRAW_LIMIT = 200;
+function mergeDrawVerdict(count, maxEntities = DEFAULT_MAX_ENTITIES, perFrameCap = DEFAULT_MERGED_DRAW_LIMIT) {
+  const merge = count > maxEntities;
+  const cap = merge ? Math.max(0, Math.min(perFrameCap, maxEntities)) : count;
+  return { count, merge, perFrameCap: cap, overflow: Math.max(0, count - cap) };
+}
 
 // src/game/perf.test.ts
 var fakeUnit = (id) => ({ id });
@@ -150,4 +255,89 @@ test("advice priority: entity cap beats frame-rate advice", () => {
   assert.equal(advice(p, softCap), "cap-entities");
   const hardCap = capEntities(Array.from({ length: 600 }, (_, i) => fakeUnit(i)), [], 400);
   assert.equal(advice(p, hardCap), "too-many-entities");
+});
+test("quality governor: sustained slow frames step every channel down", () => {
+  const g = createQualityGovernor({ windowSize: 10, hysteresis: 5, tiers: 3 });
+  for (let i = 0; i < 5; i++) assert.equal(updateQuality(g, 30), i === 4);
+  assert.equal(qualityTier(g, "units"), 1);
+  assert.equal(qualityTier(g, "effects"), 1);
+  assert.equal(qualityTier(g, "weather"), 1);
+  for (let i = 0; i < 5; i++) updateQuality(g, 30);
+  assert.equal(qualityTier(g, "units"), 0);
+  for (let i = 0; i < 10; i++) updateQuality(g, 40);
+  assert.equal(qualityTier(g, "units"), 0);
+});
+test("quality governor: sustained fast frames step back up", () => {
+  const g = createQualityGovernor({ windowSize: 5, hysteresis: 4, tiers: 3 });
+  for (let i = 0; i < 8; i++) updateQuality(g, 30);
+  assert.equal(qualityTier(g, "effects"), 0);
+  for (let i = 0; i < 8; i++) updateQuality(g, 8);
+  assert.equal(qualityTier(g, "effects"), 1);
+  for (let i = 0; i < 8; i++) updateQuality(g, 8);
+  assert.equal(qualityTier(g, "effects"), 2);
+});
+test("quality governor: hysteresis blocks jitter around the threshold", () => {
+  const g = createQualityGovernor({ windowSize: 2, hysteresis: 6, tiers: 3 });
+  for (let i = 0; i < 200; i++) updateQuality(g, i % 4 < 2 ? 40 : 10);
+  for (const ch of QUALITY_CHANNELS) {
+    assert.equal(qualityTier(g, ch), 2, `${ch} must not change`);
+    assert.equal(g.changes[ch], 0);
+  }
+});
+test("quality governor: dead zone between thresholds holds the tier", () => {
+  const g = createQualityGovernor({ windowSize: 4, hysteresis: 3, upgradeMs: 15, downgradeMs: 25 });
+  for (let i = 0; i < 3; i++) updateQuality(g, 30);
+  assert.equal(qualityTier(g, "weather"), 1);
+  for (let i = 0; i < 50; i++) updateQuality(g, 20);
+  assert.equal(qualityTier(g, "weather"), 1);
+});
+test("quality governor: injected thresholds and window are honored", () => {
+  const g = createQualityGovernor({ windowSize: 2, hysteresis: 2, downgradeMs: 20, upgradeMs: 10 });
+  updateQuality(g, 19);
+  assert.equal(qualityTier(g, "units"), 2);
+  updateQuality(g, 21);
+  assert.equal(qualityTier(g, "units"), 2);
+  updateQuality(g, 30);
+  updateQuality(g, 30);
+  assert.equal(qualityTier(g, "units"), 1);
+});
+test("frame budget: counts over-budget frames and tracks reasons", () => {
+  const b = createFrameBudget(16.7);
+  assert.equal(recordFrameCost(b, 10), false);
+  assert.equal(recordFrameCost(b, 20, "render"), true);
+  assert.equal(recordFrameCost(b, 30, "pathfind"), true);
+  assert.equal(recordFrameCost(b, 25, "render"), true);
+  assert.equal(b.overCount, 3);
+  assert.equal(b.lastReason, "render");
+  const r = budgetReport(b);
+  assert.equal(r.overCount, 3);
+  assert.equal(r.topReason, "render");
+  assert.deepEqual(r.reasons, { render: 2, pathfind: 1 });
+  assert.ok(Math.abs(r.overRatio - 0.75) < 1e-9);
+  assert.equal(r.worstMs, 30);
+});
+test("frame budget: unknown reason bucket and empty report", () => {
+  const b = createFrameBudget(16);
+  assert.deepEqual(budgetReport(b), {
+    overCount: 0,
+    overRatio: 0,
+    worstMs: 0,
+    topReason: null,
+    reasons: {}
+  });
+  recordFrameCost(b, 50);
+  assert.equal(budgetReport(b).topReason, "unknown");
+});
+test("merge verdict: under the cap draws everything individually", () => {
+  const v = mergeDrawVerdict(300, 400);
+  assert.deepEqual(v, { count: 300, merge: false, perFrameCap: 300, overflow: 0 });
+});
+test("merge verdict: over the cap merges overflow beyond per-frame cap", () => {
+  const v = mergeDrawVerdict(700, 400, 150);
+  assert.equal(v.merge, true);
+  assert.equal(v.perFrameCap, 150);
+  assert.equal(v.overflow, 550);
+  assert.equal(mergeDrawVerdict(700, 100, 150).perFrameCap, 100);
+  assert.equal(mergeDrawVerdict(401).merge, true);
+  assert.equal(mergeDrawVerdict(400).merge, false);
 });
