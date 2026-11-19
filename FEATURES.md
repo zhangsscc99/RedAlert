@@ -260,3 +260,23 @@
 
 - [ ] F1225 战斗克制与护甲纵深：game/combat.ts 加护甲类型（步兵/车辆/建筑）与武器克制矩阵（轻武器打步兵强、打车辆弱；反装甲反之）、溅射与误伤、掩体/高地加成、最小伤害下限；既有导出签名不变（新增能力走可选参数），纯函数可测，补 combat.test.ts 用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/combat.test.js && (cd client && npx tsc --noEmit)｜risk: med
 - [ ] F1226 采集经济纵深：game/harvest.ts 加矿点储量枯竭与缓慢再生、多矿车按距离与负载调度、矿车拥堵让位与排队、满载回程优先、矿厂被毁时矿车改投最近矿厂；harvest 旧导出签名不变，补 harvest.test.ts 用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/harvest.test.js && (cd client && npx tsc --noEmit)｜risk: med
+
+## M14 并行车道批（美术与手感）— 强制遵循 `docs/ART-SPEC.md`
+
+> 追加原因：功能已齐（M1–M13），但视觉仍是程序化几何图形、无统一调色板、无声无反馈，
+> 主观评分 2/5。本轮起所有可见产出必须符合 `docs/ART-SPEC.md`：
+> DB32 调色板 token、Kenney Sci-Fi RTS（CC0）贴图、可读性硬指标、WebAudio 程序化音效。
+> 每条独占列出的文件与测试文件；禁止改 FEATURES.md；禁止互相 import 对方新增符号；旧导出签名只增不改。
+
+- [ ] F1301 调色板集中化：新增 `client/src/render/palette.ts`（DB32 全 32 色 + `THEME` 语义 token + 材质 3 档 ramp 辅助函数），把 `client/src/render/**` 与 `client/src/main.ts` 里的颜色字面量全部替换为 token 引用；附 `scripts/check-palette.sh` 扫描 `client/src/render`、`client/src/main.ts` 中残留的 `#rrggbb`/`rgb(`/`hsl(`（图集与 palette.ts 自身除外），有残留即失败｜verify: bash scripts/build-tests.sh && (cd client && npx tsc --noEmit) && bash scripts/check-palette.sh｜risk: med
+- [ ] F1302 素材管线与加载器：新增 `scripts/fetch-assets.sh`（下载 Kenney Sci-Fi RTS CC0 到 `client/public/assets/kenney-scifi-rts/`，保留 License.txt）、`scripts/build-atlas.mjs`（生成 `client/public/assets/atlas/units.png|buildings.png|terrain.png` + JSON），新增 `client/src/render/sprites.ts`（异步加载图集、按名取帧、**加载失败或缺失时回落程序化绘制且不抛错**）；补 `sprites.test.ts` 断言取帧与降级路径（用注入的假图集，不依赖网络）｜verify: bash scripts/build-tests.sh && node --test client/src/render/sprites.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F1303 地形贴图化：`client/src/render/terrain.ts` 新增，草地/矿石/水面改用 32px 贴图 + 每材质 3 档 ramp（由 tile 坐标哈希选档，确定性、无随机数），水面加 2 帧轻微动画；无贴图时回落原程序化渲染；补 `terrain.test.ts` 断言哈希选档的确定性（同坐标两次调用同结果）｜verify: bash scripts/build-tests.sh && node --test client/src/render/terrain.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F1304 单位贴图与可读性：`client/src/render/units.ts` 改用贴图（24/32px），加 1.5px 深色描边、朝向指示箭头、血条（≥3px，随血量换 `hpFull/hpMid/hpLow`）、选中脉冲光环（1.2s 正弦，不改本体色）；四类对象（我方/敌方/建筑/资源点）形状必须不同；贴图缺失回落圆形｜verify: bash scripts/build-tests.sh && node --test client/src/render/units.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F1305 建筑贴图与建造反馈：`client/src/render/buildings.ts` 用贴图绘制（按 32 的整数倍），加向东 (2,2) 阴影 `rgba(0,0,0,0.35)`、施工中半透明脚手架 + 进度条、完成时高亮 300ms；补 `buildings.test.ts`（渲染入参计算，不依赖 canvas 像素）｜verify: bash scripts/build-tests.sh && node --test client/src/render/buildings.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F1306 特效对象池：新增 `client/src/render/effects.ts`，实现开火火花、命中闪光、单位死亡爆炸、移动标记淡出；**全部走预分配池，每帧零新增对象**（导出 `poolStats()` 供测试断言 `created===0`）；补 `effects.test.ts` 断言池上限、回收、零分配｜verify: bash scripts/build-tests.sh && node --test client/src/render/effects.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F1307 音效事件系统：扩展 `client/src/audio/sfx.ts`，按 ART-SPEC §5 实现 8 类事件（选中/移动/开火/命中/死亡/建造完成/采到矿/警报），程序化波形、总音量与静音开关持久化、同类并发上限 6、手势解锁 `AudioContext.resume()`；新增 `client/src/audio/engine.ts` 纯逻辑（事件排队、并发裁剪、增益计算）+ `engine.test.ts` 断言裁剪规则与静音旁路｜verify: bash scripts/build-tests.sh && node --test client/src/audio/engine.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F1308 可读性验收脚本：新增 `client/e2e/readability.mjs`（Playwright，390×844 + hasTouch），截图后断言：① 单位外沿存在深色描边（采样像素）② 四类对象平均色相互不相同 ③ 所有 HUD 命中矩形 ≥44×44 ④ 血条高度 ≥3 CSS px；失败打印具体指标；同时输出 `client/e2e/shots/readability-*.png`｜verify: node client/e2e/readability.mjs｜risk: med
+- [ ] F1309 关于页与署名：新增 `docs/CREDITS.md` 与游戏内「关于」遮罩（`client/src/render/about.ts`），列出 Kenney Sci-Fi RTS（CC0，链接）、DB32 调色板作者、以及"未使用任何原作素材"声明；关于页可从开始菜单进入并返回｜verify: (cd client && npx tsc --noEmit) && node client/e2e/mobile.mjs｜risk: low
+- [ ] F1310 渲染层顺序统一：新增 `client/src/render/layer.ts` 定义 ART-SPEC §4 的 8 层顺序常量与 `drawLayers()` 调度，`main.ts` 的帧循环改为按层调用；补 `layer.test.ts` 断言顺序稳定、层数正确｜verify: bash scripts/build-tests.sh && node --test client/src/render/layer.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F1311 HUD 配色与按压反馈：`client/src/render/hud.ts` 全面改用 `THEME` token，按钮按下缩放 0.96 + `uiAccent` 高亮，资源面板数值右对齐、行距收紧，底栏按钮文字 ≥14px 且居中加粗；保持既有命中矩形与布局函数签名｜verify: bash scripts/build-tests.sh && (cd client && npx tsc --noEmit) && node client/e2e/mobile.mjs｜risk: med
+- [ ] F1312 手感四问自检：新增 `docs/PLAYTEST.md` 记录 ART-SPEC §6 四问的判定方法，并写 `client/e2e/feel.mjs`：进场 3 秒内存在提示文案、下命令后 300ms 内 `window.__raDebug.lastFeedback` 有记录（新增该字段）、选中与开火会触发音频事件计数（`__raDebug.sfxCount`）、90% 操作命中矩形落在屏幕下 40%；四条任一失败即 fail｜verify: node client/e2e/feel.mjs｜risk: med
