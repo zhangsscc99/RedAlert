@@ -28,6 +28,10 @@ interface UnitFx {
   cargoCap?: number;
   /** veterancy rank string; anything unknown reads as 'rookie'. */
   rank?: string;
+  /** control-group number (or label); shown only while the unit is selected. */
+  group?: number | string;
+  /** id of the unit this one is attacking; draws a thin orange link. */
+  targetId?: number | null;
 }
 
 const SPRITE = 64; // body sprite canvas px — ~30px disc + anti-alias bleed
@@ -209,6 +213,9 @@ class FxRing<T extends object> {
 
 const puffs = new FxRing<Puff>(MAX_PUFFS, () => ({ x: 0, y: 0, born: 0, sand: false }));
 const marks = new FxRing<Mark>(MAX_MARKS, () => ({ x: 0, y: 0, angle: 0, born: 0 }));
+
+/** id → unit lookup for the attack-link pass; cleared and refilled per frame. */
+const byId = new Map<number, Unit>();
 
 function spawnMark(u: Unit, now: number): void {
   const m = marks.next();
@@ -700,6 +707,7 @@ interface BarRec {
   y: number; // requested top edge, screen px
   w: number;
   pct: number;
+  hp: number; // absolute hp, printed beside the bar
   sel: boolean;
 }
 
@@ -708,13 +716,14 @@ const placedPool: { x: number; y: number; w: number }[] = [];
 let barCount = 0;
 const BAR_H = 5; // bar footprint height incl. border, screen px
 
-function queueBar(x: number, y: number, w: number, pct: number, sel: boolean): void {
+function queueBar(x: number, y: number, w: number, pct: number, hp: number, sel: boolean): void {
   let b = barPool[barCount];
-  if (b === undefined) b = barPool[barCount] = { x: 0, y: 0, w: 0, pct: 0, sel: false };
+  if (b === undefined) b = barPool[barCount] = { x: 0, y: 0, w: 0, pct: 0, hp: 0, sel: false };
   b.x = x;
   b.y = y;
   b.w = w;
   b.pct = pct;
+  b.hp = hp;
   b.sel = sel;
   barCount++;
 }
@@ -761,6 +770,12 @@ function drawHealthBars(ctx: CanvasRenderingContext2D): void {
         ctx.lineWidth = 1;
         ctx.strokeRect(b.x - 1, by - 1, b.w + 2, 5);
       }
+      // Absolute hp beside the bar; red-tinted once the unit is critical.
+      ctx.font = '7px sans-serif';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = b.pct < 0.3 ? '#ff7a52' : 'rgba(235,235,220,0.85)';
+      ctx.fillText(String(Math.ceil(b.hp)), b.x + b.w + 3, by + 1.5);
+      ctx.textBaseline = 'alphabetic';
     }
   }
 }
@@ -799,6 +814,34 @@ function drawRankBadge(
   roundRect(ctx, bx, by, w, h, h / 2);
   ctx.fill();
   ctx.fillStyle = RANK_FG[rk] ?? RANK_FG.rookie!;
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'center';
+  ctx.fillText(name, bx + w / 2, by + h / 2);
+  ctx.textAlign = 'start';
+  ctx.textBaseline = 'alphabetic';
+}
+
+/** Control-group number badge on selected units, mirroring the rank lozenge. */
+function drawGroupBadge(
+  ctx: CanvasRenderingContext2D,
+  sx: number,
+  sy: number,
+  r: number,
+  group: number | string,
+  zoom: number,
+): void {
+  if (zoom < 0.55) return; // unreadable far out — skip the work entirely
+  const name = String(group);
+  const size = Math.max(8, 9 * zoom);
+  ctx.font = `${size}px sans-serif`;
+  const w = ctx.measureText(name).width + 6;
+  const h = size + 2;
+  const bx = sx + r - w * 0.6;
+  const by = sy - r - h - 4;
+  ctx.fillStyle = 'rgba(20,42,70,0.85)';
+  roundRect(ctx, bx, by, w, h, h / 2);
+  ctx.fill();
+  ctx.fillStyle = '#aee2ff';
   ctx.textBaseline = 'middle';
   ctx.textAlign = 'center';
   ctx.fillText(name, bx + w / 2, by + h / 2);
@@ -1004,7 +1047,7 @@ export function drawUnits(
     // Health bar only once damaged — queued, then flushed after the loop so
     // bars draw over every body and stack where they would collide.
     if (u.hp < u.maxHp) {
-      queueBar(sx - r, sy - r - 7, r * 2, u.hp / u.maxHp, u.selected);
+      queueBar(sx - r, sy - r - 7, r * 2, u.hp / u.maxHp, u.hp, u.selected);
     }
 
     // Veterancy badge above the health bar — only when the unit reports a
@@ -1012,9 +1055,32 @@ export function drawUnits(
     if (fx.rank !== undefined) {
       drawRankBadge(ctx, sx, sy, r, fx.rank, cam.zoom);
     }
+
+    // Control-group badge on the top-right of selected units, when the sim
+    // reports a group assignment; absent field draws nothing.
+    if (u.selected && fx.group !== undefined) {
+      drawGroupBadge(ctx, sx, sy, r, fx.group, cam.zoom);
+    }
   }
 
   drawHealthBars(ctx);
+
+  // Attack links: a thin orange line from each attacker to its locked
+  // target, so focus fire reads at a glance. `byId` is reused across frames.
+  byId.clear();
+  for (const u of units) byId.set(u.id, u);
+  ctx.strokeStyle = 'rgba(255,140,40,0.7)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (const u of units) {
+    const tid = (u as Unit & UnitFx).targetId;
+    if (tid === undefined || tid === null) continue;
+    const target = byId.get(tid);
+    if (target === undefined) continue;
+    ctx.moveTo((u.x - cam.x) * cam.zoom, (u.y - cam.y) * cam.zoom);
+    ctx.lineTo((target.x - cam.x) * cam.zoom, (target.y - cam.y) * cam.zoom);
+  }
+  ctx.stroke();
 
   // Forget despawned units so the tracking map can't grow unbounded. The
   // per-track seenAt stamp replaces a per-frame Set allocation.
