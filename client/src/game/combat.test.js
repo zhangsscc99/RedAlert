@@ -142,7 +142,26 @@ function effectiveDamage(a, t, counters = false, cover) {
   }
   const cov = cover ?? t.cover;
   if (cov !== void 0) dmg *= TERRAIN_COVER[cov];
+  dmg *= elevationMultiplier(a, t);
+  if (a.damage > 0) dmg = Math.max(dmg, MIN_DAMAGE);
   return dmg;
+}
+var MIN_DAMAGE = 1;
+var HIGH_GROUND_BONUS = 1.25;
+function elevationMultiplier(a, t) {
+  if (a.elevation === void 0 || t.elevation === void 0) return 1;
+  return a.elevation > t.elevation ? HIGH_GROUND_BONUS : 1;
+}
+var UNIT_ARMOR = {
+  infantry: "infantry",
+  tank: "vehicle",
+  harvester: "vehicle"
+};
+function armorForKind(kind) {
+  return UNIT_ARMOR[kind];
+}
+function armorForBuilding(_kind) {
+  return "building";
 }
 function creditKill(killer) {
   const rank = killer.rank ?? "rookie";
@@ -880,4 +899,69 @@ test("legacy regression: two-arg stepCombat and old option mixes unchanged", () 
   const hold = combatant({ id: 3, damage: 25, stance: "hold" });
   const t2 = combatant({ id: 4, x: 30, team: "enemy", cooldown: 100 });
   assert.deepEqual(stepCombat([hold, t2], 0.1), [{ type: "hit", from: 3, to: 4, damage: 25 }]);
+});
+test("armor classes are inferred from the unit/building definition", () => {
+  assert.deepEqual(Object.keys(UNIT_ARMOR).sort(), ["harvester", "infantry", "tank"]);
+  assert.equal(armorForKind("infantry"), "infantry");
+  assert.equal(armorForKind("tank"), "vehicle");
+  assert.equal(armorForKind("harvester"), "vehicle");
+  assert.equal(armorForBuilding("hq"), "building");
+  assert.equal(armorForBuilding("wall"), "building");
+  assert.equal(armorForBuilding("turret"), "building");
+});
+test("counter matrix: inferred armor feeds the weapon matchups", () => {
+  const rocket = combatant({ damage: 60, weapon: "rocket" });
+  const tank = combatant({ armor: armorForKind("tank") });
+  const grunt = combatant({ armor: armorForKind("infantry") });
+  assert.equal(effectiveDamage(rocket, tank, true), 120);
+  assert.equal(effectiveDamage(rocket, grunt, true), 30);
+  const bullet = combatant({ damage: 10, weapon: "bullet" });
+  assert.equal(effectiveDamage(bullet, grunt, true), 10);
+  assert.equal(effectiveDamage(bullet, tank, true), 5);
+  const wall = combatant({ armor: armorForBuilding("wall") });
+  assert.equal(effectiveDamage(rocket, wall, true), 150);
+});
+test("splash can friendly-fire: a bystander on the shooter team takes the hit", () => {
+  const shooter = combatant({ id: 1, range: 400, damage: 40, splashRadius: 100 });
+  const target = combatant({ id: 2, x: 300, team: "enemy", hp: 400, maxHp: 400, cooldown: 100 });
+  const friend = combatant({ id: 3, x: 275, team: "player", hp: 30, maxHp: 30, cooldown: 100 });
+  const ev = stepCombat([shooter, target, friend], 0.1, { splash: true });
+  assert.deepEqual(ev, [
+    { type: "hit", from: 1, to: 2, damage: 40 },
+    { type: "hit", from: 1, to: 3, damage: 30 },
+    { type: "death", id: 3 }
+    // friendly fire kills are still kills
+  ]);
+  assert.equal(friend.hp, 0);
+});
+test("minimum damage floor: an armed hit can never grind down to zero", () => {
+  const gunner = combatant({ id: 1, damage: 1, weapon: "bullet" });
+  const tank = combatant({ id: 2, x: 30, team: "enemy", hp: 400, maxHp: 400, cooldown: 100, armor: "vehicle" });
+  assert.equal(effectiveDamage(gunner, tank, true), MIN_DAMAGE);
+  const dug = combatant({ damage: 2, weapon: "bullet" });
+  const urbanTank = combatant({ armor: "vehicle", cover: "urban" });
+  assert.equal(effectiveDamage(dug, urbanTank, true), MIN_DAMAGE);
+  assert.deepEqual(stepCombat([gunner, tank], 0.1, { counters: true }), [
+    { type: "hit", from: 1, to: 2, damage: 1 }
+  ]);
+  assert.equal(tank.hp, 399);
+  assert.equal(effectiveDamage(combatant({ damage: 0 }), urbanTank), 0);
+});
+test("high ground: strictly higher elevation multiplies outgoing damage", () => {
+  const high = combatant({ damage: 20, elevation: 2 });
+  const low = combatant({ damage: 20, elevation: 1 });
+  const flat = combatant({ damage: 20 });
+  const t = combatant({ elevation: 1 });
+  const tHigh = combatant({ elevation: 3 });
+  assert.equal(elevationMultiplier(high, t), HIGH_GROUND_BONUS);
+  assert.equal(elevationMultiplier(low, t), 1);
+  assert.equal(elevationMultiplier(flat, t), 1);
+  assert.equal(elevationMultiplier(high, tHigh), 1);
+  assert.equal(effectiveDamage(high, t), 25);
+  const rocketHigh = combatant({ damage: 60, weapon: "rocket", elevation: 5 });
+  const tankLow = combatant({ armor: "vehicle", elevation: 0 });
+  assert.equal(effectiveDamage(rocketHigh, tankLow, true), 150);
+  const a = combatant({ id: 7, damage: 20, elevation: 2 });
+  const b = combatant({ id: 8, x: 30, team: "enemy", cooldown: 100, elevation: 1 });
+  assert.deepEqual(stepCombat([a, b], 0.1), [{ type: "hit", from: 7, to: 8, damage: 25 }]);
 });

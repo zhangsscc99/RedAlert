@@ -4,7 +4,8 @@
 // call behaves exactly as before.
 
 import { damageMultiplier, type ArmorType, type WeaponType } from './unitRoles.js';
-import { BUILDING_DEFS, type Building } from './buildings.js';
+import { BUILDING_DEFS, type Building, type BuildingKind } from './buildings.js';
+import type { UnitKind } from './units.js';
 import { TILE_SIZE, WATER, tileAt, worldToTile, type GameMap, type Terrain } from './grid.js';
 import {
   RANK_THRESHOLDS,
@@ -39,6 +40,7 @@ export interface Combatant {
   lastAttackerId?: number; // stance bookkeeping: last enemy to hit this unit
   antiInfantry?: number; // extra outgoing multiplier vs 'infantry' armor; absent = ×1
   antiArmor?: number; // extra outgoing multiplier vs 'vehicle'/'building'; absent = ×1
+  elevation?: number; // height level; strictly above the target grants the high-ground bonus
 }
 
 export type CombatEvent =
@@ -73,7 +75,11 @@ export function dist(a: Combatant, b: Combatant): number {
  * the defender's rank scales what gets through (rookie = ×1, so rankless
  * combatants hit exactly as before). With `counters` on and both sides typed,
  * the weapon×armor multiplier from unitRoles' DAMAGE_MATRIX also applies;
- * anything missing falls back to the rank-scaled damage.
+ * anything missing falls back to the rank-scaled damage. A shooter holding
+ * strictly higher elevation than the target gains the high-ground bonus, and
+ * any armed attacker (base damage > 0) always lands at least MIN_DAMAGE —
+ * stacked armor/cover penalties can never grind a hit down to a 0-damage
+ * deadlock.
  */
 export function effectiveDamage(
   a: Combatant,
@@ -97,7 +103,47 @@ export function effectiveDamage(
   }
   const cov = cover ?? t.cover;
   if (cov !== undefined) dmg *= TERRAIN_COVER[cov];
+  dmg *= elevationMultiplier(a, t);
+  if (a.damage > 0) dmg = Math.max(dmg, MIN_DAMAGE);
   return dmg;
+}
+
+/** Floor on a landed hit: any armed attacker deals at least this much. */
+export const MIN_DAMAGE = 1;
+
+/** Outgoing multiplier when the shooter stands strictly above the target. */
+export const HIGH_GROUND_BONUS = 1.25;
+
+/**
+ * High-ground modifier: a shooter with a strictly higher `elevation` than
+ * the target hits ×HIGH_GROUND_BONUS. Same level, lower ground, or either
+ * side untyped means no modifier — elevation never reduces damage, so a
+ * downhill shot behaves exactly as before.
+ */
+export function elevationMultiplier(a: Combatant, t: Combatant): number {
+  if (a.elevation === undefined || t.elevation === undefined) return 1;
+  return a.elevation > t.elevation ? HIGH_GROUND_BONUS : 1;
+}
+
+/**
+ * Armor class per unit kind: infantry is soft, everything with tracks
+ * (tank, harvester) is vehicle. Defined here rather than units.ts so the
+ * unit module stays free of combat concerns.
+ */
+export const UNIT_ARMOR: Record<UnitKind, ArmorType> = {
+  infantry: 'infantry',
+  tank: 'vehicle',
+  harvester: 'vehicle',
+};
+
+/** Armor class a unit kind fights with (see UNIT_ARMOR). */
+export function armorForKind(kind: UnitKind): ArmorType {
+  return UNIT_ARMOR[kind];
+}
+
+/** Every building kind armors as 'building'. */
+export function armorForBuilding(_kind: BuildingKind): ArmorType {
+  return 'building';
 }
 
 /**
@@ -360,6 +406,10 @@ export function applyDamage(t: Combatant, dmg: number): boolean {
  *   unit answer whoever last hit it inside full weapon range.
  * - occluders: targets behind a building footprint are neither fired on nor
  *   selected.
+ * Field-driven (no flag): a shooter whose `elevation` is strictly above the
+ * target's gains HIGH_GROUND_BONUS on every hit including splash; any armed
+ * attacker always lands at least MIN_DAMAGE so stacked armor/cover penalties
+ * can't produce a 0-damage deadlock.
  */
 export function stepCombat(
   all: Combatant[],

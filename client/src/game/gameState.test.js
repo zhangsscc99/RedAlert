@@ -1100,7 +1100,15 @@ function effectiveDamage(a, t, counters = false, cover) {
   }
   const cov = cover ?? t.cover;
   if (cov !== void 0) dmg *= TERRAIN_COVER[cov];
+  dmg *= elevationMultiplier(a, t);
+  if (a.damage > 0) dmg = Math.max(dmg, MIN_DAMAGE);
   return dmg;
+}
+var MIN_DAMAGE = 1;
+var HIGH_GROUND_BONUS = 1.25;
+function elevationMultiplier(a, t) {
+  if (a.elevation === void 0 || t.elevation === void 0) return 1;
+  return a.elevation > t.elevation ? HIGH_GROUND_BONUS : 1;
 }
 function creditKill(killer) {
   const rank = killer.rank ?? "rookie";

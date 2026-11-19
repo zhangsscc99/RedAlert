@@ -4,11 +4,14 @@ import {
   acquireRange,
   applyDamage,
   applySuppression,
+  armorForBuilding,
+  armorForKind,
   canAttack,
   coverAt,
   coverMultiplier,
   dist,
   effectiveDamage,
+  elevationMultiplier,
   losBlocked,
   splashFalloff,
   stanceProfile,
@@ -17,7 +20,10 @@ import {
   suppressionModifiers,
   suppressionTier,
   tileCover,
+  HIGH_GROUND_BONUS,
+  MIN_DAMAGE,
   STANCE_PROFILES,
+  UNIT_ARMOR,
   SUPPRESSION_MAX,
   SUPPRESSION_MILD_THRESHOLD,
   SUPPRESSION_MIN_ACCURACY,
@@ -659,4 +665,86 @@ test('legacy regression: two-arg stepCombat and old option mixes unchanged', () 
   const hold = combatant({ id: 3, damage: 25, stance: 'hold' });
   const t2 = combatant({ id: 4, x: 30, team: 'enemy', cooldown: 100 });
   assert.deepEqual(stepCombat([hold, t2], 0.1), [{ type: 'hit', from: 3, to: 4, damage: 25 }]);
+});
+
+test('armor classes are inferred from the unit/building definition', () => {
+  // UNIT_ARMOR covers every UnitKind: soft infantry, tracked vehicles.
+  assert.deepEqual(Object.keys(UNIT_ARMOR).sort(), ['harvester', 'infantry', 'tank']);
+  assert.equal(armorForKind('infantry'), 'infantry');
+  assert.equal(armorForKind('tank'), 'vehicle');
+  assert.equal(armorForKind('harvester'), 'vehicle');
+  // Every structure armors as 'building' regardless of kind.
+  assert.equal(armorForBuilding('hq'), 'building');
+  assert.equal(armorForBuilding('wall'), 'building');
+  assert.equal(armorForBuilding('turret'), 'building');
+});
+
+test('counter matrix: inferred armor feeds the weapon matchups', () => {
+  // An inferred tank eats the anti-armor rocket multiplier (2.0), while an
+  // inferred infantryman resists it (0.5) — bullet behavior is the inverse.
+  const rocket = combatant({ damage: 60, weapon: 'rocket' });
+  const tank = combatant({ armor: armorForKind('tank') });
+  const grunt = combatant({ armor: armorForKind('infantry') });
+  assert.equal(effectiveDamage(rocket, tank, true), 120);
+  assert.equal(effectiveDamage(rocket, grunt, true), 30);
+  const bullet = combatant({ damage: 10, weapon: 'bullet' });
+  assert.equal(effectiveDamage(bullet, grunt, true), 10);
+  assert.equal(effectiveDamage(bullet, tank, true), 5);
+  // Buildings take their own independent multiplier (2.5 for rockets).
+  const wall = combatant({ armor: armorForBuilding('wall') });
+  assert.equal(effectiveDamage(rocket, wall, true), 150);
+});
+
+test('splash can friendly-fire: a bystander on the shooter team takes the hit', () => {
+  const shooter = combatant({ id: 1, range: 400, damage: 40, splashRadius: 100 });
+  const target = combatant({ id: 2, x: 300, team: 'enemy', hp: 400, maxHp: 400, cooldown: 100 });
+  // Same team as the shooter, 25px from the impact point -> 40 * 0.75 = 30.
+  const friend = combatant({ id: 3, x: 275, team: 'player', hp: 30, maxHp: 30, cooldown: 100 });
+  const ev = stepCombat([shooter, target, friend], 0.1, { splash: true });
+  assert.deepEqual(ev, [
+    { type: 'hit', from: 1, to: 2, damage: 40 },
+    { type: 'hit', from: 1, to: 3, damage: 30 },
+    { type: 'death', id: 3 }, // friendly fire kills are still kills
+  ]);
+  assert.equal(friend.hp, 0);
+});
+
+test('minimum damage floor: an armed hit can never grind down to zero', () => {
+  // A 1-damage bullet vs vehicle armor (0.5) would land 0.5 — floored to 1.
+  const gunner = combatant({ id: 1, damage: 1, weapon: 'bullet' });
+  const tank = combatant({ id: 2, x: 30, team: 'enemy', hp: 400, maxHp: 400, cooldown: 100, armor: 'vehicle' });
+  assert.equal(effectiveDamage(gunner, tank, true), MIN_DAMAGE);
+  // Stacked penalties still floor: bullet vs vehicle *and* urban cover.
+  const dug = combatant({ damage: 2, weapon: 'bullet' });
+  const urbanTank = combatant({ armor: 'vehicle', cover: 'urban' });
+  assert.equal(effectiveDamage(dug, urbanTank, true), MIN_DAMAGE); // 2*0.5*0.6 -> 1
+  // stepCombat applies the floor too.
+  assert.deepEqual(stepCombat([gunner, tank], 0.1, { counters: true }), [
+    { type: 'hit', from: 1, to: 2, damage: 1 },
+  ]);
+  assert.equal(tank.hp, 399);
+  // An unarmed attacker (damage 0) still deals nothing — the floor only
+  // guards armed fire.
+  assert.equal(effectiveDamage(combatant({ damage: 0 }), urbanTank), 0);
+});
+
+test('high ground: strictly higher elevation multiplies outgoing damage', () => {
+  const high = combatant({ damage: 20, elevation: 2 });
+  const low = combatant({ damage: 20, elevation: 1 });
+  const flat = combatant({ damage: 20 });
+  const t = combatant({ elevation: 1 });
+  const tHigh = combatant({ elevation: 3 });
+  assert.equal(elevationMultiplier(high, t), HIGH_GROUND_BONUS);
+  assert.equal(elevationMultiplier(low, t), 1); // same level: no bonus
+  assert.equal(elevationMultiplier(flat, t), 1); // untyped: no bonus
+  assert.equal(elevationMultiplier(high, tHigh), 1); // downhill: never a penalty
+  assert.equal(effectiveDamage(high, t), 25); // 20 * 1.25
+  // The bonus stacks with counters and cover inside effectiveDamage.
+  const rocketHigh = combatant({ damage: 60, weapon: 'rocket', elevation: 5 });
+  const tankLow = combatant({ armor: 'vehicle', elevation: 0 });
+  assert.equal(effectiveDamage(rocketHigh, tankLow, true), 150); // 60*2.0*1.25
+  // And flows through stepCombat events.
+  const a = combatant({ id: 7, damage: 20, elevation: 2 });
+  const b = combatant({ id: 8, x: 30, team: 'enemy', cooldown: 100, elevation: 1 });
+  assert.deepEqual(stepCombat([a, b], 0.1), [{ type: 'hit', from: 7, to: 8, damage: 25 }]);
 });
