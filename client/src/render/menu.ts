@@ -30,11 +30,14 @@ export interface MenuLayout {
   hintY: number;
 }
 
-export type SettingRow = 'mute' | 'grid' | 'back';
+export type SettingRow = 'mute' | 'grid' | 'sfx' | 'music' | 'fps' | 'back';
+/** Rows that carry a ◀/▶ stepper instead of a boolean toggle. */
+export type StepperRow = 'sfx' | 'music';
 
 export interface SettingsLayout {
   titleY: number;
-  rows: { id: SettingRow; rect: Rect }[];
+  /** Stepper rows additionally expose their ◀ (minus) / ▶ (plus) hit zones. */
+  rows: { id: SettingRow; rect: Rect; minus?: Rect; plus?: Rect }[];
   /** Baseline y of the bottom hint line (「Esc 返回主菜单」). */
   hintY: number;
 }
@@ -56,6 +59,15 @@ const DIFF_H_MIN = 28;
 /** Bottom hint line: font px + breathing room below the baseline. */
 const HINT_FONT = 12;
 const HINT_ZONE = HINT_FONT + 6;
+
+/** Volume steppers move in fixed 10-point ticks over the 0-100 range. */
+export const VOLUME_STEP = 10;
+
+/** Clamp + snap a 0-100 volume value one tick in `dir` (-1/1). */
+export function stepVolume(v: number, dir: -1 | 1): number {
+  const base = Number.isFinite(v) ? Math.round(v / VOLUME_STEP) * VOLUME_STEP : 0;
+  return Math.min(100, Math.max(0, base + dir * VOLUME_STEP));
+}
 
 const inRect = (r: Rect, x: number, y: number): boolean =>
   x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
@@ -87,15 +99,18 @@ interface VZones {
 function vstack(
   viewH: number,
   zones: { header: number[]; mid: number; rows: number },
+  mins: { rowH?: number; gap?: number } = {},
 ): VZones {
+  const minRowH = mins.rowH ?? BTN_H_MIN;
+  const minGap = mins.gap ?? BTN_GAP_MIN;
   const nat = { top: 12, gapA: 8, gapB: 14, gapHint: 12, bottom: 6 };
   const natRows = zones.rows * BTN_H + (zones.rows - 1) * BTN_GAP;
   const natHeader = zones.header.reduce((a, b) => a + b, 0);
   const natTotal =
     nat.top + natHeader + nat.gapA + zones.mid + nat.gapB + natRows + nat.gapHint + HINT_ZONE + nat.bottom;
   const s = Math.min(1, viewH / natTotal);
-  const bh = Math.max(BTN_H_MIN, Math.round(BTN_H * s));
-  const gap = Math.max(BTN_GAP_MIN, Math.round(BTN_GAP * s));
+  const bh = Math.max(minRowH, Math.round(BTN_H * s));
+  const gap = Math.max(minGap, Math.round(BTN_GAP * s));
   const midH = Math.max(Math.min(DIFF_H_MIN, zones.mid), Math.round(zones.mid * s));
   const scaled = zones.header.map((h) => h * s);
   const top = nat.top * s;
@@ -168,21 +183,29 @@ export function menuHit(l: MenuLayout, x: number, y: number): MenuHit | null {
   return null;
 }
 
+/** Width of each ◀/▶ stepper zone carved out of a volume row. */
+const STEP_ZONE = 44;
+
 export function settingsLayout(viewW: number, viewH: number): SettingsLayout {
   const bw = colW(viewW);
   const cx = viewW / 2;
-  const v = vstack(viewH, {
-    header: [34 * 1.1], // 「设置」 title
-    mid: 0,
-    rows: 3,
-  });
-  const ids: SettingRow[] = ['mute', 'grid', 'back'];
+  // Six rows must still fit short viewports — drop the row-height floor.
+  const v = vstack(viewH, { header: [34 * 1.1], mid: 0, rows: 6 }, { rowH: 28, gap: 5 });
+  const ids: SettingRow[] = ['mute', 'grid', 'sfx', 'music', 'fps', 'back'];
   return {
     titleY: v.baselines[0]!,
-    rows: ids.map((id, i) => ({
-      id,
-      rect: { x: cx - bw / 2, y: v.rowsY + i * (v.bh + v.gap), w: bw, h: v.bh },
-    })),
+    rows: ids.map((id, i) => {
+      const rect: Rect = { x: cx - bw / 2, y: v.rowsY + i * (v.bh + v.gap), w: bw, h: v.bh };
+      if (id !== 'sfx' && id !== 'music') return { id, rect };
+      const zw = Math.min(STEP_ZONE, (rect.w - 60) / 2);
+      const inset = 4;
+      return {
+        id,
+        rect,
+        minus: { x: rect.x + rect.w - 2 * zw - inset, y: rect.y + 4, w: zw, h: rect.h - 8 },
+        plus: { x: rect.x + rect.w - zw - inset, y: rect.y + 4, w: zw, h: rect.h - 8 },
+      };
+    }),
     hintY: v.hintY,
   };
 }
@@ -190,6 +213,20 @@ export function settingsLayout(viewW: number, viewH: number): SettingsLayout {
 export function settingsHit(l: SettingsLayout, x: number, y: number): SettingRow | null {
   for (const r of l.rows) {
     if (inRect(r.rect, x, y)) return r.id;
+  }
+  return null;
+}
+
+/** ◀/▶ zones on the volume rows; full-row hit testing stays in settingsHit. */
+export function settingsAdjustHit(
+  l: SettingsLayout,
+  x: number,
+  y: number,
+): { id: StepperRow; delta: -1 | 1 } | null {
+  for (const r of l.rows) {
+    if (r.id !== 'sfx' && r.id !== 'music') continue;
+    if (r.minus && inRect(r.minus, x, y)) return { id: r.id, delta: -1 };
+    if (r.plus && inRect(r.plus, x, y)) return { id: r.id, delta: 1 };
   }
   return null;
 }
@@ -335,7 +372,14 @@ export function drawMenu(
 export interface SettingsState {
   mute: boolean;
   grid: boolean;
+  /** 0-100; when present the row renders its ◀/▶ stepper. */
+  sfxVolume?: number;
+  musicVolume?: number;
+  /** FPS 显示开关（渲染层只画，值经回调上抛）。 */
+  showFps?: boolean;
   hover?: SettingRow | null;
+  /** Hover feedback for a stepper zone, from settingsAdjustHit. */
+  hoverAdjust?: { id: StepperRow; delta: -1 | 1 } | null;
 }
 
 export function drawSettings(
@@ -352,10 +396,39 @@ export function drawSettings(
   ctx.fillText('设置', viewW / 2, l.titleY);
   ctx.textAlign = 'left';
 
-  const labels: Record<SettingRow, string> = { mute: '静音', grid: '网格线', back: '返回' };
+  const labels: Record<SettingRow, string> = {
+    mute: '静音',
+    grid: '网格线',
+    sfx: '音效',
+    music: '音乐',
+    fps: 'FPS 显示',
+    back: '返回',
+  };
   for (const row of l.rows) {
-    const value = row.id === 'mute' ? state.mute : row.id === 'grid' ? state.grid : null;
-    const suffix = value === null ? '' : value ? '：开' : '：关';
+    if (row.id === 'sfx' || row.id === 'music') {
+      const vol = row.id === 'sfx' ? state.sfxVolume : state.musicVolume;
+      const text = vol === undefined ? labels[row.id] : `${labels[row.id]} ${vol}`;
+      button(ctx, row.rect, text, {
+        on: vol !== undefined && vol > 0,
+        hover: state.hover === row.id,
+        font: `bold 15px ${FONT}`,
+      });
+      if (row.minus && row.plus) {
+        for (const [zone, glyph, delta] of [
+          [row.minus, '◀', -1],
+          [row.plus, '▶', 1],
+        ] as const) {
+          button(ctx, zone, glyph, {
+            hover: state.hoverAdjust?.id === row.id && state.hoverAdjust.delta === delta,
+            font: `bold 13px ${FONT}`,
+          });
+        }
+      }
+      continue;
+    }
+    const value =
+      row.id === 'mute' ? state.mute : row.id === 'grid' ? state.grid : row.id === 'fps' ? state.showFps : null;
+    const suffix = value === null || value === undefined ? '' : value ? '：开' : '：关';
     button(ctx, row.rect, labels[row.id] + suffix, {
       on: value === true,
       hover: state.hover === row.id,
@@ -365,7 +438,7 @@ export function drawSettings(
   ctx.font = `12px ${FONT}`;
   ctx.fillStyle = TEXT_DIM;
   ctx.textAlign = 'center';
-  ctx.fillText('Esc 返回主菜单', viewW / 2, l.hintY);
+  ctx.fillText('←/→ 调整音量 · Esc 返回主菜单', viewW / 2, l.hintY);
   ctx.textAlign = 'left';
 }
 
@@ -375,6 +448,7 @@ export function drawGameOver(
   viewH: number,
   phase: 'won' | 'lost',
   hover: 'retry' | 'menu' | null = null,
+  opts: { newRecord?: boolean } = {},
 ): void {
   const l = gameoverLayout(viewW, viewH);
   const cy = l.bandY;
@@ -384,7 +458,28 @@ export function drawGameOver(
   ctx.textAlign = 'center';
   ctx.font = `bold 44px ${FONT}`;
   ctx.fillStyle = phase === 'won' ? '#7dff7d' : BAD;
-  ctx.fillText(phase === 'won' ? 'VICTORY' : 'DEFEAT', viewW / 2, cy - 4);
+  const heading = phase === 'won' ? 'VICTORY' : 'DEFEAT';
+  ctx.fillText(heading, viewW / 2, cy - 4);
+
+  // 「新纪录」徽标：金色胶囊贴在标题右侧，仍在横幅带内。
+  if (opts.newRecord === true) {
+    const hw = ctx.measureText(heading).width;
+    const label = '★ 新纪录';
+    ctx.font = `bold 13px ${FONT}`;
+    const tw = ctx.measureText(label).width;
+    const pw = tw + 18;
+    const ph = 22;
+    const px = Math.min(viewW - pw - 8, viewW / 2 + hw / 2 + 14);
+    const py = cy - 4 - 30;
+    ctx.fillStyle = 'rgba(255, 217, 77, 0.16)';
+    ctx.fillRect(px, py, pw, ph);
+    ctx.strokeStyle = 'rgba(255, 217, 77, 0.7)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(px + 0.5, py + 0.5, pw - 1, ph - 1);
+    ctx.fillStyle = '#ffd94d';
+    ctx.fillText(label, px + pw / 2, py + ph / 2 + 5);
+    ctx.font = `bold 44px ${FONT}`;
+  }
   ctx.textAlign = 'left';
 
   for (const b of l.buttons) {
@@ -551,4 +646,32 @@ export function drawReplayList(
   ctx.textAlign = 'center';
   ctx.fillText('Esc 返回主菜单', viewW / 2, viewH - 24);
   ctx.textAlign = 'left';
+}
+
+// -------------------------------------------------------- leaderboard ----
+
+/**
+ * Format one leaderboard row as「名次 · 难度 · 用时 · 得分」.
+ * Tolerates junk API payloads: missionId 「skirmish」 maps to「遭遇战」, a
+ * numeric `score` wins, otherwise stars stand in as ★N.
+ */
+export function formatBoardRow(rank: number, s: unknown): string {
+  const r = (s ?? {}) as Record<string, unknown>;
+  const where =
+    r.missionId === 'skirmish'
+      ? '遭遇战'
+      : typeof r.missionId === 'string' && r.missionId !== ''
+        ? r.missionId
+        : '未知';
+  const dur =
+    typeof r.durationSec === 'number' && Number.isFinite(r.durationSec)
+      ? fmtDur(r.durationSec)
+      : '--:--';
+  const score =
+    typeof r.score === 'number' && Number.isFinite(r.score)
+      ? `${Math.round(r.score)}分`
+      : Number.isInteger(r.stars)
+        ? `★${r.stars}`
+        : '0分';
+  return `#${rank} · ${where} · ${dur} · ${score}`;
 }

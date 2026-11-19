@@ -222,14 +222,16 @@ var HINT_ZONE = HINT_FONT + 6;
 function colW(viewW) {
   return Math.max(180, Math.min(320, viewW - 64));
 }
-function vstack(viewH, zones) {
+function vstack(viewH, zones, mins = {}) {
+  const minRowH = mins.rowH ?? BTN_H_MIN;
+  const minGap = mins.gap ?? BTN_GAP_MIN;
   const nat = { top: 12, gapA: 8, gapB: 14, gapHint: 12, bottom: 6 };
   const natRows = zones.rows * BTN_H + (zones.rows - 1) * BTN_GAP;
   const natHeader = zones.header.reduce((a, b) => a + b, 0);
   const natTotal = nat.top + natHeader + nat.gapA + zones.mid + nat.gapB + natRows + nat.gapHint + HINT_ZONE + nat.bottom;
   const s = Math.min(1, viewH / natTotal);
-  const bh = Math.max(BTN_H_MIN, Math.round(BTN_H * s));
-  const gap = Math.max(BTN_GAP_MIN, Math.round(BTN_GAP * s));
+  const bh = Math.max(minRowH, Math.round(BTN_H * s));
+  const gap = Math.max(minGap, Math.round(BTN_GAP * s));
   const midH = Math.max(Math.min(DIFF_H_MIN, zones.mid), Math.round(zones.mid * s));
   const scaled = zones.header.map((h) => h * s);
   const top = nat.top * s;
