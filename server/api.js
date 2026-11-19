@@ -5,11 +5,21 @@
 
 const path = require('path');
 const fs = require('fs');
-const { validateScore, sortScores, summarize } = require('./scoreboard');
+const { validateScore, sortScores, summarize, capScores, MAX_ENTRIES } = require('./scoreboard');
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const SCORE_FILE = path.join(DATA_DIR, 'scoreboard.json');
 const RATE_LIMIT_PER_MIN = 10;
+const DEFAULT_LIMIT = 20;
+const MAX_LIMIT = 50;
+
+// ?limit= parsing: default 20, clamped to [1, 50]; junk input falls back.
+function parseLimit(raw) {
+  if (raw === undefined || raw === '') return DEFAULT_LIMIT;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return DEFAULT_LIMIT;
+  return Math.min(MAX_LIMIT, Math.max(1, Math.floor(n)));
+}
 
 function loadScores() {
   try {
@@ -60,6 +70,7 @@ setInterval(() => {
 function registerApi(app, prefix = '', deps = {}) {
   const load = deps.loadScores || loadScores;
   const save = deps.saveScores || saveScores;
+  const maxEntries = deps.maxEntries ?? MAX_ENTRIES;
 
   app.get(`${prefix}/api/health`, (_req, res) => {
     res.json({ ok: true, service: 'redalert', time: new Date().toISOString() });
@@ -74,7 +85,7 @@ function registerApi(app, prefix = '', deps = {}) {
       if (!r.ok) return res.status(400).json({ ok: false, error: r.error });
       const scores = load();
       scores.push({ ...r.value, ts: Date.now() });
-      save(scores);
+      save(capScores(scores, maxEntries));
       res.status(201).json({ ok: true });
     } catch (err) {
       console.error('[score] failed:', err);
@@ -84,12 +95,16 @@ function registerApi(app, prefix = '', deps = {}) {
 
   app.get(`${prefix}/api/leaderboard`, (req, res) => {
     try {
-      const mission = req.query.mission;
+      const { mission, difficulty } = req.query;
+      const limit = parseLimit(req.query.limit);
       let scores = load();
       if (mission !== undefined) {
         scores = scores.filter((s) => s.missionId === String(mission));
       }
-      res.json({ ok: true, scores: sortScores(scores).slice(0, 20) });
+      if (difficulty !== undefined) {
+        scores = scores.filter((s) => s.difficulty === String(difficulty));
+      }
+      res.json({ ok: true, scores: sortScores(scores).slice(0, limit) });
     } catch (err) {
       console.error('[leaderboard] failed:', err);
       res.status(500).json({ ok: false, error: 'internal error' });
