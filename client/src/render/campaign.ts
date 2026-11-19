@@ -2,7 +2,8 @@
 // 与 menu.ts 同一约定 —— 纯几何(layout+hit)与 canvas 绘制分离，命中测试
 // 可在 node --test 下无 DOM 运行。图形一律 canvas 绘制，无外部素材。
 
-import type { Rect } from '../game/index.ts';
+import { generateMap, WATER, ORE } from '../game/index.ts';
+import type { Rect, GameMap } from '../game/index.ts';
 
 // ------------------------------------------------------------ geometry ----
 
@@ -361,6 +362,160 @@ function drawLock(ctx: CanvasRenderingContext2D, cx: number, cy: number, s: numb
   ctx.strokeRect(cx - s * 0.5, cy - s * 0.15, s, s * 0.8);
 }
 
+// --------------------------------------------------- briefing helpers ----
+
+/** 与 main.ts MAP_SEED 保持一致 —— 模型不传 seed 时全部关卡共用此图。 */
+const DEFAULT_MAP_SEED = 1337;
+
+const HINT_FOR: Record<ObjectiveKind, string> = {
+  destroy: '优先集火高威胁单位，注意保存兵力。',
+  capture: '多派单位同时进入区域，驻守期间别调走。',
+  survive: '收缩防线、抢修建筑，拖过倒计时即胜。',
+  escort: '护送目标不会反击——坦克前出清路。',
+  hold: '把炮塔修在敌人必经之路上。',
+  eliminate: '敌方兵力有限，别拖到倒计时归零。',
+};
+
+const FAIL_FOR: Record<ObjectiveKind, string> = {
+  destroy: '我方全灭即失败',
+  capture: '我方全灭即失败',
+  survive: '全体阵亡即失败',
+  escort: '护送目标被毁即失败',
+  hold: '防守建筑被毁即失败',
+  eliminate: '超时未歼灭即失败',
+};
+
+/**
+ * 关卡卡内的地图缩略图区：贴左缘、垂直居中，边长钳在 48–64px
+ * （卡高 64 时 48，84 时 64），永不超出卡片本身。
+ */
+export function cardThumbRect(r: Rect): Rect {
+  const s = Math.min(64, Math.max(48, r.h - 16));
+  return { x: r.x + 10, y: r.y + (r.h - s) / 2, w: s, h: s };
+}
+
+const thumbCache = new Map<number, GameMap>();
+const thumbMap = (seed: number): GameMap => {
+  let m = thumbCache.get(seed);
+  if (!m) {
+    m = generateMap(seed);
+    thumbCache.set(seed, m);
+  }
+  return m;
+};
+
+/** 程序化地形缩略图：复用 generateMap 的地形，矿脉/水域/空地三色。 */
+function drawMapThumb(
+  ctx: CanvasRenderingContext2D,
+  r: Rect,
+  seed: number,
+  dim: boolean,
+): void {
+  const map = thumbMap(seed);
+  const tw = r.w / map.w;
+  const th = r.h / map.h;
+  for (let y = 0; y < map.h; y++) {
+    for (let x = 0; x < map.w; x++) {
+      const t = map.tiles[y * map.w + x];
+      ctx.fillStyle =
+        t === WATER ? '#1d3f6e' : t === ORE ? '#b08428' : '#2e4a25';
+      ctx.fillRect(r.x + x * tw, r.y + y * th, tw + 0.5, th + 0.5);
+    }
+  }
+  ctx.strokeStyle = dim ? 'rgba(255,255,255,0.10)' : BORDER;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+  if (dim) {
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+  }
+}
+
+/** 目标类型小图标（卡片右上角徽标）：全 canvas 路径，无素材。 */
+function drawObjectiveIcon(
+  ctx: CanvasRenderingContext2D,
+  kind: ObjectiveKind,
+  cx: number,
+  cy: number,
+  s: number,
+): void {
+  ctx.strokeStyle = ACCENT;
+  ctx.fillStyle = ACCENT;
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  switch (kind) {
+    case 'destroy': // 准星：圆 + 十字
+      ctx.arc(cx, cy, s * 0.7, 0, Math.PI * 2);
+      ctx.moveTo(cx - s, cy);
+      ctx.lineTo(cx - s * 0.4, cy);
+      ctx.moveTo(cx + s * 0.4, cy);
+      ctx.lineTo(cx + s, cy);
+      ctx.moveTo(cx, cy - s);
+      ctx.lineTo(cx, cy - s * 0.4);
+      ctx.moveTo(cx, cy + s * 0.4);
+      ctx.lineTo(cx, cy + s);
+      ctx.stroke();
+      break;
+    case 'capture': // 旗帜：旗杆 + 三角旗面
+      ctx.moveTo(cx - s * 0.5, cy + s);
+      ctx.lineTo(cx - s * 0.5, cy - s);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(cx - s * 0.5, cy - s);
+      ctx.lineTo(cx + s * 0.8, cy - s * 0.55);
+      ctx.lineTo(cx - s * 0.5, cy - s * 0.1);
+      ctx.closePath();
+      ctx.fill();
+      break;
+    case 'survive': // 盾牌：上平下尖轮廓
+      ctx.moveTo(cx - s * 0.7, cy - s * 0.7);
+      ctx.lineTo(cx + s * 0.7, cy - s * 0.7);
+      ctx.lineTo(cx + s * 0.7, cy);
+      ctx.lineTo(cx, cy + s);
+      ctx.lineTo(cx - s * 0.7, cy);
+      ctx.closePath();
+      ctx.stroke();
+      break;
+    case 'escort': // 箭头：护送方向
+      ctx.moveTo(cx - s, cy);
+      ctx.lineTo(cx + s * 0.7, cy);
+      ctx.moveTo(cx + s * 0.1, cy - s * 0.6);
+      ctx.lineTo(cx + s * 0.7, cy);
+      ctx.lineTo(cx + s * 0.1, cy + s * 0.6);
+      ctx.stroke();
+      break;
+    case 'hold': // 碉堡：垛口方块
+      ctx.rect(cx - s * 0.7, cy - s * 0.4, s * 1.4, s * 1.1);
+      ctx.moveTo(cx - s * 0.7, cy - s * 0.4);
+      ctx.lineTo(cx - s * 0.7, cy - s * 0.7);
+      ctx.lineTo(cx - s * 0.35, cy - s * 0.7);
+      ctx.lineTo(cx - s * 0.35, cy - s * 0.4);
+      ctx.moveTo(cx + s * 0.35, cy - s * 0.4);
+      ctx.lineTo(cx + s * 0.35, cy - s * 0.7);
+      ctx.lineTo(cx + s * 0.7, cy - s * 0.7);
+      ctx.lineTo(cx + s * 0.7, cy - s * 0.4);
+      ctx.stroke();
+      break;
+    case 'eliminate': // 时钟：限时
+      ctx.arc(cx, cy, s * 0.8, 0, Math.PI * 2);
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(cx, cy - s * 0.55);
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + s * 0.4, cy);
+      ctx.stroke();
+      break;
+  }
+}
+
+/** 目标类型：驱动卡片右上角图标与提示/失败条件的通用文案。 */
+export type ObjectiveKind =
+  | 'destroy'
+  | 'capture'
+  | 'survive'
+  | 'escort'
+  | 'hold'
+  | 'eliminate';
+
 export interface MissionCardModel {
   index: number;
   name: string;
@@ -374,6 +529,19 @@ export interface MissionCardModel {
   bestTime?: string;
   /** 未解锁卡片的解锁条件；缺省推导为「通关关卡 N 解锁」。 */
   unlockHint?: string;
+  /**
+   * 地图缩略图种子；缺省与 main.ts 的 MAP_SEED（1337）一致 ——
+   * 全部关卡目前共用同一张种子图，接线层传 def 对应种子即可切换。
+   */
+  seed?: number;
+  /** 首要目标类型，决定图标与通用文案；缺省 'destroy'。 */
+  objectiveKind?: ObjectiveKind;
+  /** 敌军编成一行（e.g. "步兵×8 坦克×2"）；缺省给通用编成文案。 */
+  enemy?: string;
+  /** 战术提示一行；缺省按 objectiveKind 给通用提示。 */
+  hint?: string;
+  /** 失败条件一行；缺省按 objectiveKind 推导。 */
+  fail?: string;
 }
 
 export interface CampaignModel {
@@ -427,38 +595,75 @@ export function drawCampaign(
     ctx.lineWidth = 1;
     ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
 
+    // 左缘：程序化地形缩略图（矿脉/水域/空地）；右上角：目标类型徽标。
+    const thumb = cardThumbRect(r);
+    drawMapThumb(ctx, thumb, m.seed ?? DEFAULT_MAP_SEED, dim);
+    const kind = m.objectiveKind ?? 'destroy';
+    drawObjectiveIcon(ctx, kind, r.x + r.w - 15, r.y + 14, 7);
+
     const pad = 14;
     const side = 92; // 右栏：星级+用时 / 锁，文本行避开不重叠。
-    const textX = r.x + pad;
-    const textW = Math.max(80, r.w - pad * 2 - side);
+    const textX = thumb.x + thumb.w + 10;
+    const textW = Math.max(80, r.x + r.w - pad - side - textX);
     const indent = 20;
     const bodyW = textW - indent;
 
-    // 正文行（卡高 ≥82 给 3 行，否则 2 行）：锁定卡首行写解锁条件，
-    // 目标文案按可用宽度折行（≤2 行，超出省略）；空出行补一行简报。
+    // 正文行：目标描述按宽度折行，随后 敌军编成 / 简报 / 提示 / 失败条件；
+    // 卡高 ≥82 最多 5 行（行距收紧），否则 3 行 —— 空间不足先丢简报、
+    // 再丢提示，敌军与失败条件始终保留。锁定卡首行写解锁条件。
     ctx.font = `12px ${FONT}`;
-    const maxBody = r.h >= 82 ? 3 : 2;
-    const hint = dim
-      ? clampLine(
+    const body: { text: string; color: string }[] = [];
+    const objColor = dim ? TEXT_DIM : TEXT_MAIN;
+    if (dim) {
+      body.push({
+        text: clampLine(
           m.unlockHint ?? (m.index > 0 ? `通关关卡 ${m.index} 解锁` : '未解锁'),
           bodyW,
           measure,
-        )
-      : null;
-    const objCap = Math.max(1, Math.min(2, maxBody - (hint ? 1 : 0)));
-    const objLines = wrapText(m.objective, bodyW, measure, objCap);
-    const body: { text: string; color: string }[] = [];
-    if (hint) body.push({ text: hint, color: 'rgba(255,217,77,0.6)' });
-    if (body.length + objLines.length < maxBody) {
-      body.push({ text: clampLine(m.briefing, bodyW, measure), color: TEXT_DIM });
+        ),
+        color: 'rgba(255,217,77,0.6)',
+      });
+      const maxBody = r.h >= 82 ? 4 : 3;
+      for (const t of wrapText(m.objective, bodyW, measure, Math.min(2, maxBody - 1))) {
+        body.push({ text: t, color: objColor });
+      }
+    } else {
+      const maxBody = r.h >= 82 ? 5 : 3;
+      const objCap = Math.max(1, Math.min(2, maxBody - 3 - (m.briefing ? 1 : 0)));
+      for (const t of wrapText(m.objective, bodyW, measure, objCap)) {
+        body.push({ text: t, color: objColor });
+      }
+      body.push({
+        text: clampLine(`敌军：${m.enemy ?? '步兵与装甲混编'}`, bodyW, measure),
+        color: 'rgba(255,107,93,0.75)',
+      });
+      const briefRow = {
+        text: clampLine(`简报：${m.briefing}`, bodyW, measure),
+        color: TEXT_DIM,
+      };
+      const hintRow = {
+        text: clampLine(`提示：${m.hint ?? HINT_FOR[kind]}`, bodyW, measure),
+        color: 'rgba(255,217,77,0.6)',
+      };
+      const failRow = {
+        text: clampLine(`失败：${m.fail ?? FAIL_FOR[kind]}`, bodyW, measure),
+        color: 'rgba(255,107,93,0.55)',
+      };
+      if (m.briefing) body.push(briefRow);
+      body.push(hintRow, failRow);
+      // 超出行数预算：先丢简报，再丢提示（倒数第二行，末行恒为失败）。
+      while (body.length > maxBody) {
+        const bi = body.indexOf(briefRow);
+        if (bi >= 0) body.splice(bi, 1);
+        else body.splice(body.length - 2, 1);
+      }
     }
-    for (const t of objLines) body.push({ text: t, color: dim ? TEXT_DIM : TEXT_MAIN });
 
-    // 名称行 + 正文行整体垂直居中。
+    // 名称行 + 正文行整体垂直居中；行多时间距微收。
     const nameSize = r.h >= 66 ? 15 : 14;
-    const lineH = 14.5;
+    const lineH = Math.min(14.5, (r.h - nameSize - 6) / Math.max(1, body.length));
     const blockH = nameSize + body.length * lineH;
-    let cy = r.y + Math.max(6, (r.h - blockH) / 2) + nameSize / 2;
+    let cy = r.y + Math.max(4, (r.h - blockH) / 2) + nameSize / 2;
     ctx.textBaseline = 'middle';
     ctx.font = `bold ${nameSize}px ${FONT}`;
     ctx.fillStyle = dim ? TEXT_DIM : ACCENT;

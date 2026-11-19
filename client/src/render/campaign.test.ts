@@ -4,6 +4,7 @@ import {
   campaignHit,
   campaignLayout,
   campaignPageHit,
+  cardThumbRect,
   clampLine,
   missionEndHit,
   missionEndLayout,
@@ -162,6 +163,36 @@ test('campaign 780x380: 2x2 grid of exact rects + back/pager inside', () => {
   assert.deepEqual(p2.pager.prev, { x: 206, y: 282, w: 72, h: 40 });
   assert.equal(p2.pager.next, null);
 });
+
+// 两档布局：780x380 双列与 380x320 单列 —— 卡片不溢出、不与返回/翻页重叠，
+// 且每张卡的地形缩略图区边长合法（48~64px、完整落在卡片内）。
+for (const [w, h] of [
+  [780, 380],
+  [380, 320],
+] as const) {
+  test(`campaign ${w}x${h}: cards + thumbnails never overflow either tier`, () => {
+    for (let page = 0; page < 4; page++) {
+      const l = campaignLayout(w, h, MISSION_COUNT, page);
+      for (const c of l.cards) {
+        assert.ok(inside(c.rect, w, h), 'card inside viewport');
+        assert.ok(!overlaps(c.rect, l.back), 'card clears back button');
+        for (const p of [l.pager.prev, l.pager.next]) {
+          if (p) assert.ok(!overlaps(c.rect, p), 'card clears pager');
+        }
+        const t = cardThumbRect(c.rect);
+        assert.ok(t.w >= 48 && t.w <= 64, `thumb w ${t.w} in [48,64]`);
+        assert.equal(t.w, t.h, 'thumb stays square');
+        assert.ok(
+          t.x >= c.rect.x &&
+            t.y >= c.rect.y &&
+            t.x + t.w <= c.rect.x + c.rect.w &&
+            t.y + t.h <= c.rect.y + c.rect.h,
+          'thumb inside card',
+        );
+      }
+    }
+  });
+}
 
 test('missionEnd 780x380: three buttons side by side, fully inside', () => {
   const l = missionEndLayout(780, 380, true);

@@ -2,6 +2,176 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
+// src/game/grid.ts
+var TILE_SIZE = 32;
+var GRASS = 0;
+var WATER = 1;
+var ORE = 2;
+
+// src/game/pathfind.ts
+var ROAD = 3;
+var TERRAIN_COSTS = {
+  [ROAD]: 0.6,
+  [GRASS]: 1,
+  [ORE]: 3,
+  [WATER]: Infinity
+};
+var COST_GRASS = TERRAIN_COSTS[GRASS];
+var MIN_TERRAIN_COST = Math.min(TERRAIN_COSTS[ROAD], COST_GRASS, TERRAIN_COSTS[ORE]);
+
+// src/game/units.ts
+var UNIT_STATS = {
+  infantry: { hp: 50, speed: 70, cost: 100, buildTime: 4, radius: 9, canHarvest: false },
+  tank: { hp: 400, speed: 55, cost: 800, buildTime: 12, radius: 11, canHarvest: false },
+  harvester: { hp: 300, speed: 35, cost: 1400, buildTime: 20, radius: 12, canHarvest: true }
+};
+var UNIT_RADIUS = UNIT_STATS.infantry.radius;
+var INFANTRY_SPEED = UNIT_STATS.infantry.speed;
+
+// src/game/upgrades.ts
+var stock = (effect) => ({
+  level: 1,
+  label: "\u57FA\u7840",
+  cost: 0,
+  time: 0,
+  effect,
+  multiplier: 1,
+  needsPower: false
+});
+var UPGRADE_TABLE = {
+  hq: {
+    1: stock("armor"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 800, time: 15, effect: "armor", multiplier: 1.25, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 1500, time: 25, effect: "armor", multiplier: 1.5, needsPower: true }
+  },
+  barracks: {
+    1: stock("production"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 300, time: 12, effect: "production", multiplier: 1.25, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 600, time: 20, effect: "production", multiplier: 1.5, needsPower: true }
+  },
+  refinery: {
+    1: stock("production"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 1e3, time: 18, effect: "production", multiplier: 1.5, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 2e3, time: 30, effect: "production", multiplier: 2, needsPower: true }
+  },
+  power: {
+    1: stock("production"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 200, time: 8, effect: "production", multiplier: 1.5, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 400, time: 15, effect: "production", multiplier: 2, needsPower: true }
+  },
+  turret: {
+    1: stock("range"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 400, time: 12, effect: "range", multiplier: 1.25, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 800, time: 20, effect: "range", multiplier: 1.5, needsPower: true }
+  },
+  wall: {
+    1: stock("armor"),
+    2: { level: 2, label: "\u5F3A\u5316", cost: 50, time: 4, effect: "armor", multiplier: 1.5, needsPower: true },
+    3: { level: 3, label: "\u7CBE\u82F1", cost: 100, time: 8, effect: "armor", multiplier: 2, needsPower: true }
+  }
+};
+
+// src/game/buildings.ts
+var RADAR_SCAN = { radius: 12 * TILE_SIZE, period: 5 };
+
+// src/game/unitRoles.ts
+var ROLE_STATS = {
+  rocket: {
+    hp: 80,
+    speed: 45,
+    range: 140,
+    damage: 60,
+    cost: 300,
+    buildTime: 8,
+    sight: 160,
+    armor: "infantry",
+    weapon: "rocket",
+    canAttack: true,
+    canCapture: false,
+    canRepair: false,
+    rare: false,
+    requires: ["barracks"]
+  },
+  engineer: {
+    hp: 40,
+    speed: 65,
+    range: 0,
+    damage: 0,
+    cost: 500,
+    buildTime: 10,
+    sight: 120,
+    armor: "infantry",
+    weapon: null,
+    canAttack: false,
+    canCapture: true,
+    canRepair: true,
+    rare: true,
+    requires: ["barracks"]
+  },
+  scout: {
+    hp: 30,
+    speed: 110,
+    range: 90,
+    damage: 8,
+    cost: 200,
+    buildTime: 5,
+    sight: 260,
+    armor: "infantry",
+    weapon: "bullet",
+    canAttack: true,
+    canCapture: false,
+    canRepair: false,
+    rare: true,
+    requires: ["barracks"]
+  }
+};
+
+// src/game/balance.ts
+var BALANCE = {
+  infantry: { hp: 50, dmg: 8, range: 90, cooldown: 0.8, speed: 70, cost: 100, buildTime: 4 },
+  tank: { hp: 400, dmg: 40, range: 120, cooldown: 1.4, speed: 55, cost: 800, buildTime: 12 },
+  harvester: { hp: 300, dmg: 0, range: 0, cooldown: 0, speed: 35, cost: 1400, buildTime: 20 }
+};
+var BUILDING_BALANCE = {
+  hq: { w: 4, h: 3, hp: 2e3, cost: 2500, buildTime: 40 },
+  barracks: { w: 3, h: 2, hp: 800, cost: 500, buildTime: 15 },
+  refinery: { w: 4, h: 3, hp: 1200, cost: 2e3, buildTime: 25 },
+  power: { w: 2, h: 2, hp: 400, cost: 300, buildTime: 8 },
+  turret: { w: 2, h: 2, hp: 700, cost: 700, buildTime: 12 },
+  wall: { w: 1, h: 1, hp: 500, cost: 100, buildTime: 4 }
+};
+var WAVE_BALANCE = {
+  interval: 30,
+  // seconds between waves
+  size: 4,
+  // enemies in the first wave
+  growth: 2,
+  // additional enemies per wave
+  max: 30
+  // hard cap on wave size
+};
+var BALANCE_TABLE = {
+  ...BALANCE,
+  buildings: BUILDING_BALANCE,
+  waves: WAVE_BALANCE
+};
+
+// src/game/enemyAI.ts
+var AI_CONTACT_RANGE = ROLE_STATS.scout.sight;
+var AI_DENSITY_RADIUS = 6 * TILE_SIZE;
+var EXPAND_WANT = {
+  refinery: [1, 1, 1, 2, 2, 2, 2],
+  barracks: [0, 1, 1, 1, 1, 2, 2],
+  turret: [0, 0, 1, 1, 2, 2, 3]
+};
+var EXPAND_MAX_LEVEL = EXPAND_WANT.refinery.length - 1;
+
+// src/game/save.ts
+var MAX_SAFE = Number.MAX_SAFE_INTEGER;
+
+// src/game/replayStore.ts
+var REPLAY_MAX_BYTES = 256 * 1024;
+
 // src/render/campaign.ts
 var CARD_GAP = 12;
 var CARD_MIN_H = 64;
@@ -152,6 +322,10 @@ function wrapText(text, maxW, measure, maxLines = 2) {
   }
   return lines;
 }
+function cardThumbRect(r) {
+  const s = Math.min(64, Math.max(48, r.h - 16));
+  return { x: r.x + 10, y: r.y + (r.h - s) / 2, w: s, h: s };
+}
 
 // src/render/campaign.test.ts
 var VIEWPORTS = [
@@ -291,6 +465,30 @@ test("campaign 780x380: 2x2 grid of exact rects + back/pager inside", () => {
   assert.deepEqual(p2.pager.prev, { x: 206, y: 282, w: 72, h: 40 });
   assert.equal(p2.pager.next, null);
 });
+for (const [w, h] of [
+  [780, 380],
+  [380, 320]
+]) {
+  test(`campaign ${w}x${h}: cards + thumbnails never overflow either tier`, () => {
+    for (let page = 0; page < 4; page++) {
+      const l = campaignLayout(w, h, MISSION_COUNT, page);
+      for (const c of l.cards) {
+        assert.ok(inside(c.rect, w, h), "card inside viewport");
+        assert.ok(!overlaps(c.rect, l.back), "card clears back button");
+        for (const p of [l.pager.prev, l.pager.next]) {
+          if (p) assert.ok(!overlaps(c.rect, p), "card clears pager");
+        }
+        const t = cardThumbRect(c.rect);
+        assert.ok(t.w >= 48 && t.w <= 64, `thumb w ${t.w} in [48,64]`);
+        assert.equal(t.w, t.h, "thumb stays square");
+        assert.ok(
+          t.x >= c.rect.x && t.y >= c.rect.y && t.x + t.w <= c.rect.x + c.rect.w && t.y + t.h <= c.rect.y + c.rect.h,
+          "thumb inside card"
+        );
+      }
+    }
+  });
+}
 test("missionEnd 780x380: three buttons side by side, fully inside", () => {
   const l = missionEndLayout(780, 380, true);
   assert.deepEqual(
