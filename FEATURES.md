@@ -202,3 +202,26 @@
 - [x] F1105 新手引导覆盖新系统：onboarding.ts 四步引导扩到「采矿 → 建兵营 → 出兵 → 建炮塔防守 → 摧毁敌基地」，并把引导文案与真实快捷键（空格暂停、1-9 编队、H 帮助、右键集结点）对齐，引导在战役与遭遇战都能触发且可跳过；balance.ts 补一致性校验（科技前置链成本单调、克制矩阵对称性、难度倍率单调），纯逻辑可测，不改旧签名｜verify: bash scripts/build-tests.sh && node --test client/src/game/onboarding.test.js && node --test client/src/game/balance.test.js && (cd client && npx tsc --noEmit)｜risk: low
 - [x] F1106 排行榜浮层遮挡菜单按钮：实测 780×380 视口下 main.ts 的排行榜面板（左下半透明黑框）压住「回放」按钮，玩家点回放时会被浮层覆盖。改成浮层按可用空间避让：宽度不足时折叠为一行小字或收进按钮列之外，保证主菜单所有按钮矩形内没有任何浮层覆盖，并让浮层命中测试（若支持点击）优先于/让位于按钮；桌面尺寸行为不变｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client && bash scripts/build-tests.sh && node --test client/src/render/menu.test.js｜risk: low
 - [x] F1107 快捷键冲突与引导文案截断：线上实测底部生产面板把热键 E 同时给了「矿车」和「电厂」（按 E 行为不确定，属逻辑死路），新手引导条正文被省略号截断看不全。修 hotkeys.ts 键位表去重并加一次性冲突校验（validateHotkeys 返回冲突列表，开发期断言为空），生产面板的键位改由同一张表驱动；引导条正文按可用宽度折行（最多 3 行）或滚动，全文可见｜verify: bash scripts/build-tests.sh && node --test client/src/game/hotkeys.test.js && (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: med
+
+## M11 并行车道批（2026-11-19 00:35 UTC）— 线上真机走查后的可读性收口 + 内容/服务端纵深
+
+> 现状判断（本轮 00:22 UTC 用真实浏览器在 780×380 视口走查线上 https://openfolio.uk/redalert/ 得到，均为玩家可见缺陷）：
+> ① 局内左上信息条把两个不同量纲的数值挤成一行「资金: 0/6   5000」，玩家分不清哪个是人口、哪个是资金；
+> ② 新手引导正文按像素硬断行，出现「没有经 / 济就…」这种把词切断的换行；
+> ③ 底部建造栏给「矿车」标的禁用原因是「需要兵营」，但生产系统里 `requirementsFor('harvester')` 是 `['refinery']`，
+>    「坦克」同样一律「需要兵营」，而「电厂」卡连热键字母都没画 —— 玩家照提示建完兵营，矿车仍旧造不出来，是逻辑死路；
+> ④ 主菜单排行榜每行渲染成「#1 遭遇 匿名 *0 1条 01:24」，字段错位，看不出名次/难度/用时；
+> ⑤ 建造栏、引导条、小地图在 780×380 下彼此贴边，容易互相压住。
+> 本批 F1201 是**唯一**允许改 `client/src/main.ts`、`client/src/render/hud.ts`、`client/index.html` 的车道；
+> 其余九条各自独占列出的文件，只加不改旧导出签名、不改 FEATURES.md、不互相 import 对方新增符号。
+
+- [ ] F1201 HUD 可读性收口：① 顶栏拆分标签（人口 6/6、资金 5000、建筑 1 各自带标签与竖线分隔，数值不再粘连）；② 引导条/消息按 CJK 字符宽度折行（不在词中间断开，最多 3 行，末尾可省略）；③ 建造栏禁用原因改用生产系统真实前置（矿车→矿厂、坦克→重工或兵营、电厂→无需前置），并按 hotkeys 表统一给每张卡画热键字母（含电厂）；④ 780×380、1024×768、1440×900 三档下建造栏/引导条/小地图互不重叠。唯一允许改 main.ts / render/hud.ts / client/index.html｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client && bash scripts/build-tests.sh && node --test client/src/render/hud.test.js && node --test client/src/game/hotkeys.test.js｜risk: med
+- [ ] F1202 单位状态可读性：render/units.ts 为选中单位加编队号徽标（读现有 group/编队字段，缺省不画）、血条旁血量数值、受击闪白与低血抖动、载具炮塔朝向与履带痕迹、被攻击目标连线；drawUnits / drawUnitBody / drawUnitsColored 签名不变｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F1203 建造反馈可读性：render/buildings.ts 给放置预览按合法性着色并在预览框上写原因（占用/资金/地形）、在建建筑显示百分比进度、受损分级裂纹与冒烟、炮塔画出射界弧；drawBuildings / drawPlacementPreview 签名不变｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F1204 菜单与结算可读性：render/menu.ts 修正排行榜每行字段（名次 · 难度 · 用时 · 得分，去掉「*0 1条」这种错位拼接）、设置页加音效/音乐音量步进与 FPS 开关两项、结算页给新纪录加徽标；780×380 与 1440×900 下按钮与文字不溢出、不重叠｜verify: bash scripts/build-tests.sh && node --test client/src/render/menu.test.js && (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F1205 战役界面可读性：render/campaign.ts 的关卡卡片给未解锁关卡置灰并写解锁条件、显示星级与最佳用时、目标文案按可用宽度折行不重叠；任务结算页 retry/next/menu 三键在 780×380 下完整可见｜verify: bash scripts/build-tests.sh && node --test client/src/render/campaign.test.js && (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F1206 音频总线：audio/sfx.ts 与 audio/music.ts 加 master/sfx/music 三级音量、同类音效 40ms 内合并限流、远离视口的音效按距离衰减、静音与音量写入注入的 storage 并跨局保持；BGM 场景切换交叉淡入淡出，全部振荡器合成无外部素材｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F1207 排行榜服务端纵深：server/scoreboard.js 与 server/api.js 校验 score（0..1000000 整数）与 duration（0..86400 秒）、支持 ?difficulty=&limit= 筛选且 limit 上限 50、同一 IP 简单限流、内存表超上限按分数淘汰；/api/* 与 /redalert/api/* 双前缀行为一致并补测试｜verify: node --test server/scoreboard.test.js && node --test server/routes.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F1208 战役内容扩充：game/missions.ts 与 game/campaign.ts 新增两关（限时防守关、歼灭/护送关）与新的目标类型（守住 N 秒、护送单位到点、限时歼灭），带目标提示文案与失败条件；关卡列表由战役 UI 自动读取，旧关卡与旧导出签名不变并补用例｜verify: bash scripts/build-tests.sh && node --test client/src/game/missions.test.js && node --test client/src/game/campaign.test.js && (cd client && npx tsc --noEmit)｜risk: med
+- [ ] F1209 战场氛围细化：render/fog.ts 记忆层边缘柔化与可见区平滑、render/weather.ts 天气叠层避开 HUD 区且雨丝随相机偏移、render/effects.ts 爆炸烟尘与弹道拖尾分层；导出签名不变｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
+- [ ] F1210 地形与矿脉表现：render/terrain.ts 与 render/textures.ts 加矿脉储量可视化（枯竭变暗、富矿高光）、土路与地基过渡、水岸波光与岸线阴影，预渲染路径（prerenderMap/prerenderGrid）不变｜verify: (cd client && npx tsc --noEmit) && npm run build -w redalert-client｜risk: low
