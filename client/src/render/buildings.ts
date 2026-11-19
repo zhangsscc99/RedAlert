@@ -5,6 +5,7 @@ import {
   BUILDING_DEFS,
   TILE_SIZE,
   UNIT_STATS,
+  rangeAtLevel,
   worldToScreen,
   type BuildingKind,
   type Camera,
@@ -42,6 +43,27 @@ let lastFrameT = 0;
 const NEUTRAL_AIM = -Math.PI / 2; // barrel rests pointing up
 const TURN_RATE = 3.2; // rad/s toward target
 const COLLAPSE_T = 0.4; // seconds for the completion snap animation
+
+// Damage readability tiers: nothing above DMG_CRACK, cracks below it, and
+// cracks + smoke + flickering flames below DMG_BURN. The hp bar shades
+// green / yellow / red across the same boundaries.
+const DMG_CRACK = 2 / 3;
+const DMG_BURN = 1 / 3;
+
+/** Short labels for placement-failure codes a caller may pass through. */
+const PLACE_REASON_TEXT: Record<string, string> = {
+  overlap: '位置被占用',
+  occupied: '位置被占用',
+  funds: '资金不足',
+  cost: '资金不足',
+  water: '地形不可建',
+  terrain: '地形不可建',
+  oob: '超出地图边界',
+  base: '需靠基地',
+  'near-base': '需靠基地',
+  adjacency: '需靠基地',
+  distance: '需靠基地',
+};
 
 /** Deterministic 0..1 hash — cheap pseudo-random for particles/jitter. */
 function hash(n: number): number {
@@ -268,6 +290,41 @@ function drawCrane(
   }
 }
 
+/**
+ * Faint firing envelope for an armed building: a dashed reach circle, plus a
+ * brighter wedge marking the arc the barrel currently covers when `aim` is
+ * known. Barely visible idle so it never fights the scene; clearly readable
+ * once the caller flags the building `selected`.
+ */
+function drawRangeArc(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  r: number,
+  aim: number | null,
+  selected: boolean,
+  enemy: boolean,
+): void {
+  const rgb = enemy ? '255, 120, 95' : '150, 230, 150';
+  const a = selected ? 0.5 : 0.09;
+  ctx.save();
+  ctx.strokeStyle = `rgba(${rgb}, ${a})`;
+  ctx.lineWidth = selected ? 1.5 : 1;
+  ctx.setLineDash([6, 6]);
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  if (aim !== null) {
+    ctx.strokeStyle = `rgba(${rgb}, ${Math.min(1, a + 0.18)})`;
+    ctx.lineWidth = selected ? 2.5 : 1.5;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, aim - 0.5, aim + 0.5);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
 /** One-time white flash + expanding ring right after construction finishes. */
 function drawCompletionBurst(
   ctx: CanvasRenderingContext2D,
@@ -284,9 +341,9 @@ function drawCompletionBurst(
 }
 
 /**
- * Jagged crack decals in three damage tiers, deterministic per building id:
- * light (>55%) thin hairlines, medium (>30%) wider cracks + spall chips,
- * heavy deep fissures with scorched patches around them.
+ * Jagged crack decals in two damage tiers, deterministic per building id:
+ * medium (below DMG_CRACK) wider cracks + spall chips, heavy (below
+ * DMG_BURN) deep fissures with scorched patches around them.
  */
 function drawCracks(
   ctx: CanvasRenderingContext2D,
@@ -297,7 +354,7 @@ function drawCracks(
   h: number,
   ratio: number,
 ): void {
-  const tier = ratio < 0.3 ? 2 : ratio < 0.55 ? 1 : 0;
+  const tier = ratio < DMG_BURN ? 2 : 1;
   const cracks = 2 + tier * 2;
   const segs = 3 + tier;
   // Heavy tier: charred spall patches behind the fissures.
@@ -573,7 +630,9 @@ export function drawBuildings(
     ctx.font = `${Math.max(9, Math.round(11 * cam.zoom))}px ui-monospace, Menlo, Consolas, monospace`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(d.label.toUpperCase(), s.x + w / 2, s.y + h / 2);
+    // While under construction the label rides high so the % readout can sit
+    // inside the progress ring at the footprint's center.
+    ctx.fillText(d.label.toUpperCase(), s.x + w / 2, s.y + (b.done ? h / 2 : h * 0.22));
     ctx.textAlign = 'left';
     ctx.textBaseline = 'alphabetic';
 
@@ -586,7 +645,21 @@ export function drawBuildings(
       ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
       ctx.fillRect(s.x, s.y, w, h * (1 - pct));
       drawScaffold(ctx, s.x, s.y, w, h, Math.max(3, 4 * cam.zoom));
-      drawProgressRing(ctx, s.x + w / 2, s.y + h / 2, Math.min(w, h) * 0.3, pct);
+      const ringR = Math.min(w, h) * 0.3;
+      drawProgressRing(ctx, s.x + w / 2, s.y + h / 2, ringR, pct);
+      // Numeric readout inside the ring — outlined so it stays legible over
+      // any body color and the darkening not-yet-built overlay.
+      const pctLabel = `${Math.round(pct * 100)}%`;
+      ctx.font = `${Math.max(8, Math.min(Math.round(11 * cam.zoom), Math.round(ringR * 0.8)))}px ui-monospace, Menlo, Consolas, monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = 'rgba(0, 0, 0, 0.75)';
+      ctx.strokeText(pctLabel, s.x + w / 2, s.y + h / 2);
+      ctx.fillStyle = PROGRESS;
+      ctx.fillText(pctLabel, s.x + w / 2, s.y + h / 2);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
       drawCrane(ctx, s.x, s.y, w, now, b.id, pct);
     } else if (collapsing && finishT !== undefined) {
       // One short snap: scaffold pulls in + a fading white flash.
@@ -612,22 +685,34 @@ export function drawBuildings(
       }
     }
 
+    // Armed buildings telegraph their reach: a faint dashed range circle
+    // (plus a wedge along the barrel's bearing for turrets). `b.range` wins
+    // when populated; otherwise fall back to the level-scaled def range.
+    const range = b.range > 0 ? b.range : rangeAtLevel(b.kind, b.level ?? 1);
+    const aim = b.kind === 'turret' && b.done ? aimAngle(b, dt) : null;
+    if (b.done && b.hp > 0 && range > 0) {
+      const sel = (b as GBuilding & { selected?: boolean }).selected === true;
+      drawRangeArc(ctx, s.x + w / 2, s.y + h / 2, range * cam.zoom, aim, sel, b.team === 'enemy');
+    }
+
     if (b.kind === 'turret' && b.done) {
       const raw = b.cooldownMax > 0 ? Math.max(0, Math.min(1, b.cooldown / b.cooldownMax)) : 0;
       const recoil = raw * raw; // spring back fast, settle slow
-      drawTurret(ctx, s.x + w / 2, s.y + h / 2, Math.min(w, h) * 0.42, aimAngle(b, dt), b.team === 'enemy', recoil);
+      drawTurret(ctx, s.x + w / 2, s.y + h / 2, Math.min(w, h) * 0.42, aim ?? NEUTRAL_AIM, b.team === 'enemy', recoil);
     }
 
     if (b.done && b.hp > 0) {
-      if (ratio < 0.85) drawCracks(ctx, b.id, s.x, s.y, w, h, ratio);
-      if (ratio < 0.4) drawDamage(ctx, b, s.x, s.y, w, h, ratio, now);
-      if (ratio < 0.15) drawFlames(ctx, b.id, s.x, s.y, w, h, now);
+      if (ratio < DMG_CRACK) drawCracks(ctx, b.id, s.x, s.y, w, h, ratio);
+      if (ratio < DMG_BURN) {
+        drawDamage(ctx, b, s.x, s.y, w, h, ratio, now);
+        drawFlames(ctx, b.id, s.x, s.y, w, h, now);
+      }
     }
 
     if (b.hp < b.maxHp) {
       ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
       ctx.fillRect(s.x + 3, s.y + 2, w - 6, 4);
-      ctx.fillStyle = ratio > 0.4 ? '#5dff5d' : '#ff6b5e';
+      ctx.fillStyle = ratio > DMG_CRACK ? '#5dff5d' : ratio > DMG_BURN ? '#ffd94d' : '#ff6b5e';
       ctx.fillRect(s.x + 3, s.y + 2, Math.max(0, (w - 6) * ratio), 4);
     }
 
@@ -637,7 +722,13 @@ export function drawBuildings(
   }
 }
 
-/** Grid-snapped ghost of a footprint: green when legal + affordable, red otherwise. */
+/**
+ * Grid-snapped ghost of a footprint: green outline + translucent fill when
+ * legal, red outline + diagonal hatching when not. A reason chip sits above
+ * the box — a caller-supplied failure code (`reason`) is mapped to a short
+ * label, an unrecognized non-empty string is shown verbatim, and absent one
+ * the chip falls back to 可放置 / 不可放置 by `ok`.
+ */
 export function drawPlacementPreview(
   ctx: CanvasRenderingContext2D,
   cam: Camera,
@@ -645,17 +736,55 @@ export function drawPlacementPreview(
   gx: number,
   gy: number,
   ok: boolean,
+  reason?: string,
 ): void {
   const d = BUILDING_DEFS[kind];
   const s = worldToScreen(cam, gx * TILE_SIZE, gy * TILE_SIZE);
   const w = d.w * TILE_SIZE * cam.zoom;
   const h = d.h * TILE_SIZE * cam.zoom;
 
-  ctx.fillStyle = ok ? 'rgba(93, 255, 93, 0.25)' : 'rgba(255, 80, 60, 0.25)';
+  ctx.fillStyle = ok ? 'rgba(93, 255, 93, 0.25)' : 'rgba(255, 80, 60, 0.10)';
   ctx.fillRect(s.x, s.y, w, h);
+
+  if (!ok) {
+    // Diagonal hatch — "blocked" stays readable for colorblind players too.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(s.x, s.y, w, h);
+    ctx.clip();
+    ctx.strokeStyle = 'rgba(255, 80, 60, 0.5)';
+    ctx.lineWidth = 1;
+    const step = Math.max(6, 8 * cam.zoom);
+    for (let off = -h; off < w; off += step) {
+      ctx.beginPath();
+      ctx.moveTo(s.x + off, s.y);
+      ctx.lineTo(s.x + off + h, s.y + h);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
   ctx.strokeStyle = ok ? '#5dff5d' : '#ff5040';
   ctx.lineWidth = 2;
   ctx.strokeRect(s.x + 1, s.y + 1, w - 2, h - 2);
+
+  let text: string;
+  if (reason && Object.hasOwn(PLACE_REASON_TEXT, reason)) text = PLACE_REASON_TEXT[reason];
+  else if (reason) text = reason;
+  else text = ok ? '可放置' : '不可放置';
+  const size = Math.max(10, Math.round(11 * cam.zoom));
+  ctx.font = `${size}px ui-monospace, Menlo, Consolas, monospace`;
+  const tw = ctx.measureText(text).width + 8;
+  const bh = size + 6;
+  const by = s.y - bh - 3 < 0 ? s.y + 3 : s.y - bh - 3;
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+  ctx.fillRect(s.x + w / 2 - tw / 2, by, tw, bh);
+  ctx.fillStyle = ok ? '#8dff8d' : '#ff9a86';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, s.x + w / 2, by + bh / 2);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
 }
 
 /** Same body/facing style as drawUnits, but tinted — used for enemy units. */
