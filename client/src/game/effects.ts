@@ -11,7 +11,12 @@ export type EffectKind =
   | 'crater'
   | 'debris'
   | 'shockwave'
-  | 'smoke';
+  | 'smoke'
+  | 'smokeColumn'
+  | 'dust';
+
+/** Weapon class for a tracer: light arms vs heavy cannons/rockets. */
+export type TracerTier = 'light' | 'heavy';
 
 export interface Effect {
   kind: EffectKind;
@@ -21,12 +26,16 @@ export interface Effect {
   vy: number; // world px/s velocity (tracer: end point y instead)
   ttl: number; // seconds of life total
   age: number; // seconds elapsed
-  size: number; // world px (explosion max radius / text size)
+  size: number; // world px (explosion max radius / text size / tracer width)
   text?: string; // damageText glyph
+  tier?: TracerTier; // tracer only; undefined treated as 'light'
 }
 
 export const EXPLOSION_TTL = 0.6;
-export const TRACER_TTL = 0.15;
+export const TRACER_TTL = 0.15; // light weapons
+export const TRACER_HEAVY_TTL = 0.28; // heavy ordnance lingers longer
+export const TRACER_LIGHT_WIDTH = 1; // px line width hint stored in `size`
+export const TRACER_HEAVY_WIDTH = 3;
 export const DAMAGE_TEXT_TTL = 1.0;
 export const DAMAGE_TEXT_RISE = 24; // px/s upward drift
 export const SHOCKWAVE_TTL = 0.5;
@@ -34,6 +43,11 @@ export const DEBRIS_TTL = 1.2;
 export const DEBRIS_GRAVITY = 220; // px/s^2 pulling debris back down
 export const SMOKE_TTL = 2.4;
 export const SMOKE_RISE = 14; // px/s upward drift
+export const SMOKE_COLUMN_TTL = 3.2; // explosion plume lives longer than a puff
+export const SMOKE_COLUMN_RISE = 26; // px/s — faster climb than damage smoke
+export const DUST_TTL = 1.8; // collapse dust settles quicker than smoke
+export const DUST_RISE = 8; // px/s slow upward drift before settling
+export const COLLAPSE_DEBRIS_TTL = 1.6; // building chunks fly further than unit debris
 export const CRATER_TTL_MIN = 8;
 export const CRATER_TTL_MAX = 15;
 export const CRATER_FADE = 2; // last N seconds of a crater fade out
@@ -60,8 +74,26 @@ export function spawnExplosion(list: Effect[], x: number, y: number, size = 24):
  * A tracer is a short-lived line from (x1,y1) to (x2,y2). The end point is
  * stored in vx/vy (as absolute coordinates, not velocity): tracers do not move.
  */
-export function spawnTracer(list: Effect[], x1: number, y1: number, x2: number, y2: number): Effect {
-  return push(list, { kind: 'tracer', x: x1, y: y1, vx: x2, vy: y2, ttl: TRACER_TTL, age: 0, size: 0 });
+export function spawnTracer(
+  list: Effect[],
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  tier: TracerTier = 'light',
+): Effect {
+  const heavy = tier === 'heavy';
+  return push(list, {
+    kind: 'tracer',
+    x: x1,
+    y: y1,
+    vx: x2,
+    vy: y2,
+    ttl: heavy ? TRACER_HEAVY_TTL : TRACER_TTL,
+    age: 0,
+    size: heavy ? TRACER_HEAVY_WIDTH : TRACER_LIGHT_WIDTH,
+    tier,
+  });
 }
 
 export function spawnDamageText(list: Effect[], x: number, y: number, amount: number): Effect {
@@ -121,6 +153,50 @@ export function spawnSmoke(list: Effect[], x: number, y: number, size = 10): Eff
     age: 0,
     size,
   });
+}
+
+/**
+ * Explosion smoke column: a dense plume that climbs fast, swells wide, and
+ * fades out over its whole life. Rendered as stacked, growing puffs.
+ */
+export function spawnSmokeColumn(list: Effect[], x: number, y: number, size = 14): Effect {
+  return push(list, {
+    kind: 'smokeColumn',
+    x,
+    y,
+    vx: 0,
+    vy: -SMOKE_COLUMN_RISE,
+    ttl: SMOKE_COLUMN_TTL,
+    age: 0,
+    size,
+  });
+}
+
+/**
+ * Collapse dust: a lazy tan puff drifting outward at (vx,vy), swelling and
+ * fading as it settles. Much slower rise than smoke.
+ */
+export function spawnDust(list: Effect[], x: number, y: number, vx = 0, vy = -DUST_RISE, size = 12): Effect {
+  return push(list, { kind: 'dust', x, y, vx, vy, ttl: DUST_TTL, age: 0, size });
+}
+
+/**
+ * Building collapse burst: heavy rubble chunks on long ballistic arcs plus a
+ * ring of settling dust and a lingering smoke column. Deterministic spread
+ * via the golden-angle table, same as `effectsFromCombatEvents`.
+ */
+export function spawnBuildingCollapse(list: Effect[], x: number, y: number, size = 40): Effect[] {
+  for (let i = 0; i < 6; i++) {
+    const v = debrisVelocity(i + 2, 120);
+    const d = spawnDebris(list, x, y, v.vx, v.vy, 3 + (i % 3));
+    d.ttl = COLLAPSE_DEBRIS_TTL;
+  }
+  for (let i = 0; i < 5; i++) {
+    const angle = i * 2.399963229728653 + 0.4;
+    spawnDust(list, x, y, Math.cos(angle) * 16, -DUST_RISE, size * 0.3 + (i % 3) * 2);
+  }
+  spawnSmokeColumn(list, x, y - size * 0.4, size * 0.4);
+  return list;
 }
 
 /**

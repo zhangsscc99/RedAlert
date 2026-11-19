@@ -4,23 +4,33 @@ import {
   aliveCount,
   effectsFromCombatEvents,
   screenShake,
+  spawnBuildingCollapse,
   spawnCrater,
   spawnDamageText,
   spawnDebris,
+  spawnDust,
   spawnExplosion,
   spawnShockwave,
   spawnSmoke,
+  spawnSmokeColumn,
   spawnTracer,
   updateEffects,
+  COLLAPSE_DEBRIS_TTL,
   CRATER_TTL_MAX,
   CRATER_TTL_MIN,
   DEBRIS_GRAVITY,
   DEBRIS_TTL,
+  DUST_TTL,
   EXPLOSION_TTL,
   MAX_EFFECTS,
   SHAKE_MAX,
   SHOCKWAVE_TTL,
+  SMOKE_COLUMN_RISE,
+  SMOKE_COLUMN_TTL,
   SMOKE_TTL,
+  TRACER_HEAVY_TTL,
+  TRACER_HEAVY_WIDTH,
+  TRACER_LIGHT_WIDTH,
   TRACER_TTL,
   DAMAGE_TEXT_RISE,
   type Effect,
@@ -156,6 +166,87 @@ test('shockwave and smoke expire on their own ttls', () => {
   assert.ok(s.y < 0); // smoke drifts upward
   updateEffects(list, SMOKE_TTL);
   assert.equal(list.length, 0);
+});
+
+test('smoke column climbs each tick and is recycled at its ttl', () => {
+  const list: Effect[] = [];
+  const c = spawnSmokeColumn(list, 0, 100, 14);
+  assert.equal(c.kind, 'smokeColumn');
+  assert.equal(c.ttl, SMOKE_COLUMN_TTL);
+  const y0 = c.y;
+  updateEffects(list, 0.5);
+  assert.ok(c.y < y0); // rises
+  assert.equal(c.y, y0 - SMOKE_COLUMN_RISE * 0.5);
+  const y1 = c.y;
+  updateEffects(list, 0.5);
+  assert.ok(c.y < y1); // keeps climbing on schedule
+  updateEffects(list, SMOKE_COLUMN_TTL);
+  assert.equal(list.length, 0); // fully recycled
+});
+
+test('smoke column outlives a damage smoke puff', () => {
+  const list: Effect[] = [];
+  spawnSmoke(list, 0, 0);
+  spawnSmokeColumn(list, 0, 0);
+  updateEffects(list, SMOKE_TTL + 0.01);
+  assert.equal(aliveCount(list, 'smoke'), 0);
+  assert.equal(aliveCount(list, 'smokeColumn'), 1);
+});
+
+test('building collapse spawns rubble debris, dust, and a smoke column', () => {
+  const list: Effect[] = [];
+  const out = spawnBuildingCollapse(list, 40, 60, 40);
+  assert.equal(out, list);
+  assert.equal(aliveCount(list, 'debris'), 6);
+  assert.equal(aliveCount(list, 'dust'), 5);
+  assert.equal(aliveCount(list, 'smokeColumn'), 1);
+  // Rubble chunks fly longer than unit debris.
+  for (const e of list) if (e.kind === 'debris') assert.equal(e.ttl, COLLAPSE_DEBRIS_TTL);
+  const col = list.find((e) => e.kind === 'smokeColumn')!;
+  assert.ok(col.y < 60); // plume starts above the collapse point
+});
+
+test('collapse dust drifts outward, rises slowly, and settles on its ttl', () => {
+  const list: Effect[] = [];
+  const d = spawnDust(list, 10, 50, 16);
+  assert.equal(d.kind, 'dust');
+  assert.equal(d.ttl, DUST_TTL);
+  updateEffects(list, 0.5);
+  assert.ok(d.x > 10); // pushed outward
+  assert.ok(d.y < 50); // drifts up a little
+  updateEffects(list, DUST_TTL);
+  assert.equal(list.length, 0);
+});
+
+test('tracer tiers: heavy is wider, longer-lived, and tagged', () => {
+  const list: Effect[] = [];
+  const light = spawnTracer(list, 0, 0, 10, 10);
+  const heavy = spawnTracer(list, 0, 0, 10, 10, 'heavy');
+  assert.equal(light.tier, 'light');
+  assert.equal(heavy.tier, 'heavy');
+  assert.equal(light.size, TRACER_LIGHT_WIDTH);
+  assert.equal(heavy.size, TRACER_HEAVY_WIDTH);
+  assert.equal(light.ttl, TRACER_TTL);
+  assert.equal(heavy.ttl, TRACER_HEAVY_TTL);
+  assert.ok(heavy.ttl > light.ttl);
+  assert.ok(heavy.size > light.size);
+  updateEffects(list, TRACER_TTL + 0.01);
+  assert.equal(aliveCount(list, 'tracer'), 1); // light expired, heavy remains
+  assert.equal(list[0].tier, 'heavy');
+  updateEffects(list, TRACER_HEAVY_TTL);
+  assert.equal(list.length, 0);
+});
+
+test('particle count stays bounded under repeated collapse spam', () => {
+  const list: Effect[] = [];
+  for (let i = 0; i < 100; i++) spawnBuildingCollapse(list, i, 0);
+  assert.ok(list.length <= MAX_EFFECTS);
+  for (let i = 0; i < 50; i++) {
+    spawnSmokeColumn(list, i, 0);
+    spawnDust(list, i, 0);
+    spawnTracer(list, 0, 0, 1, 1, 'heavy');
+  }
+  assert.ok(list.length <= MAX_EFFECTS);
 });
 
 test('MAX_EFFECTS cap drops the oldest effects', () => {

@@ -68,13 +68,21 @@ export function drawEffects(ctx: CanvasRenderingContext2D, cam: Camera, effects:
       }
       case 'tracer': {
         const s2 = worldToScreen(cam, e.vx, e.vy); // end point packed in vx/vy
+        const heavy = e.tier === 'heavy';
         // Fading trail: wide soft underpass + thin hot core, alpha ∝ age.
+        // Heavy ordnance burns hotter (red-orange) and wider than light arms.
         const g = ctx.createLinearGradient(s.x, s.y, s2.x, s2.y);
-        g.addColorStop(0, `rgba(255, 200, 90, 0)`);
-        g.addColorStop(0.7, `rgba(255, 220, 120, ${a * 0.45})`);
-        g.addColorStop(1, `rgba(255, 240, 160, ${a * 0.8})`);
+        if (heavy) {
+          g.addColorStop(0, `rgba(255, 120, 40, 0)`);
+          g.addColorStop(0.6, `rgba(255, 150, 60, ${a * 0.55})`);
+          g.addColorStop(1, `rgba(255, 220, 140, ${a * 0.9})`);
+        } else {
+          g.addColorStop(0, `rgba(255, 200, 90, 0)`);
+          g.addColorStop(0.7, `rgba(255, 220, 120, ${a * 0.45})`);
+          g.addColorStop(1, `rgba(255, 240, 160, ${a * 0.8})`);
+        }
         ctx.strokeStyle = g;
-        ctx.lineWidth = 3;
+        ctx.lineWidth = heavy ? 6 : 3;
         ctx.beginPath();
         ctx.moveTo(s.x, s.y);
         ctx.lineTo(s2.x, s2.y);
@@ -82,8 +90,8 @@ export function drawEffects(ctx: CanvasRenderingContext2D, cam: Camera, effects:
         ctx.beginPath();
         ctx.moveTo(s.x, s.y);
         ctx.lineTo(s2.x, s2.y);
-        ctx.strokeStyle = `rgba(255, 240, 160, ${a})`;
-        ctx.lineWidth = 1;
+        ctx.strokeStyle = heavy ? `rgba(255, 235, 180, ${a})` : `rgba(255, 240, 160, ${a})`;
+        ctx.lineWidth = Math.max(1, e.size || 1);
         ctx.stroke();
         break;
       }
@@ -123,6 +131,29 @@ export function drawEffects(ctx: CanvasRenderingContext2D, cam: Camera, effects:
         ctx.beginPath();
         ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
         ctx.fillStyle = `rgba(90, 90, 90, ${a * 0.45})`;
+        ctx.fill();
+        break;
+      }
+      case 'smokeColumn': {
+        // Explosion plume: three stacked puffs climbing with the column. Lower
+        // puffs are smaller and darker; all swell with t and fade with a.
+        for (let j = 0; j < 3; j++) {
+          const lift = (j + 0.5) * e.size * 0.9 * cam.zoom;
+          const r = Math.max(1, e.size * (0.5 + 1.1 * t) * (1 - j * 0.22) * cam.zoom);
+          ctx.beginPath();
+          ctx.arc(s.x, s.y - lift, r, 0, Math.PI * 2);
+          const shade = 60 + j * 18;
+          ctx.fillStyle = `rgba(${shade}, ${shade - 6}, ${shade - 10}, ${a * (0.5 - j * 0.12)})`;
+          ctx.fill();
+        }
+        break;
+      }
+      case 'dust': {
+        // Settling dust: tan puff swelling slower than smoke, stays low.
+        const r = Math.max(1, e.size * (0.7 + 0.6 * t) * cam.zoom);
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(150, 125, 95, ${a * 0.4})`;
         ctx.fill();
         break;
       }
