@@ -115,18 +115,25 @@ var BTN_GAP_MIN = 6;
 var DIFF_H_MIN = 28;
 var HINT_FONT = 12;
 var HINT_ZONE = HINT_FONT + 6;
+var VOLUME_STEP = 10;
+function stepVolume(v, dir) {
+  const base = Number.isFinite(v) ? Math.round(v / VOLUME_STEP) * VOLUME_STEP : 0;
+  return Math.min(100, Math.max(0, base + dir * VOLUME_STEP));
+}
 var inRect = (r, x, y) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
 function colW(viewW) {
   return Math.max(180, Math.min(320, viewW - 64));
 }
-function vstack(viewH, zones) {
+function vstack(viewH, zones, mins = {}) {
+  const minRowH = mins.rowH ?? BTN_H_MIN;
+  const minGap = mins.gap ?? BTN_GAP_MIN;
   const nat = { top: 12, gapA: 8, gapB: 14, gapHint: 12, bottom: 6 };
   const natRows = zones.rows * BTN_H + (zones.rows - 1) * BTN_GAP;
   const natHeader = zones.header.reduce((a, b) => a + b, 0);
   const natTotal = nat.top + natHeader + nat.gapA + zones.mid + nat.gapB + natRows + nat.gapHint + HINT_ZONE + nat.bottom;
   const s = Math.min(1, viewH / natTotal);
-  const bh = Math.max(BTN_H_MIN, Math.round(BTN_H * s));
-  const gap = Math.max(BTN_GAP_MIN, Math.round(BTN_GAP * s));
+  const bh = Math.max(minRowH, Math.round(BTN_H * s));
+  const gap = Math.max(minGap, Math.round(BTN_GAP * s));
   const midH = Math.max(Math.min(DIFF_H_MIN, zones.mid), Math.round(zones.mid * s));
   const scaled = zones.header.map((h) => h * s);
   const top = nat.top * s;
@@ -191,28 +198,40 @@ function menuHit(l, x, y) {
   }
   return null;
 }
+var STEP_ZONE = 44;
 function settingsLayout(viewW, viewH) {
   const bw = colW(viewW);
   const cx = viewW / 2;
-  const v = vstack(viewH, {
-    header: [34 * 1.1],
-    // 「设置」 title
-    mid: 0,
-    rows: 3
-  });
-  const ids = ["mute", "grid", "back"];
+  const v = vstack(viewH, { header: [34 * 1.1], mid: 0, rows: 6 }, { rowH: 28, gap: 5 });
+  const ids = ["mute", "grid", "sfx", "music", "fps", "back"];
   return {
     titleY: v.baselines[0],
-    rows: ids.map((id, i) => ({
-      id,
-      rect: { x: cx - bw / 2, y: v.rowsY + i * (v.bh + v.gap), w: bw, h: v.bh }
-    })),
+    rows: ids.map((id, i) => {
+      const rect = { x: cx - bw / 2, y: v.rowsY + i * (v.bh + v.gap), w: bw, h: v.bh };
+      if (id !== "sfx" && id !== "music") return { id, rect };
+      const zw = Math.min(STEP_ZONE, (rect.w - 60) / 2);
+      const inset = 4;
+      return {
+        id,
+        rect,
+        minus: { x: rect.x + rect.w - 2 * zw - inset, y: rect.y + 4, w: zw, h: rect.h - 8 },
+        plus: { x: rect.x + rect.w - zw - inset, y: rect.y + 4, w: zw, h: rect.h - 8 }
+      };
+    }),
     hintY: v.hintY
   };
 }
 function settingsHit(l, x, y) {
   for (const r of l.rows) {
     if (inRect(r.rect, x, y)) return r.id;
+  }
+  return null;
+}
+function settingsAdjustHit(l, x, y) {
+  for (const r of l.rows) {
+    if (r.id !== "sfx" && r.id !== "music") continue;
+    if (r.minus && inRect(r.minus, x, y)) return { id: r.id, delta: -1 };
+    if (r.plus && inRect(r.plus, x, y)) return { id: r.id, delta: 1 };
   }
   return null;
 }
@@ -235,6 +254,18 @@ function gameoverHit(l, x, y) {
     if (inRect(b.rect, x, y)) return b.id;
   }
   return null;
+}
+var pad2 = (n) => String(n).padStart(2, "0");
+function fmtDur(sec) {
+  const s = Math.max(0, Math.floor(sec));
+  return `${pad2(Math.floor(s / 60))}:${pad2(s % 60)}`;
+}
+function formatBoardRow(rank, s) {
+  const r = s ?? {};
+  const where = r.missionId === "skirmish" ? "\u906D\u9047\u6218" : typeof r.missionId === "string" && r.missionId !== "" ? r.missionId : "\u672A\u77E5";
+  const dur = typeof r.durationSec === "number" && Number.isFinite(r.durationSec) ? fmtDur(r.durationSec) : "--:--";
+  const score = typeof r.score === "number" && Number.isFinite(r.score) ? `${Math.round(r.score)}\u5206` : Number.isInteger(r.stars) ? `\u2605${r.stars}` : "0\u5206";
+  return `#${rank} \xB7 ${where} \xB7 ${dur} \xB7 ${score}`;
 }
 
 // src/render/menu.test.ts
@@ -280,9 +311,9 @@ for (const [w, h] of VIEWPORTS) {
     }
     for (const b of l.buttons) assert.ok(b.rect.h >= 44);
   });
-  test(`settings ${w}x${h}: rows hit mute/grid/back in order`, () => {
+  test(`settings ${w}x${h}: rows hit mute/grid/sfx/music/fps/back in order`, () => {
     const l = settingsLayout(w, h);
-    const order = ["mute", "grid", "back"];
+    const order = ["mute", "grid", "sfx", "music", "fps", "back"];
     l.rows.forEach((row, i) => {
       const c = center(row.rect);
       assert.equal(settingsHit(l, c.x, c.y), order[i]);
@@ -295,6 +326,28 @@ for (const [w, h] of VIEWPORTS) {
       assert.ok(row.rect.x >= 0 && row.rect.x + row.rect.w <= w);
       assert.ok(row.rect.y >= 0 && row.rect.y + row.rect.h <= h);
     }
+  });
+  test(`settings ${w}x${h}: stepper zones hit minus/plus`, () => {
+    const l = settingsLayout(w, h);
+    for (const row of l.rows) {
+      if (row.id !== "sfx" && row.id !== "music") {
+        assert.equal(row.minus, void 0);
+        assert.equal(row.plus, void 0);
+        continue;
+      }
+      assert.ok(row.minus && row.plus, `row ${row.id} missing stepper zones`);
+      for (const z of [row.minus, row.plus]) {
+        assert.ok(z.x >= row.rect.x && z.x + z.w <= row.rect.x + row.rect.w);
+        assert.ok(z.y >= row.rect.y && z.y + z.h <= row.rect.y + row.rect.h);
+      }
+      assert.ok(!overlap(row.minus, row.plus));
+      const cMinus = center(row.minus);
+      const cPlus = center(row.plus);
+      assert.deepEqual(settingsAdjustHit(l, cMinus.x, cMinus.y), { id: row.id, delta: -1 });
+      assert.deepEqual(settingsAdjustHit(l, cPlus.x, cPlus.y), { id: row.id, delta: 1 });
+      assert.equal(settingsHit(l, cMinus.x, cMinus.y), row.id);
+    }
+    assert.equal(settingsAdjustHit(l, 2, 2), null);
   });
   test(`gameover ${w}x${h}: retry/menu buttons hit correctly`, () => {
     const l = gameoverLayout(w, h);
@@ -344,6 +397,12 @@ for (const [w, h] of FIT_VIEWPORTS) {
   test(`settings ${w}x${h}: every row fits, none overlap, hint is clear`, () => {
     const l = settingsLayout(w, h);
     const rects = l.rows.map((r) => r.rect);
+    const zones = l.rows.flatMap((r) => [r.minus, r.plus].filter((z) => !!z));
+    for (const z of zones) {
+      assert.ok(z.y >= 0 && z.y + z.h <= h, `zone ${JSON.stringify(z)} overflows height ${h}`);
+      assert.ok(z.x >= 0 && z.x + z.w <= w, `zone ${JSON.stringify(z)} overflows width ${w}`);
+    }
+    assert.ok(l.titleY > 0 && l.titleY < h);
     for (const r of rects) {
       assert.ok(r.y >= 0 && r.y + r.h <= h, `row ${JSON.stringify(r)} overflows height ${h}`);
       assert.ok(r.x >= 0 && r.x + r.w <= w, `row ${JSON.stringify(r)} overflows width ${w}`);
@@ -355,5 +414,43 @@ for (const [w, h] of FIT_VIEWPORTS) {
       }
     }
     assert.ok(l.hintY <= h);
+  });
+}
+test("formatBoardRow: fields are rank \xB7 where \xB7 duration \xB7 score", () => {
+  assert.equal(
+    formatBoardRow(1, { missionId: "skirmish", durationSec: 84, score: 1234, stars: 0, kills: 1 }),
+    "#1 \xB7 \u906D\u9047\u6218 \xB7 01:24 \xB7 1234\u5206"
+  );
+  assert.equal(formatBoardRow(2, { missionId: "m03", durationSec: 9, stars: 2 }), "#2 \xB7 m03 \xB7 00:09 \xB7 \u26052");
+  assert.equal(formatBoardRow(3, null), "#3 \xB7 \u672A\u77E5 \xB7 --:-- \xB7 0\u5206");
+});
+test("stepVolume: \xB110 ticks clamped to 0-100", () => {
+  assert.equal(stepVolume(50, 1), 60);
+  assert.equal(stepVolume(50, -1), 40);
+  assert.equal(stepVolume(100, 1), 100);
+  assert.equal(stepVolume(0, -1), 0);
+  assert.equal(stepVolume(55, 1), 70);
+});
+for (const [w, h] of [
+  [780, 380],
+  [1440, 900]
+]) {
+  test(`menu ${w}x${h}: text baselines stay inside the viewport`, () => {
+    const l = menuLayout(w, h);
+    for (const y of [l.titleY, l.subtitleY, l.diffLabelY, l.hintY]) {
+      assert.ok(y > 0 && y <= h, `baseline ${y} out of ${h}`);
+    }
+  });
+  test(`settings ${w}x${h}: six rows ordered with steppers on sfx/music`, () => {
+    const l = settingsLayout(w, h);
+    assert.deepEqual(
+      l.rows.map((r) => r.id),
+      ["mute", "grid", "sfx", "music", "fps", "back"]
+    );
+    for (let i = 1; i < l.rows.length; i++) {
+      assert.ok(l.rows[i].rect.y >= l.rows[i - 1].rect.y + l.rows[i - 1].rect.h);
+    }
+    const last = l.rows[l.rows.length - 1].rect;
+    assert.ok(last.y + last.h <= l.hintY - 12);
   });
 }
