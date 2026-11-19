@@ -23,6 +23,7 @@ import {
   ORE_RESERVE,
   REPAIR_BELOW,
   STUCK_SECONDS,
+  planOreAssignments,
   type Harvester,
 } from './harvest.js';
 
@@ -735,4 +736,150 @@ test('a depleted vein never regrows', () => {
   // 枯竭矿脉不再回填：再跑多少 tick 也还是 0。
   drive([h], map, [refinery], econ, 200);
   assert.equal(oreReserveAt(map, 10, 8), 0);
+});
+
+test('regen: false keeps an abandoned vein drained', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  const h = createHarvester(unitAt('harvester', 8, 8));
+  const econ = createEconomy(0);
+
+  // Mine a little, then battle damage releases the claim.
+  for (let i = 0; i < 50 && h.state !== 'mining'; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2, undefined, false);
+  }
+  for (let i = 0; i < 5; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2, undefined, false);
+  }
+  const drained = oreReserveAt(map, 10, 8);
+  assert.ok(drained > 0 && drained < ORE_RESERVE);
+
+  h.unit.hp = 10;
+  for (let i = 0; i < 50; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2, undefined, false);
+  }
+  // 再生关闭：被放弃的矿脉一格也不回填。
+  assert.equal(oreReserveAt(map, 10, 8), drained);
+});
+
+test('a faster regen rate refills the same vein sooner', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  const h = createHarvester(unitAt('harvester', 8, 8));
+  const econ = createEconomy(0);
+
+  for (let i = 0; i < 50 && h.state !== 'mining'; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2);
+  }
+  for (let i = 0; i < 5; i++) updateHarvesters([h], map, [refinery], econ, 0.2);
+  const drained = oreReserveAt(map, 10, 8);
+
+  h.unit.hp = 10; // release the claim so regen applies
+  for (let i = 0; i < 50; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2, undefined, { rate: 60 });
+  }
+  const fast = oreReserveAt(map, 10, 8);
+  assert.ok(fast > drained, `rate 60 should out-regrow default: ${drained} → ${fast}`);
+  assert.ok(fast <= ORE_RESERVE);
+});
+
+test('planOreAssignments picks each harvester\'s nearest vein, purely', () => {
+  const map = openMap();
+  setTerrain(map, 10, 8, ORE);
+  setTerrain(map, 16, 8, ORE);
+  const h1 = createHarvester(unitAt('harvester', 8, 7)); // nearer to (10,8)
+  const h2 = createHarvester(unitAt('harvester', 14, 9)); // nearer to (16,8)
+  h2.unit.id = 2;
+
+  const plan = planOreAssignments([h1, h2], map);
+
+  assert.deepEqual(plan.get(h1), { x: 10, y: 8 });
+  assert.deepEqual(plan.get(h2), { x: 16, y: 8 });
+  // 纯函数：不改任何矿车状态，也不写储量表。
+  assert.equal(h1.state, 'idle');
+  assert.equal(h1.target, null);
+  assert.equal(h2.state, 'idle');
+  assert.equal(oreReserveAt(map, 10, 8), ORE_RESERVE); // reserve table untouched
+});
+
+test('planOreAssignments spreads harvesters and skips full holds', () => {
+  const map = openMap();
+  setTerrain(map, 10, 8, ORE);
+  setTerrain(map, 12, 8, ORE);
+  const h1 = createHarvester(unitAt('harvester', 8, 7));
+  const h2 = createHarvester(unitAt('harvester', 8, 9));
+  const h3 = createHarvester(unitAt('harvester', 8, 11));
+  h2.unit.id = 2;
+  h3.unit.id = 3;
+  h3.cargo = HARVEST_CAPACITY; // 满载：该回程，不派矿
+
+  const plan = planOreAssignments([h1, h2, h3], map);
+
+  assert.notDeepEqual(plan.get(h1), plan.get(h2), 'two miners split the veins');
+  assert.equal(plan.size, 2);
+  assert.equal(plan.has(h3), false);
+});
+
+test('a taken mining spot sends dispatch to the next free neighbor', () => {
+  const map = openMap();
+  const refinery = building('refinery', 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  setTerrain(map, 10, 9, ORE);
+  // h1 parked on (9,8) — a stand neighbor of both veins — mining (10,8).
+  const h1 = createHarvester(unitAt('harvester', 9, 8));
+  h1.state = 'mining';
+  h1.target = { x: 10, y: 8 };
+  const h2 = createHarvester(unitAt('harvester', 7, 8));
+  h2.unit.id = 2;
+  const econ = createEconomy(0);
+
+  updateHarvesters([h1, h2], map, [refinery], econ, 0.2);
+
+  assert.equal(h2.state, 'toOre');
+  assert.deepEqual(h2.target, { x: 10, y: 9 });
+  assert.ok(h2.unit.path.length > 0);
+  const last = h2.unit.path[h2.unit.path.length - 1]!;
+  // (9,8) 被占：改停次近空格 (9,9)，而不是挤进同一格。
+  assert.deepEqual({ x: worldToTile(last.x), y: worldToTile(last.y) }, { x: 9, y: 9 });
+});
+
+test('mid-haul refinery loss retargets the nearest surviving dropoff', () => {
+  const map = openMap();
+  const r1 = building('refinery', 2, 2);
+  const r2 = building('refinery', 16, 2);
+  r2.id = 2;
+  const buildings = [r1, r2];
+  const h = createHarvester(unitAt('harvester', 10, 8));
+  h.cargo = 300;
+  const econ = createEconomy(0);
+
+  updateHarvesters([h], map, buildings, econ, 0.2);
+  assert.equal(h.state, 'toRefinery');
+  assert.equal(h.dropoffId, r1.id); // r1 is nearer to (10,8)
+
+  // 矿厂被毁：下一个 tick 改投最近的幸存卸点。
+  buildings.splice(0, 1);
+  updateHarvesters([h], map, buildings, econ, 0.2);
+  assert.equal(h.state, 'toRefinery');
+  assert.equal(h.dropoffId, r2.id);
+  assert.ok(h.unit.path.length > 0, 're-routed toward the surviving refinery');
+
+  // 全毁：原地等待，货物保留，绝不入账。
+  buildings.splice(0, 1);
+  const wx = h.unit.x;
+  const wy = h.unit.y;
+  for (let i = 0; i < 10; i++) updateHarvesters([h], map, buildings, econ, 0.2);
+  assert.equal(h.state, 'toRefinery');
+  assert.equal(h.unit.x, wx);
+  assert.equal(h.unit.y, wy);
+  assert.equal(h.cargo, 300);
+  assert.equal(econ.credits, 0);
+
+  // 新矿厂建成：自动恢复回程。
+  buildings.push(building('refinery', 12, 2));
+  updateHarvesters([h], map, buildings, econ, 0.2);
+  assert.equal(h.state, 'toRefinery');
+  assert.ok(h.unit.path.length > 0);
 });

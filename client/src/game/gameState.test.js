@@ -2245,6 +2245,7 @@ function toIdle(h) {
   h.state = "idle";
   h.target = null;
   h.replans = 0;
+  h.dropoffId = void 0;
   h.unit.path = [];
   resetWatchdog(h);
 }
@@ -2333,6 +2334,7 @@ function sendToRefinery(h, map, buildings, blockers, forRepair = false) {
   const uy = worldToTile(h.unit.y);
   const b = dropoffBuilding(buildings, ux, uy);
   if (!b) return false;
+  h.dropoffId = b.id;
   const def = BUILDING_DEFS[b.kind];
   const goal = { x: Math.floor(b.gx + def.w / 2), y: Math.floor(b.gy + def.h / 2) };
   const path = findPathAvoiding(map, { x: ux, y: uy }, goal, blockers);
@@ -2354,12 +2356,23 @@ function sendToRefinery(h, map, buildings, blockers, forRepair = false) {
 function hasDropoff(buildings) {
   return buildings.some((b) => b.done && (b.kind === "refinery" || b.kind === "hq"));
 }
+function dropoffAlive(h, buildings) {
+  if (h.dropoffId == null) return true;
+  return buildings.some(
+    (b) => b.id === h.dropoffId && b.done && (b.kind === "refinery" || b.kind === "hq")
+  );
+}
 function updateHarvesters(hs, map, buildings, economy, dt, obstacles, regen) {
   const depleted = [];
   if (dt <= 0) return depleted;
   const reserves = reserveTable(map);
   const blockers = buildingBlockers(obstacles ?? buildings);
   const blocked = blockedTiles(map, blockers);
+  const occupied = blockedTiles(
+    map,
+    hs.filter((o) => o.unit.kind === "harvester").map((o) => ({ gx: worldToTile(o.unit.x), gy: worldToTile(o.unit.y), w: 1, h: 1 }))
+  );
+  const standBlocked = blocked.map((v, i) => v | occupied[i]);
   const claims = /* @__PURE__ */ new Map();
   for (const h of hs) {
     if (h.unit.kind === "harvester" && (h.state === "toOre" || h.state === "mining") && h.target !== null && isOre(map, h.target.x, h.target.y)) {
@@ -2402,7 +2415,7 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles, regen) {
             ok = sendToOre(h, map, reserves, claims, avoid, avoidBlocked, /* @__PURE__ */ new Set([cur]));
           }
           if (!ok) ok = sendToOre(h, map, reserves, claims, avoid, avoidBlocked);
-          if (!ok) ok = sendToOre(h, map, reserves, claims, blockers, blocked);
+          if (!ok) ok = sendToOre(h, map, reserves, claims, blockers, standBlocked);
         } else if (h.state === "toRefinery") {
           ok = sendToRefinery(h, map, buildings, avoid) || sendToRefinery(h, map, buildings, blockers);
         } else {
@@ -2417,7 +2430,7 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles, regen) {
         if (h.cargo > 0) {
           sendToRefinery(h, map, buildings, blockers);
         } else if (hasDropoff(buildings)) {
-          sendToOre(h, map, reserves, claims, blockers, blocked);
+          sendToOre(h, map, reserves, claims, blockers, standBlocked);
         }
         break;
       }
@@ -2439,7 +2452,7 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles, regen) {
         if (!isViableOre(map, reserves, h.target)) {
           if (h.cargo >= HARVEST_CAPACITY) {
             if (!sendToRefinery(h, map, buildings, blockers)) toIdle(h);
-          } else if (!sendToOre(h, map, reserves, claims, blockers, blocked)) {
+          } else if (!sendToOre(h, map, reserves, claims, blockers, standBlocked)) {
             if (h.cargo <= 0 || !sendToRefinery(h, map, buildings, blockers)) toIdle(h);
           }
           break;
@@ -2460,13 +2473,19 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles, regen) {
         if (h.cargo >= HARVEST_CAPACITY) {
           if (!sendToRefinery(h, map, buildings, blockers)) toIdle(h);
         } else if (reserves[i] <= 0) {
-          if (!sendToOre(h, map, reserves, claims, blockers, blocked)) {
+          if (!sendToOre(h, map, reserves, claims, blockers, standBlocked)) {
             if (!sendToRefinery(h, map, buildings, blockers)) toIdle(h);
           }
         }
         break;
       }
       case "toRefinery": {
+        if (!dropoffAlive(h, buildings)) {
+          if (!sendToRefinery(h, map, buildings, blockers)) {
+            h.unit.path = [];
+            break;
+          }
+        }
         stepAlong(h.unit, dt);
         if (h.unit.path.length === 0) h.state = "unloading";
         break;
@@ -2475,10 +2494,17 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles, regen) {
         credit(economy, h.cargo);
         h.cargo = 0;
         h.target = null;
+        h.dropoffId = void 0;
         h.state = "idle";
         break;
       }
       case "toRepair": {
+        if (!dropoffAlive(h, buildings)) {
+          if (!sendToRefinery(h, map, buildings, blockers, true)) {
+            h.unit.path = [];
+            break;
+          }
+        }
         stepAlong(h.unit, dt);
         if (h.unit.path.length === 0) {
           h.state = h.cargo > 0 ? "unloading" : "repairing";
