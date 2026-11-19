@@ -309,6 +309,247 @@ export function drawSandstorm(
   drawFogVeil(ctx, w, h, t, 0.7);
 }
 
+// ---------------------------------------------------------------------------
+// Day/night ambience.
+//
+// `timeOfDay` follows the same [0,1) cycle convention as `dayPhase` in
+// game/weather.ts: dawn [0,.06), day [.06,.5), dusk [.5,.56), night [.56,1).
+// All colours interpolate continuously between keyframes, so sliding p or
+// advancing ticks never pops. Draw order matches the weather overlays: on the
+// world, after fog and units, under the HUD-safe band.
+// ---------------------------------------------------------------------------
+
+/** One colour stop pair: lit-side tint and shadow-side tint, premultiplied rgba. */
+interface GradeStop {
+  p: number;
+  lit: [number, number, number, number];
+  dark: [number, number, number, number];
+}
+
+/**
+ * Keyframed light grade over the cycle. Dawn is a cool blue-violet wash,
+ * day nearly neutral, dusk a low orange-red, night deep blue moonlight.
+ * The wrap entry duplicates p=0 at p=1 so lerp never needs modulo math.
+ */
+const DAY_GRADE: GradeStop[] = [
+  { p: 0.0, lit: [170, 140, 220, 0.18], dark: [40, 40, 110, 0.20] }, // dawn 蓝紫
+  { p: 0.06, lit: [255, 210, 150, 0.10], dark: [60, 70, 130, 0.12] },
+  { p: 0.28, lit: [255, 255, 235, 0.06], dark: [30, 40, 20, 0.05] }, // noon
+  { p: 0.5, lit: [255, 160, 80, 0.10], dark: [50, 60, 120, 0.10] },
+  { p: 0.56, lit: [235, 120, 55, 0.20], dark: [45, 50, 110, 0.20] }, // dusk 橙红
+  { p: 0.62, lit: [110, 120, 190, 0.20], dark: [15, 25, 70, 0.26] },
+  { p: 0.78, lit: [70, 90, 160, 0.22], dark: [8, 14, 40, 0.30] }, // midnight 月光
+  { p: 1.0, lit: [170, 140, 220, 0.18], dark: [40, 40, 110, 0.20] },
+];
+
+function lerpChannel(a: number, b: number, k: number): number {
+  return a + (b - a) * k;
+}
+
+/**
+ * Interpolated lit/dark tint at cycle position `p` (clamped into [0,1)).
+ * Returns two rgba() strings.
+ */
+function gradeAt(p: number): [string, string] {
+  const q = clamp01(p);
+  let i = 0;
+  while (i < DAY_GRADE.length - 2 && DAY_GRADE[i + 1]!.p <= q) i++;
+  const a = DAY_GRADE[i]!;
+  const b = DAY_GRADE[i + 1]!;
+  const k = b.p > a.p ? clamp01((q - a.p) / (b.p - a.p)) : 0;
+  const lit = `rgba(${Math.round(lerpChannel(a.lit[0], b.lit[0], k))},${Math.round(
+    lerpChannel(a.lit[1], b.lit[1], k),
+  )},${Math.round(lerpChannel(a.lit[2], b.lit[2], k))},${(
+    lerpChannel(a.lit[3], b.lit[3], k)
+  ).toFixed(3)})`;
+  const dark = `rgba(${Math.round(lerpChannel(a.dark[0], b.dark[0], k))},${Math.round(
+    lerpChannel(a.dark[1], b.dark[1], k),
+  )},${Math.round(lerpChannel(a.dark[2], b.dark[2], k))},${(
+    lerpChannel(a.dark[3], b.dark[3], k)
+  ).toFixed(3)})`;
+  return [lit, dark];
+}
+
+/** Ambient light 0..1 at cycle position p (mirrors dayPhase's cosine curve). */
+function dayLight(p: number): number {
+  return 0.675 + 0.325 * Math.cos((p - 0.28) * Math.PI * 2);
+}
+
+/**
+ * Unit vector from the light source toward screen centre. The sun/moon runs
+ * east → overhead → west across the cycle: at dawn (p≈0.03) it points left
+ * (light falls from the right/east edge), at noon it is nearly straight down,
+ * at dusk it points right (light from the west edge).
+ */
+function lightDir(p: number): { x: number; y: number } {
+  const a = -(p * Math.PI * 2) + 0.2;
+  // Flatten the vertical a little so "low sun" reads as a horizontal rake.
+  const y = Math.sin(a) * 0.55;
+  const x = Math.cos(a);
+  const m = Math.hypot(x, y) || 1;
+  return { x: x / m, y: y / m };
+}
+
+/** A screen-space point that casts a soft directional shadow. */
+export interface ShadowAnchor {
+  x: number;
+  y: number;
+  /** Base radius in px; default 14. */
+  radius?: number;
+}
+
+/** A screen-space lamp glow; visible only when ambient light is low. */
+export interface LightGlow {
+  x: number;
+  y: number;
+  /** Glow radius in px; buildings read larger than units. Default by kind. */
+  radius?: number;
+  /** 'building' → wider, warmer flood; 'unit' → small lamp. Default 'unit'. */
+  kind?: 'unit' | 'building';
+}
+
+export interface DaylightOptions {
+  /**
+   * Optional light sources in screen px (units / buildings with lights on).
+   * Omit or pass an empty list → no glows are painted.
+   */
+  lights?: LightGlow[];
+  /**
+   * Optional shadow anchors in screen px. Each casts a soft ellipse offset
+   * opposite the sun/moon direction; length grows as the light gets low.
+   */
+  shadows?: ShadowAnchor[];
+  /** Seconds, for the subtle lamp flicker. Defaults to 0 (static). */
+  t?: number;
+}
+
+/**
+ * Continuous day/night ambience for one frame.
+ *
+ * - `timeOfDay` is the cycle position in [0,1) (e.g. `dayPhase(t).p`); passing
+ *   a raw tick/seconds value also works — it is wrapped modulo DAY_LENGTH
+ *   (240s) when >1 so callers can feed `game.elapsed` directly.
+ * - `opts.shadows` get directional ground shadows that rotate and stretch
+ *   with the sun angle (long rakes at dawn/dusk, short at noon, faint at
+ *   night under moonlight).
+ * - `opts.lights` paint warm halos that fade in as ambient light drops; an
+ *   absent list draws nothing.
+ *
+ * Paint only — call it in the same overlay slot as the weather draws (after
+ * units/fog, before HUD); it respects the HUD-safe band.
+ */
+export function drawDaylight(
+  ctx: CanvasRenderingContext2D,
+  w: number,
+  h: number,
+  timeOfDay: number,
+  opts: DaylightOptions = {},
+): void {
+  // Accept either a 0..1 phase or an absolute tick in seconds (240s cycle).
+  const p = ((timeOfDay > 1 ? timeOfDay / 240 : timeOfDay) % 1 + 1) % 1;
+  const light = dayLight(p);
+  const dark = 1 - light; // 0 at noon → ~0.65 at midnight
+  const dir = lightDir(p);
+  const b = safeBand(h);
+  ctx.save();
+
+  // 1) Shadows first (under the colour grade so they pick up the tint).
+  if (opts.shadows && opts.shadows.length > 0) {
+    // Shadow length: ~0.6r at noon → ~2.4r at low sun / moonlit night.
+    const stretch = 0.6 + dark * 1.8;
+    const alpha = 0.16 + dark * 0.10; // moon shadows stay visible but faint
+    ctx.fillStyle = `rgba(10,14,26,${alpha})`;
+    for (const s of opts.shadows) {
+      const r = s.radius ?? 14;
+      // Shadow falls opposite the light direction.
+      const dx = -dir.x * r * stretch;
+      const dy = -dir.y * r * stretch * 0.4;
+      ctx.beginPath();
+      ctx.ellipse(
+        s.x + dx,
+        s.y + dy + r * 0.35,
+        r + Math.abs(dx) * 0.5,
+        r * 0.38,
+        Math.atan2(dy, dx || 0.0001),
+        0,
+        Math.PI * 2,
+      );
+      ctx.fill();
+    }
+  }
+
+  // 2) Directional colour grade: a linear gradient along the light axis —
+  // lit corner gets the warm/cool tint, the far corner the shadow tint.
+  const [litCol, darkCol] = gradeAt(p);
+  const cx = w / 2;
+  const cy = b.top + b.h / 2;
+  const span = Math.hypot(w, b.h) / 2;
+  const g = ctx.createLinearGradient(
+    cx + dir.x * span,
+    cy + dir.y * span,
+    cx - dir.x * span,
+    cy - dir.y * span,
+  );
+  g.addColorStop(0, litCol);
+  g.addColorStop(1, darkCol);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, b.top, w, b.h);
+
+  // 3) Night body: deep-blue dim + vignette, scaled by darkness. Same
+  //    silhouette as drawNightOverlay so callers can swap one for the other.
+  if (dark > 0.05) {
+    ctx.fillStyle = `rgba(10,16,48,${0.42 * dark})`;
+    ctx.fillRect(0, b.top, w, b.h);
+    const r = Math.hypot(w, b.h) / 2;
+    const v = ctx.createRadialGradient(cx, cy, r * 0.35, cx, cy, r);
+    v.addColorStop(0, 'rgba(0,0,20,0)');
+    v.addColorStop(1, `rgba(0,0,20,${0.32 * dark})`);
+    ctx.fillStyle = v;
+    ctx.fillRect(0, b.top, w, b.h);
+
+    // Moon: pale disc + halo in the corner the light currently comes from.
+    const mx = cx + dir.x * w * 0.42;
+    const my = Math.max(b.top + 26, cy + dir.y * b.h * 0.4 - b.h * 0.32);
+    const mr = 10 + dark * 6;
+    const halo = ctx.createRadialGradient(mx, my, mr * 0.4, mx, my, mr * 5);
+    halo.addColorStop(0, `rgba(190,205,235,${0.30 * dark})`);
+    halo.addColorStop(0.25, `rgba(150,170,215,${0.14 * dark})`);
+    halo.addColorStop(1, 'rgba(150,170,215,0)');
+    ctx.fillStyle = halo;
+    ctx.fillRect(mx - mr * 5, my - mr * 5, mr * 10, mr * 10);
+    ctx.fillStyle = `rgba(225,232,248,${0.75 * dark})`;
+    ctx.beginPath();
+    ctx.arc(mx, my, mr, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // 4) Unit/building lamp glows — fade in as ambient light drops.
+  if (opts.lights && opts.lights.length > 0 && dark > 0.08) {
+    const t = opts.t ?? 0;
+    const glow = Math.min(1, dark * 1.6);
+    for (let i = 0; i < opts.lights.length; i++) {
+      const l = opts.lights[i]!;
+      const r = l.radius ?? (l.kind === 'building' ? 46 : 18);
+      // Deterministic soft flicker per lamp index.
+      const fl = 0.85 + 0.15 * Math.sin(t * 7 + i * 2.13);
+      const a = glow * fl * (l.kind === 'building' ? 0.55 : 0.45);
+      const gg = ctx.createRadialGradient(l.x, l.y, r * 0.1, l.x, l.y, r);
+      gg.addColorStop(0, `rgba(255,214,140,${a})`);
+      gg.addColorStop(0.45, `rgba(255,180,90,${a * 0.4})`);
+      gg.addColorStop(1, 'rgba(255,170,80,0)');
+      ctx.fillStyle = gg;
+      ctx.fillRect(l.x - r, l.y - r, r * 2, r * 2);
+      // Bright core so the emitter itself reads as "lit".
+      ctx.fillStyle = `rgba(255,236,190,${a * 0.9})`;
+      ctx.beginPath();
+      ctx.arc(l.x, l.y, Math.max(1.5, r * 0.08), 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  ctx.restore();
+}
+
 /**
  * Night dimming: flat blue-dark fill scaled by `nightFactor` (0–1), plus a
  * radial vignette so edges darken more than the center.
