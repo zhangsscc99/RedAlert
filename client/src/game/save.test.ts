@@ -6,6 +6,7 @@ import {
   parse,
   parseResult,
   migrateSnapshot,
+  migrateSave,
   MIGRATE_MAX_COORD,
   snapshot,
   encodeBase64,
@@ -425,4 +426,54 @@ test('parse() still rejects what migrateSnapshot repairs', () => {
   const text = JSON.stringify({ version: 2, credits: 'lots' });
   assert.equal(parse(text), null);
   assert.equal(migrateSnapshot(JSON.parse(text)).credits, 0);
+});
+
+test('mission label round-trips and validates like difficulty', () => {
+  const s = { ...state, mission: 'allied-2' };
+  assert.deepEqual(parse(serialize(s)), s);
+  assert.equal(JSON.parse(serialize(s)).mission, 'allied-2');
+
+  // wrong type → structured bad-field code, not a crash
+  assert.deepEqual(parseResult(JSON.stringify({ ...state, mission: 2 })), {
+    ok: false,
+    reason: 'bad-field:mission',
+  });
+  assert.equal(parse(JSON.stringify({ ...state, mission: ['m1'] })), null);
+
+  // absent stays absent — no phantom mission on older blobs
+  assert.equal(parse(serialize(state))?.mission, undefined);
+
+  // snapshot() carries it through
+  const built = snapshot({ seed: 1, credits: 0, elapsed: 0, units: [], mission: 'm1' });
+  assert.equal(built.mission, 'm1');
+});
+
+test('migrateSnapshot keeps a valid mission label and drops bad ones', () => {
+  assert.equal(migrateSnapshot({ version: 1, mission: 'soviet-4' }).mission, 'soviet-4');
+  assert.equal(migrateSnapshot({ version: 2, mission: 7 }).mission, undefined);
+  assert.equal(migrateSnapshot({ version: 3, mission: null }).mission, undefined);
+});
+
+test('migrateSave repairs text-level blobs; only non-object JSON fails', () => {
+  // old version with damaged fields → repaired defaults, current version
+  const m = migrateSave(
+    JSON.stringify({
+      version: 1,
+      credits: -5,
+      units: [{ id: 1, kind: 'rifle', x: 1, y: 2, hp: 10 }],
+    }),
+  );
+  assert.equal(m?.version, SAVE_VERSION);
+  assert.equal(m?.credits, 0);
+  assert.equal(m?.units?.[0]?.kind, 'rifle');
+
+  // what strict parse rejects, migration reads
+  const v2 = JSON.stringify({ version: 2, credits: 'lots' });
+  assert.equal(parse(v2), null);
+  assert.equal(migrateSave(v2)?.credits, 0);
+
+  // non-object JSON is beyond repair
+  assert.equal(migrateSave('{oops'), null);
+  assert.equal(migrateSave('[1,2]'), null);
+  assert.equal(migrateSave('42'), null);
 });

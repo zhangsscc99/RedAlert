@@ -101,6 +101,7 @@ export interface SaveState {
   stats?: SavedStats; // battle-report counters
   wave?: number; // current wave count (menu display / non-AI saves)
   difficulty?: string; // difficulty label the match started on
+  mission?: string; // mission/level label the match belongs to (e.g. 'allied-2')
   weather?: SavedWeather;
   radar?: SavedRadar;
 }
@@ -188,6 +189,7 @@ export function serialize(s: SaveState): string {
   if (s.camera) o.camera = { x: s.camera.x, y: s.camera.y, zoom: s.camera.zoom };
   if (s.opts) o.opts = { ...s.opts };
   if (s.difficulty !== undefined) o.difficulty = s.difficulty;
+  if (s.mission !== undefined) o.mission = s.mission;
   if (s.wave !== undefined) o.wave = s.wave;
   if (s.fog) {
     o.fog = { w: s.fog.w, h: s.fog.h, explored: encodeBase64(s.fog.explored) };
@@ -464,6 +466,7 @@ export function migrateSnapshot(raw: unknown): SaveState {
     s.opts = opts;
   }
   if (typeof o.difficulty === 'string') s.difficulty = o.difficulty;
+  if (typeof o.mission === 'string') s.mission = o.mission;
   if (o.wave !== undefined) s.wave = migNum(o.wave, 0, 0, MAX_SAFE);
 
   const fog = parseFog(o.fog);
@@ -505,6 +508,22 @@ export function migrateSnapshot(raw: unknown): SaveState {
     }
   }
   return s;
+}
+
+/**
+ * Text-level migration: JSON.parse + migrateSnapshot. Returns null only when
+ * the text isn't a JSON object at all — field-level damage is repaired, never
+ * reported. For diagnostics on rejection use parseResult instead.
+ */
+export function migrateSave(text: string): SaveState | null {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
+  return migrateSnapshot(raw);
 }
 
 // ------------------------------------------------------------- public API --
@@ -572,6 +591,11 @@ export function parseResult(text: string): ParseResult {
     if (typeof o.difficulty !== 'string') return fail('bad-field:difficulty');
     difficulty = o.difficulty;
   }
+  let mission: string | undefined;
+  if (o.mission !== undefined) {
+    if (typeof o.mission !== 'string') return fail('bad-field:mission');
+    mission = o.mission;
+  }
 
   // Older versions parse into the same shape — missing v2/v3 fields stay
   // absent so a v1 save never gains phantom data.
@@ -589,6 +613,7 @@ export function parseResult(text: string): ParseResult {
   if (camera !== undefined) s.camera = camera;
   if (opts !== undefined) s.opts = opts;
   if (difficulty !== undefined) s.difficulty = difficulty;
+  if (mission !== undefined) s.mission = mission;
   if (o.wave !== undefined) s.wave = wave;
   if (fog !== undefined) s.fog = fog;
   if (stats !== undefined) s.stats = stats;
@@ -619,6 +644,7 @@ export function snapshot(input: {
   stats?: SavedStats;
   wave?: number;
   difficulty?: string;
+  mission?: string;
   weather?: SavedWeather;
   radar?: SavedRadar;
 }): SaveState {
@@ -639,6 +665,7 @@ export function snapshot(input: {
   if (input.stats) s.stats = cloneStats(input.stats);
   if (input.wave !== undefined) s.wave = input.wave;
   if (input.difficulty !== undefined) s.difficulty = input.difficulty;
+  if (input.mission !== undefined) s.mission = input.mission;
   if (input.weather) s.weather = cloneWeather(input.weather);
   if (input.radar) s.radar = cloneRadar(input.radar);
   return s;

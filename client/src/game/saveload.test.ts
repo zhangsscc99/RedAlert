@@ -3,12 +3,23 @@ import assert from 'node:assert/strict';
 import { serialize, parse, type SaveState } from './save.js';
 import {
   SLOT_IDS,
+  ALL_SLOT_IDS,
+  AUTO_SLOT_ID,
   listSlots,
   inspectSlots,
+  inspectSlot,
+  inspectAllSlots,
   saveSlot,
   loadSlot,
+  loadSlotResult,
+  loadSlotMigrated,
   deleteSlot,
+  saveAuto,
+  loadAuto,
+  deleteAuto,
+  autoSlotInfo,
   latestSlot,
+  latestSave,
   slotKey,
   type SlotStorage,
 } from './saveload.js';
@@ -270,4 +281,138 @@ test('empty and meta-only slots read as empty status', () => {
   const infos = inspectSlots(s);
   assert.equal(infos[1]!.status, 'empty');
   assert.equal(infos[1]!.meta?.credits, 5); // meta survives for display
+});
+
+test('autosave slot round-trips and stays out of the manual list', () => {
+  const s = memStorage();
+  const meta = saveAuto(s, makeState(555), { phase: 'playing', savedAt: 42 });
+  assert.equal(meta.credits, 555);
+  assert.equal(loadAuto(s)?.credits, 555);
+  assert.ok(s.map.has('redalert.save.v2.auto'));
+  assert.ok(s.map.has('redalert.save.v2.auto.meta'));
+
+  // the manual list is untouched — still exactly three slots
+  assert.deepEqual(listSlots(s).map((i) => i.id), [...SLOT_IDS]);
+  // the autosave slot shows up via its own inspectors
+  assert.deepEqual(autoSlotInfo(s), { id: 'auto', meta, status: 'ok' });
+  assert.deepEqual(inspectAllSlots(s).map((i) => i.id), [...ALL_SLOT_IDS]);
+  assert.deepEqual(inspectSlot(s, AUTO_SLOT_ID), autoSlotInfo(s));
+});
+
+test('autosave and manual slots are fully isolated', () => {
+  const s = memStorage();
+  saveSlot(s, 1, makeState(100), { savedAt: 1 });
+  saveAuto(s, makeState(999), { savedAt: 2 });
+
+  // overwriting auto leaves the manual slot untouched
+  saveAuto(s, makeState(777), { savedAt: 3 });
+  assert.equal(loadSlot(s, 1)?.credits, 100);
+  assert.equal(loadAuto(s)?.credits, 777);
+
+  // deleting a manual slot leaves auto untouched, and vice versa
+  deleteSlot(s, 1);
+  assert.equal(loadSlot(s, 1), null);
+  assert.equal(loadAuto(s)?.credits, 777);
+  deleteAuto(s);
+  assert.equal(loadAuto(s), null);
+  assert.equal(autoSlotInfo(s).status, 'empty');
+});
+
+test('loadSlotResult reports structured reasons, never throws', () => {
+  const s = memStorage();
+  assert.deepEqual(loadSlotResult(s, 1), { ok: false, reason: 'empty' });
+  assert.deepEqual(loadSlotResult(s, AUTO_SLOT_ID), { ok: false, reason: 'empty' });
+
+  s.map.set(slotKey(2), '{oops');
+  assert.deepEqual(loadSlotResult(s, 2), { ok: false, reason: 'bad-json' });
+
+  s.map.set(slotKey(3), JSON.stringify({ version: 3, units: 'many' }));
+  assert.deepEqual(loadSlotResult(s, 3), { ok: false, reason: 'bad-field:units' });
+
+  s.map.set(slotKey(AUTO_SLOT_ID), JSON.stringify({ version: 99 }));
+  assert.deepEqual(loadSlotResult(s, AUTO_SLOT_ID), { ok: false, reason: 'bad-version' });
+
+  saveSlot(s, 1, makeState(64), { savedAt: 9 });
+  const good = loadSlotResult(s, 1);
+  assert.equal(good.ok, true);
+  if (good.ok) assert.equal(good.state.credits, 64);
+});
+
+test('loadSlotMigrated repairs version-mismatched and field-damaged blobs', () => {
+  const s = memStorage();
+  // future-version blob: strict load fails, migration clamps it into shape
+  s.map.set(slotKey(1), JSON.stringify({ version: 99, seed: 5, credits: -50, units: [] }));
+  assert.equal(loadSlot(s, 1), null);
+  const m1 = loadSlotMigrated(s, 1);
+  assert.equal(m1?.credits, 0);
+  assert.equal(m1?.seed, 5);
+  assert.equal(inspectSlots(s)[0]!.status, 'version'); // strict health unchanged
+
+  // old blob with a damaged field: strict parse rejects, migrate repairs
+  s.map.set(
+    slotKey(2),
+    JSON.stringify({
+      version: 2,
+      credits: 'lots',
+      units: [{ id: 1, kind: 'tank', x: -5, y: 3, hp: 40 }],
+    }),
+  );
+  const m2 = loadSlotMigrated(s, 2);
+  assert.equal(m2?.credits, 0);
+  assert.equal(m2?.units?.[0]?.x, 0);
+  assert.equal(m2?.units?.[0]?.kind, 'tank');
+
+  // beyond-repair blobs and empty slots still read as null
+  s.map.set(slotKey(3), 'not json{');
+  assert.equal(loadSlotMigrated(s, 3), null);
+  assert.equal(loadSlotMigrated(s, AUTO_SLOT_ID), null);
+});
+
+test('slot meta carries the mission/level label', () => {
+  const s = memStorage();
+  // explicit extra wins over the save's own label
+  const m1 = saveSlot(
+    s,
+    1,
+    { ...makeState(100), mission: 'allied-2' },
+    { mission: 'allied-3', savedAt: 1 },
+  );
+  assert.equal(m1.mission, 'allied-3');
+
+  // falls back to state.mission
+  const m2 = saveSlot(s, 2, { ...makeState(200), mission: 'soviet-1' }, { savedAt: 2 });
+  assert.equal(m2.mission, 'soviet-1');
+
+  // absent everywhere → key stays absent
+  const m3 = saveAuto(s, makeState(300), { savedAt: 3 });
+  assert.equal('mission' in m3, false);
+
+  // persists through the meta record on the list page
+  assert.equal(inspectAllSlots(s)[0]!.meta?.mission, 'allied-3');
+  assert.equal(autoSlotInfo(s).meta?.mission, undefined);
+
+  // wrong-typed stored meta field corrupts the meta, not the list
+  s.map.set(
+    'redalert.save.v2.3.meta',
+    JSON.stringify({ savedAt: 1, elapsed: 0, credits: 5, phase: 'p', mission: 7 }),
+  );
+  assert.equal(inspectSlots(s)[2]!.meta, null);
+});
+
+test('latestSave picks the newest save including the autosave slot', () => {
+  const s = memStorage();
+  saveSlot(s, 1, makeState(100), { savedAt: 100 });
+  saveSlot(s, 3, makeState(300), { savedAt: 300 });
+  assert.equal(latestSave(s)?.id, 3);
+
+  // a fresher autosave wins over manual slots; latestSlot stays manual-only
+  saveAuto(s, makeState(50), { savedAt: 400 });
+  assert.equal(latestSave(s)?.id, 'auto');
+  assert.equal(latestSlot(s)?.id, 3);
+
+  deleteAuto(s);
+  assert.equal(latestSave(s)?.id, 3);
+  deleteSlot(s, 3);
+  deleteSlot(s, 1);
+  assert.equal(latestSave(s), null);
 });

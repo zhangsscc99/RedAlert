@@ -72,6 +72,7 @@ function serialize(s) {
   if (s.camera) o.camera = { x: s.camera.x, y: s.camera.y, zoom: s.camera.zoom };
   if (s.opts) o.opts = { ...s.opts };
   if (s.difficulty !== void 0) o.difficulty = s.difficulty;
+  if (s.mission !== void 0) o.mission = s.mission;
   if (s.wave !== void 0) o.wave = s.wave;
   if (s.fog) {
     o.fog = { w: s.fog.w, h: s.fog.h, explored: encodeBase64(s.fog.explored) };
@@ -215,7 +216,140 @@ function parseRadar(v) {
   if (r.time !== void 0) out.time = time;
   return out;
 }
+var MIGRATE_MAX_COORD = 8192;
+function migNum(v, dflt, min, max) {
+  const n = isNum(v) ? v : dflt;
+  return Math.min(max, Math.max(min, n));
+}
+var migStr = (v, dflt) => typeof v === "string" ? v : dflt;
+function migUnit(v) {
+  if (typeof v !== "object" || v === null) return null;
+  const u = v;
+  if (!isNum(u.id) || typeof u.kind !== "string") return null;
+  const out = {
+    id: u.id,
+    kind: u.kind,
+    x: migNum(u.x, 0, 0, MIGRATE_MAX_COORD),
+    y: migNum(u.y, 0, 0, MIGRATE_MAX_COORD),
+    hp: migNum(u.hp, 0, 0, Number.MAX_SAFE_INTEGER)
+  };
+  if (u.kills !== void 0) out.kills = migNum(u.kills, 0, 0, Number.MAX_SAFE_INTEGER);
+  return out;
+}
+function migBuilding(v) {
+  if (typeof v !== "object" || v === null) return null;
+  const b = v;
+  if (!isNum(b.id) || typeof b.kind !== "string") return null;
+  const out = {
+    id: b.id,
+    kind: b.kind,
+    gx: migNum(b.gx, 0, 0, MIGRATE_MAX_COORD),
+    gy: migNum(b.gy, 0, 0, MIGRATE_MAX_COORD),
+    hp: migNum(b.hp, 0, 0, Number.MAX_SAFE_INTEGER)
+  };
+  if (b.done !== void 0) out.done = b.done === true;
+  if (b.level !== void 0) out.level = migNum(b.level, 1, 1, 255);
+  if (b.repair !== void 0) out.repair = b.repair === true;
+  return out;
+}
+function migList(v, f) {
+  if (!Array.isArray(v)) return [];
+  const out = [];
+  for (const item of v) {
+    const m = f(item);
+    if (m !== null) out.push(m);
+  }
+  return out;
+}
 var MAX_SAFE = Number.MAX_SAFE_INTEGER;
+function migrateSnapshot(raw) {
+  const o = typeof raw === "object" && raw !== null && !Array.isArray(raw) ? raw : {};
+  const s = {
+    version: SAVE_VERSION,
+    seed: migNum(o.seed, 0, 0, MAX_SAFE),
+    credits: migNum(o.credits, 0, 0, MAX_SAFE),
+    elapsed: migNum(o.elapsed, 0, 0, MAX_SAFE),
+    units: migList(o.units, migUnit),
+    buildings: migList(o.buildings, migBuilding),
+    enemyUnits: migList(o.enemyUnits, migUnit),
+    enemyBuildings: migList(o.enemyBuildings, migBuilding)
+  };
+  if (typeof o.ai === "object" && o.ai !== null) {
+    const a = o.ai;
+    s.ai = {
+      phase: migStr(a.phase, "gather"),
+      credits: migNum(a.credits, 0, 0, MAX_SAFE),
+      army: migNum(a.army, 0, 0, MAX_SAFE),
+      wave: migNum(a.wave, 0, 0, MAX_SAFE)
+    };
+  }
+  if (typeof o.camera === "object" && o.camera !== null) {
+    const c = o.camera;
+    s.camera = {
+      x: migNum(c.x, 0, -MAX_SAFE, MAX_SAFE),
+      y: migNum(c.y, 0, -MAX_SAFE, MAX_SAFE),
+      zoom: migNum(c.zoom, 1, 0.1, 16)
+    };
+  }
+  if (typeof o.opts === "object" && o.opts !== null && !Array.isArray(o.opts)) {
+    const opts = {};
+    for (const [k, val] of Object.entries(o.opts)) {
+      if (isNum(val) || typeof val === "boolean") opts[k] = val;
+    }
+    s.opts = opts;
+  }
+  if (typeof o.difficulty === "string") s.difficulty = o.difficulty;
+  if (typeof o.mission === "string") s.mission = o.mission;
+  if (o.wave !== void 0) s.wave = migNum(o.wave, 0, 0, MAX_SAFE);
+  const fog = parseFog(o.fog);
+  if (fog) s.fog = fog;
+  if (typeof o.stats === "object" && o.stats !== null) {
+    const st = o.stats;
+    s.stats = {
+      unitsTrained: migNum(st.unitsTrained, 0, 0, MAX_SAFE),
+      unitsLost: migNum(st.unitsLost, 0, 0, MAX_SAFE),
+      kills: migNum(st.kills, 0, 0, MAX_SAFE),
+      buildingsBuilt: migNum(st.buildingsBuilt, 0, 0, MAX_SAFE),
+      buildingsLost: migNum(st.buildingsLost, 0, 0, MAX_SAFE),
+      oreMined: migNum(st.oreMined, 0, 0, MAX_SAFE),
+      wavesCleared: migNum(st.wavesCleared, 0, 0, MAX_SAFE),
+      elapsed: migNum(st.elapsed, 0, 0, MAX_SAFE),
+      over: st.over === true,
+      victory: st.victory === true
+    };
+  }
+  if (typeof o.weather === "object" && o.weather !== null) {
+    const w = o.weather;
+    if (isNum(w.seed)) {
+      const out = { seed: w.seed };
+      if (typeof w.kind === "string") out.kind = w.kind;
+      if (w.elapsed !== void 0) out.elapsed = migNum(w.elapsed, 0, 0, MAX_SAFE);
+      if (w.duration !== void 0) out.duration = migNum(w.duration, 0, 0, MAX_SAFE);
+      if (w.intensity !== void 0) out.intensity = migNum(w.intensity, 0, 0, 1);
+      s.weather = out;
+    }
+  }
+  if (typeof o.radar === "object" && o.radar !== null) {
+    const r = o.radar;
+    if (isNum(r.seed)) {
+      const out = { seed: r.seed };
+      if (r.phase !== void 0) out.phase = migNum(r.phase, 0, 0, MAX_SAFE);
+      if (r.time !== void 0) out.time = migNum(r.time, 0, 0, MAX_SAFE);
+      s.radar = out;
+    }
+  }
+  return s;
+}
+function migrateSave(text) {
+  let raw;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  return migrateSnapshot(raw);
+}
 var fail = (reason) => ({ ok: false, reason });
 function parseResult(text) {
   let raw;
@@ -261,6 +395,11 @@ function parseResult(text) {
     if (typeof o.difficulty !== "string") return fail("bad-field:difficulty");
     difficulty = o.difficulty;
   }
+  let mission;
+  if (o.mission !== void 0) {
+    if (typeof o.mission !== "string") return fail("bad-field:mission");
+    mission = o.mission;
+  }
   const s = {
     version: SAVE_VERSION,
     seed,
@@ -275,6 +414,7 @@ function parseResult(text) {
   if (camera !== void 0) s.camera = camera;
   if (opts !== void 0) s.opts = opts;
   if (difficulty !== void 0) s.difficulty = difficulty;
+  if (mission !== void 0) s.mission = mission;
   if (o.wave !== void 0) s.wave = wave;
   if (fog !== void 0) s.fog = fog;
   if (stats !== void 0) s.stats = stats;
@@ -289,6 +429,8 @@ function parse(text) {
 
 // src/game/saveload.ts
 var SLOT_IDS = [1, 2, 3];
+var AUTO_SLOT_ID = "auto";
+var ALL_SLOT_IDS = [...SLOT_IDS, AUTO_SLOT_ID];
 var KEY_PREFIX = "redalert.save.v2.";
 var slotKey = (id) => `${KEY_PREFIX}${id}`;
 var metaKey = (id) => `${slotKey(id)}.meta`;
@@ -309,6 +451,7 @@ function readMeta(storage, id) {
   if (!isNum2(m.savedAt) || !isNum2(m.elapsed) || !isNum2(m.credits) || typeof m.phase !== "string")
     return null;
   if (m.difficulty !== void 0 && typeof m.difficulty !== "string") return null;
+  if (m.mission !== void 0 && typeof m.mission !== "string") return null;
   if (m.result !== void 0 && typeof m.result !== "string") return null;
   const meta = {
     savedAt: m.savedAt,
@@ -317,24 +460,32 @@ function readMeta(storage, id) {
     phase: m.phase
   };
   if (m.difficulty !== void 0) meta.difficulty = m.difficulty;
+  if (m.mission !== void 0) meta.mission = m.mission;
   if (m.result !== void 0) meta.result = m.result;
   return meta;
 }
+function inspectSlot(storage, id) {
+  const text = storage.getItem(slotKey(id));
+  let status;
+  if (text === null) {
+    status = "empty";
+  } else {
+    const r = parseResult(text);
+    status = r.ok ? "ok" : r.reason === "bad-version" ? "version" : "corrupt";
+  }
+  return { id, meta: readMeta(storage, id), status };
+}
 function inspectSlots(storage) {
   return SLOT_IDS.map((id) => {
-    const text = storage.getItem(slotKey(id));
-    let status;
-    if (text === null) {
-      status = "empty";
-    } else {
-      const r = parseResult(text);
-      status = r.ok ? "ok" : r.reason === "bad-version" ? "version" : "corrupt";
-    }
-    return { id, meta: readMeta(storage, id), status };
+    const { meta, status } = inspectSlot(storage, id);
+    return { id, meta, status };
   });
 }
 function listSlots(storage) {
   return inspectSlots(storage);
+}
+function inspectAllSlots(storage) {
+  return ALL_SLOT_IDS.map((id) => inspectSlot(storage, id));
 }
 function resultOf(state, extra) {
   if (extra.result !== void 0) return extra.result;
@@ -351,6 +502,8 @@ function saveSlot(storage, id, state, extra = {}) {
   };
   const difficulty = extra.difficulty ?? state.difficulty;
   if (difficulty !== void 0) meta.difficulty = difficulty;
+  const mission = extra.mission ?? state.mission;
+  if (mission !== void 0) meta.mission = mission;
   storage.setItem(slotKey(id), serialize(state));
   storage.setItem(metaKey(id), JSON.stringify(meta));
   return meta;
@@ -359,13 +512,44 @@ function loadSlot(storage, id) {
   const text = storage.getItem(slotKey(id));
   return text === null ? null : parse(text);
 }
+function loadSlotResult(storage, id) {
+  const text = storage.getItem(slotKey(id));
+  if (text === null) return { ok: false, reason: "empty" };
+  return parseResult(text);
+}
+function loadSlotMigrated(storage, id) {
+  const text = storage.getItem(slotKey(id));
+  if (text === null) return null;
+  const r = parseResult(text);
+  return r.ok ? r.state : migrateSave(text);
+}
 function deleteSlot(storage, id) {
   storage.removeItem(slotKey(id));
   storage.removeItem(metaKey(id));
 }
+function saveAuto(storage, state, extra = {}) {
+  return saveSlot(storage, AUTO_SLOT_ID, state, extra);
+}
+function loadAuto(storage) {
+  return loadSlot(storage, AUTO_SLOT_ID);
+}
+function deleteAuto(storage) {
+  deleteSlot(storage, AUTO_SLOT_ID);
+}
+function autoSlotInfo(storage) {
+  return inspectSlot(storage, AUTO_SLOT_ID);
+}
 function latestSlot(storage) {
   let best = null;
   for (const info of listSlots(storage)) {
+    if (info.meta === null) continue;
+    if (best === null || best.meta === null || info.meta.savedAt > best.meta.savedAt) best = info;
+  }
+  return best;
+}
+function latestSave(storage) {
+  let best = null;
+  for (const info of inspectAllSlots(storage)) {
     if (info.meta === null) continue;
     if (best === null || best.meta === null || info.meta.savedAt > best.meta.savedAt) best = info;
   }
@@ -588,4 +772,104 @@ test("empty and meta-only slots read as empty status", () => {
   const infos = inspectSlots(s);
   assert.equal(infos[1].status, "empty");
   assert.equal(infos[1].meta?.credits, 5);
+});
+test("autosave slot round-trips and stays out of the manual list", () => {
+  const s = memStorage();
+  const meta = saveAuto(s, makeState(555), { phase: "playing", savedAt: 42 });
+  assert.equal(meta.credits, 555);
+  assert.equal(loadAuto(s)?.credits, 555);
+  assert.ok(s.map.has("redalert.save.v2.auto"));
+  assert.ok(s.map.has("redalert.save.v2.auto.meta"));
+  assert.deepEqual(listSlots(s).map((i) => i.id), [...SLOT_IDS]);
+  assert.deepEqual(autoSlotInfo(s), { id: "auto", meta, status: "ok" });
+  assert.deepEqual(inspectAllSlots(s).map((i) => i.id), [...ALL_SLOT_IDS]);
+  assert.deepEqual(inspectSlot(s, AUTO_SLOT_ID), autoSlotInfo(s));
+});
+test("autosave and manual slots are fully isolated", () => {
+  const s = memStorage();
+  saveSlot(s, 1, makeState(100), { savedAt: 1 });
+  saveAuto(s, makeState(999), { savedAt: 2 });
+  saveAuto(s, makeState(777), { savedAt: 3 });
+  assert.equal(loadSlot(s, 1)?.credits, 100);
+  assert.equal(loadAuto(s)?.credits, 777);
+  deleteSlot(s, 1);
+  assert.equal(loadSlot(s, 1), null);
+  assert.equal(loadAuto(s)?.credits, 777);
+  deleteAuto(s);
+  assert.equal(loadAuto(s), null);
+  assert.equal(autoSlotInfo(s).status, "empty");
+});
+test("loadSlotResult reports structured reasons, never throws", () => {
+  const s = memStorage();
+  assert.deepEqual(loadSlotResult(s, 1), { ok: false, reason: "empty" });
+  assert.deepEqual(loadSlotResult(s, AUTO_SLOT_ID), { ok: false, reason: "empty" });
+  s.map.set(slotKey(2), "{oops");
+  assert.deepEqual(loadSlotResult(s, 2), { ok: false, reason: "bad-json" });
+  s.map.set(slotKey(3), JSON.stringify({ version: 3, units: "many" }));
+  assert.deepEqual(loadSlotResult(s, 3), { ok: false, reason: "bad-field:units" });
+  s.map.set(slotKey(AUTO_SLOT_ID), JSON.stringify({ version: 99 }));
+  assert.deepEqual(loadSlotResult(s, AUTO_SLOT_ID), { ok: false, reason: "bad-version" });
+  saveSlot(s, 1, makeState(64), { savedAt: 9 });
+  const good = loadSlotResult(s, 1);
+  assert.equal(good.ok, true);
+  if (good.ok) assert.equal(good.state.credits, 64);
+});
+test("loadSlotMigrated repairs version-mismatched and field-damaged blobs", () => {
+  const s = memStorage();
+  s.map.set(slotKey(1), JSON.stringify({ version: 99, seed: 5, credits: -50, units: [] }));
+  assert.equal(loadSlot(s, 1), null);
+  const m1 = loadSlotMigrated(s, 1);
+  assert.equal(m1?.credits, 0);
+  assert.equal(m1?.seed, 5);
+  assert.equal(inspectSlots(s)[0].status, "version");
+  s.map.set(
+    slotKey(2),
+    JSON.stringify({
+      version: 2,
+      credits: "lots",
+      units: [{ id: 1, kind: "tank", x: -5, y: 3, hp: 40 }]
+    })
+  );
+  const m2 = loadSlotMigrated(s, 2);
+  assert.equal(m2?.credits, 0);
+  assert.equal(m2?.units?.[0]?.x, 0);
+  assert.equal(m2?.units?.[0]?.kind, "tank");
+  s.map.set(slotKey(3), "not json{");
+  assert.equal(loadSlotMigrated(s, 3), null);
+  assert.equal(loadSlotMigrated(s, AUTO_SLOT_ID), null);
+});
+test("slot meta carries the mission/level label", () => {
+  const s = memStorage();
+  const m1 = saveSlot(
+    s,
+    1,
+    { ...makeState(100), mission: "allied-2" },
+    { mission: "allied-3", savedAt: 1 }
+  );
+  assert.equal(m1.mission, "allied-3");
+  const m2 = saveSlot(s, 2, { ...makeState(200), mission: "soviet-1" }, { savedAt: 2 });
+  assert.equal(m2.mission, "soviet-1");
+  const m3 = saveAuto(s, makeState(300), { savedAt: 3 });
+  assert.equal("mission" in m3, false);
+  assert.equal(inspectAllSlots(s)[0].meta?.mission, "allied-3");
+  assert.equal(autoSlotInfo(s).meta?.mission, void 0);
+  s.map.set(
+    "redalert.save.v2.3.meta",
+    JSON.stringify({ savedAt: 1, elapsed: 0, credits: 5, phase: "p", mission: 7 })
+  );
+  assert.equal(inspectSlots(s)[2].meta, null);
+});
+test("latestSave picks the newest save including the autosave slot", () => {
+  const s = memStorage();
+  saveSlot(s, 1, makeState(100), { savedAt: 100 });
+  saveSlot(s, 3, makeState(300), { savedAt: 300 });
+  assert.equal(latestSave(s)?.id, 3);
+  saveAuto(s, makeState(50), { savedAt: 400 });
+  assert.equal(latestSave(s)?.id, "auto");
+  assert.equal(latestSlot(s)?.id, 3);
+  deleteAuto(s);
+  assert.equal(latestSave(s)?.id, 3);
+  deleteSlot(s, 3);
+  deleteSlot(s, 1);
+  assert.equal(latestSave(s), null);
 });
