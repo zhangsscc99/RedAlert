@@ -136,6 +136,15 @@ function minimapPointToWorld(map2, mm2, px, py) {
     y: (py - mm2.y) / mm2.h * map2.h * TILE_SIZE
   };
 }
+function worldToMinimap(map2, mm2, wx, wy) {
+  return {
+    x: mm2.x + wx / (map2.w * TILE_SIZE) * mm2.w,
+    y: mm2.y + wy / (map2.h * TILE_SIZE) * mm2.h
+  };
+}
+function minimapCameraFrame(cam, map2, mm2) {
+  return minimapViewRect(cam, map2, mm2);
+}
 function viewWorld(cam, viewW, viewH) {
   return { w: viewW / cam.zoom, h: viewH / cam.zoom };
 }
@@ -174,10 +183,26 @@ function minimapBoxToCamera(cam, map2, mm2, box, viewW, viewH) {
   cam.y = center.y - v.h / 2;
   return true;
 }
+function minimapDragPan(cam, map2, mm2, prev, cur) {
+  const a = minimapPointToWorld(map2, mm2, prev.x, prev.y);
+  const b = minimapPointToWorld(map2, mm2, cur.x, cur.y);
+  if (!a || !b) return null;
+  const d = { x: b.x - a.x, y: b.y - a.y };
+  cam.x += d.x;
+  cam.y += d.y;
+  return d;
+}
+function minimapIssueOrder(map2, mm2, px, py, onOrder) {
+  const w = minimapPointToWorld(map2, mm2, px, py);
+  if (!w) return null;
+  onOrder?.(w);
+  return w;
+}
 function createMinimapAlerts(opts = {}) {
   const duration = opts.durationMs ?? 4e3;
   const blink = opts.blinkMs ?? 250;
   const maxDots = opts.maxDots ?? 16;
+  const fade = Math.min(opts.fadeMs ?? 1500, duration);
   let alerts = [];
   return {
     get size() {
@@ -191,13 +216,36 @@ function createMinimapAlerts(opts = {}) {
       alerts = alerts.filter((a) => now - a.t < duration);
       return alerts.map((a) => ({
         ...a,
-        on: Math.floor((now - a.t) / blink) % 2 === 0
+        on: Math.floor((now - a.t) / blink) % 2 === 0,
+        alpha: clamp2((duration - (now - a.t)) / fade, 0, 1)
       }));
     },
     clear() {
       alerts = [];
     }
   };
+}
+function minimapEnemyDots(map2, mm2, enemies) {
+  return enemies.map((e) => ({ ...worldToMinimap(map2, mm2, e.x, e.y), count: 1 }));
+}
+function minimapUnitDots(map2, mm2, units, cellPx = 6) {
+  const cell = Math.max(1, cellPx);
+  const buckets = /* @__PURE__ */ new Map();
+  for (const u of units) {
+    const p = worldToMinimap(map2, mm2, u.x, u.y);
+    const cx = clamp2(Math.floor((p.x - mm2.x) / cell), 0, Math.ceil(mm2.w / cell) - 1);
+    const cy = clamp2(Math.floor((p.y - mm2.y) / cell), 0, Math.ceil(mm2.h / cell) - 1);
+    const key = cy * 4096 + cx;
+    const b = buckets.get(key);
+    if (b) {
+      b.sx += p.x;
+      b.sy += p.y;
+      b.count++;
+    } else {
+      buckets.set(key, { sx: p.x, sy: p.y, count: 1 });
+    }
+  }
+  return [...buckets.values()].map((b) => ({ x: b.sx / b.count, y: b.sy / b.count, count: b.count }));
 }
 
 // src/input/minimap.test.ts
@@ -327,4 +375,80 @@ test("minimapAlerts: respects maxDots eviction and clear()", () => {
   a.clear();
   assert.equal(a.size, 0);
   assert.deepEqual(a.active(200), []);
+});
+test("worldToMinimap / minimapCameraFrame: world\u2192mm mapping + full-map frame", () => {
+  assert.deepEqual(worldToMinimap(map, mm, 0, 0), { x: mm.x, y: mm.y });
+  const c = worldToMinimap(map, mm, WORLD / 2, WORLD / 2);
+  assert.ok(close(c.x, mm.x + mm.w / 2) && close(c.y, mm.y + mm.h / 2));
+  const cam = createCamera(map, 8192, 8192);
+  cam.zoom = MIN_ZOOM;
+  cam.x = -100;
+  cam.y = -100;
+  assert.deepEqual(minimapCameraFrame(cam, map, mm), mm);
+});
+test("minimapDragPan: continuous drag returns world delta and pans the camera", () => {
+  const cam = createCamera(map, 390, 844);
+  cam.x = 0;
+  cam.y = 0;
+  const a = { x: mm.x + mm.w / 2, y: mm.y + mm.h / 2 };
+  const b = { x: mm.x + mm.w / 4, y: mm.y + mm.h / 2 };
+  const d = minimapDragPan(cam, map, mm, a, b);
+  assert.ok(d && close(d.x, -WORLD / 4) && close(d.y, 0));
+  assert.ok(close(cam.x, -WORLD / 4) && close(cam.y, 0));
+  const d2 = minimapDragPan(cam, map, mm, b, a);
+  assert.ok(d2 && close(d2.x, WORLD / 4));
+  assert.ok(close(cam.x, 0));
+  const { x, y } = cam;
+  assert.equal(minimapDragPan(cam, map, mm, { x: mm.x - 1, y: mm.y }, a), null);
+  assert.equal(cam.x, x);
+  assert.equal(cam.y, y);
+});
+test("minimapIssueOrder: right-click resolves world point, only orders via callback", () => {
+  let got = null;
+  const w = minimapIssueOrder(map, mm, mm.x + mm.w / 2, mm.y + mm.h / 2, (p) => got = p);
+  assert.ok(w && close(w.x, WORLD / 2) && close(w.y, WORLD / 2));
+  assert.deepEqual(got, w);
+  got = null;
+  const w2 = minimapIssueOrder(map, mm, mm.x + mm.w / 2, mm.y + mm.h / 2);
+  assert.deepEqual(w2, w);
+  assert.equal(got, null);
+  assert.equal(minimapIssueOrder(map, mm, mm.x - 1, mm.y, (p) => got = p), null);
+  assert.equal(got, null);
+});
+test("minimapAlerts: dots fade out over the tail (deterministic on tick)", () => {
+  const a = createMinimapAlerts({ durationMs: 1e3, blinkMs: 100, fadeMs: 400 });
+  a.add(10, 20, 0);
+  assert.equal(a.active(0)[0].alpha, 1);
+  assert.equal(a.active(500)[0].alpha, 1);
+  assert.ok(close(a.active(800)[0].alpha, 0.5));
+  assert.deepEqual(a.active(1e3), []);
+});
+test("minimapEnemyDots: one dot per enemy, no merging", () => {
+  const dots = minimapEnemyDots(map, mm, [
+    { x: 0, y: 0 },
+    { x: 1, y: 1 },
+    // nearly same spot — still separate dots
+    { x: WORLD, y: WORLD }
+  ]);
+  assert.equal(dots.length, 3);
+  assert.ok(dots.every((d) => d.count === 1));
+  assert.ok(close(dots[0].x, mm.x) && close(dots[0].y, mm.y));
+});
+test("minimapUnitDots: same-cell units merge into one counted dot", () => {
+  const units = [
+    { x: 10, y: 10 },
+    { x: 20, y: 15 },
+    { x: 15, y: 25 },
+    { x: 5, y: 30 },
+    { x: WORLD, y: WORLD }
+    // far corner, own cell
+  ];
+  const dots = minimapUnitDots(map, mm, units, 20);
+  assert.equal(dots.length, 2);
+  const big = dots.find((d) => d.count === 4);
+  const lone = dots.find((d) => d.count === 1);
+  const cx = (10 + 20 + 15 + 5) / 4 / WORLD * mm.w + mm.x;
+  const cy = (10 + 15 + 25 + 30) / 4 / WORLD * mm.h + mm.y;
+  assert.ok(close(big.x, cx) && close(big.y, cy));
+  assert.ok(close(lone.x, mm.x + mm.w) && close(lone.y, mm.y + mm.h));
 });
