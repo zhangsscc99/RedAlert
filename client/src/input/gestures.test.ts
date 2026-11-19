@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createGestureRecognizer, type Gesture } from './gestures.js';
+import { createGestureRecognizer, createPanInertia, type Gesture } from './gestures.js';
 
 const T0 = 1_000_000;
 
@@ -276,4 +276,180 @@ test('doubletap: a third quick tap starts a fresh pair', () => {
     const out = g.up(1, 10, 10, T0 + i * 200 + 60);
     assert.equal(out[0]!.type, want);
   }
+});
+
+test('pinch anchor follows the midpoint: prevCenter chains across moves (no jump)', () => {
+  const g = createGestureRecognizer();
+  g.down(1, 100, 100, T0);
+  g.down(2, 200, 100, T0 + 10); // mid (150,100), spread 100
+  g.move(2, 240, 100, T0 + 20); // mid (170,100), spread 140
+  g.move(1, 120, 120, T0 + 30); // mid (180,110), spread ~134.2
+  const pinches = g
+    .tick(T0 + 40)
+    .filter((x): x is Extract<Gesture, { type: 'pinch' }> => x.type === 'pinch');
+  assert.equal(pinches.length, 2);
+  // First pinch anchors at the frame before it; each next anchors where the
+  // previous one ended — the anchor tracks the fingers, never teleports.
+  assert.deepEqual(pinches[0]!.prevCenter, { x: 150, y: 100 });
+  assert.deepEqual(pinches[0]!.center, { x: 170, y: 100 });
+  assert.deepEqual(pinches[1]!.prevCenter, pinches[0]!.center);
+  assert.deepEqual(pinches[1]!.center, { x: 180, y: 110 });
+});
+
+test('pinch anchor: symmetric spread keeps the anchor fixed', () => {
+  const g = createGestureRecognizer();
+  g.down(1, 100, 100, T0);
+  g.down(2, 200, 100, T0 + 10);
+  g.move(1, 90, 100, T0 + 20);
+  g.move(2, 210, 100, T0 + 25); // both ±10: spread +20, midpoint unchanged
+  const pinches = g
+    .tick(T0 + 30)
+    .filter((x): x is Extract<Gesture, { type: 'pinch' }> => x.type === 'pinch');
+  assert.equal(pinches.length, 2); // one frame per finger move
+  // The anchor lands back on the original midpoint once both fingers moved —
+  // symmetric spread never shifts the zoom anchor.
+  assert.deepEqual(pinches[1]!.center, { x: 150, y: 100 });
+  assert.deepEqual(pinches[1]!.prevCenter, pinches[0]!.center);
+  const scale = pinches.reduce((s, p) => s * p.scale, 1);
+  assert.ok(Math.abs(scale - 1.2) < 1e-9);
+});
+
+test('ring select: held longpress emits growing ring preview at the anchor', () => {
+  const g = createGestureRecognizer();
+  g.down(1, 50, 50, T0);
+  g.move(1, 53, 51, T0 + 100); // ~3.2px wobble, stays held
+  assert.equal(g.tick(T0 + 520)[0]!.type, 'longpress'); // ring clock starts here
+  const r1 = g.tick(T0 + 620)[0]!;
+  assert.equal(r1.type, 'ring');
+  assert.deepEqual({ x: (r1 as { x: number }).x, y: (r1 as { y: number }).y }, { x: 50, y: 50 });
+  const r2 = g.tick(T0 + 720)[0]!;
+  assert.equal(r2.type, 'ring');
+  // Radius grows linearly: 24 + 60px/s.
+  assert.equal((r1 as { radius: number }).radius, 24 + 60 * 0.1);
+  assert.equal((r2 as { radius: number }).radius, 24 + 60 * 0.2);
+});
+
+test('ringselect commits on release after holding past the ring minimum', () => {
+  const g = createGestureRecognizer();
+  g.down(1, 50, 50, T0);
+  g.tick(T0 + 520); // longpress fires, lpT = T0+520
+  g.tick(T0 + 800); // ring preview ticking
+  const out = g.up(1, 50, 50, T0 + 900); // 380ms after fire ≥ 150ms min hold
+  assert.equal(out.length, 1);
+  assert.deepEqual(out[0], { type: 'ringselect', x: 50, y: 50, radius: 24 + 60 * 0.38 });
+});
+
+test('ring select aborts when the finger converts to a dragbox', () => {
+  const g = createGestureRecognizer();
+  g.down(1, 50, 50, T0);
+  g.tick(T0 + 520);
+  g.move(1, 90, 80, T0 + 700); // past tolerance → box select takes over
+  assert.deepEqual(g.tick(T0 + 800).filter((x) => x.type === 'ring'), []);
+  const out = g.up(1, 90, 80, T0 + 900);
+  assert.equal(out.length, 1);
+  assert.equal(out[0]!.type, 'dragbox');
+});
+
+test('ring preview honors injectable start radius and growth rate', () => {
+  const g = createGestureRecognizer({
+    longPressMs: 200,
+    ringStartRadiusPx: 40,
+    ringGrowthPxPerSec: 100,
+  });
+  g.down(1, 0, 0, T0);
+  g.tick(T0 + 200); // longpress
+  const ring = g.tick(T0 + 500)[0]!;
+  assert.equal(ring.type, 'ring');
+  assert.equal((ring as { radius: number }).radius, 40 + 100 * 0.3);
+});
+
+test('fling: releasing a fast two-finger pan emits midpoint velocity (px/s)', () => {
+  const g = createGestureRecognizer();
+  g.down(1, 0, 0, T0);
+  g.down(2, 100, 0, T0 + 10);
+  g.move(1, 20, 0, T0 + 110); // mid +10 in 100ms → raw 100px/s, EMA first sample halves it
+  g.move(2, 120, 0, T0 + 210); // mid +10 in 100ms → EMA: 0.5*50 + 0.5*100 = 75px/s
+  g.tick(T0 + 220);
+  const out = g.up(1, 20, 0, T0 + 230);
+  const fling = out.find((x): x is Extract<Gesture, { type: 'fling' }> => x.type === 'fling');
+  assert.ok(fling);
+  assert.ok(Math.abs(fling.vx - 75) < 1e-9);
+  assert.equal(fling.vy, 0);
+});
+
+test('fling: a slow two-finger release stays quiet', () => {
+  const g = createGestureRecognizer();
+  g.down(1, 0, 0, T0);
+  g.down(2, 100, 0, T0 + 10);
+  g.move(2, 101, 0, T0 + 400); // mid +0.5 in 390ms ≈ 1.3px/s
+  g.tick(T0 + 410);
+  assert.deepEqual(g.up(1, 0, 0, T0 + 420), []);
+});
+
+test('inertia: velocity decays exponentially and the pan comes to rest', () => {
+  const inertia = createPanInertia({
+    bounds: { minX: -1e6, minY: -1e6, maxX: 1e6, maxY: 1e6 },
+  });
+  inertia.flick(600, 0, T0);
+  const d1 = inertia.tick(T0 + 500)!;
+  const d2 = inertia.tick(T0 + 1000)!;
+  assert.ok(d1.dx > 0 && d2.dx > 0);
+  assert.ok(d2.dx < d1.dx); // decay: each step covers less ground
+  // Eventually drops under minSpeed and reports rest.
+  let steps = 0;
+  while (inertia.moving && steps++ < 200) inertia.tick(T0 + 1000 + steps * 500);
+  assert.equal(inertia.moving, false);
+  assert.equal(inertia.tick(T0 + 200_000), null);
+});
+
+test('inertia: offset is clamped at bounds and velocity dies on the wall', () => {
+  const inertia = createPanInertia({ bounds: { minX: 0, minY: 0, maxX: 100, maxY: 50 }, x: 90, y: 25 });
+  inertia.flick(1000, -500, T0);
+  inertia.tick(T0 + 200); // would fly past both walls without clamp
+  assert.ok(inertia.x <= 100 && inertia.x >= 0);
+  assert.ok(inertia.y <= 50 && inertia.y >= 0);
+  assert.equal(inertia.x, 100); // pinned to the max edge
+  assert.equal(inertia.y, 0); // pinned to the min edge
+  assert.equal(inertia.moving, false); // no residual velocity after clamping
+});
+
+test('inertia: a fresh grab can reposition, a weak flick never starts', () => {
+  const inertia = createPanInertia({ bounds: { minX: 0, minY: 0, maxX: 10, maxY: 10 }, x: 5, y: 5 });
+  inertia.flick(4, 0, T0); // under the 8px/s rest speed
+  assert.equal(inertia.moving, false);
+  inertia.setPosition(99, -3); // clamped into bounds, no momentum
+  assert.equal(inertia.x, 10);
+  assert.equal(inertia.y, 0);
+});
+
+test('anti-mistouch: injectable tap distance/time thresholds', () => {
+  const g = createGestureRecognizer({ tapMaxPx: 4, tapMaxMs: 150 });
+  g.down(1, 0, 0, T0);
+  assert.deepEqual(g.up(1, 6, 0, T0 + 80), []); // 6px > 4px custom limit → no tap
+  g.down(1, 0, 0, T0 + 200);
+  assert.deepEqual(g.up(1, 3, 0, T0 + 380), []); // inside 4px but 180ms > 150ms → no tap
+  g.down(1, 0, 0, T0 + 500);
+  assert.equal(g.up(1, 3, 0, T0 + 580)[0]!.type, 'tap'); // inside both limits
+});
+
+test('doubletap select-same-kind: taps at the window edge still pair up', () => {
+  const g = createGestureRecognizer();
+  g.down(1, 100, 100, T0);
+  g.up(1, 100, 100, T0 + 60);
+  g.down(1, 100, 100, T0 + 320);
+  const out = g.up(1, 100, 100, T0 + 360); // release exactly doubleTapMs after the first
+  assert.equal(out.length, 1);
+  assert.deepEqual(out[0], { type: 'doubletap', x: 100, y: 100 });
+});
+
+test('doubletap select-same-kind: a dragged second press cannot pair', () => {
+  const g = createGestureRecognizer();
+  g.down(1, 0, 0, T0);
+  g.up(1, 0, 0, T0 + 60);
+  g.down(1, 5, 5, T0 + 100);
+  g.move(1, 40, 40, T0 + 140); // second press becomes a box drag
+  const out = g.up(1, 40, 40, T0 + 180);
+  assert.equal(out[0]!.type, 'dragbox');
+  g.down(1, 5, 5, T0 + 220); // next quick tap is a fresh tap, not a doubletap
+  assert.equal(g.up(1, 5, 5, T0 + 280)[0]!.type, 'tap');
 });
