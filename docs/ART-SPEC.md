@@ -52,12 +52,43 @@ export const THEME = {
 
 ## 2. 素材来源与规格
 
-### 2.1 主素材包（唯一允许的默认来源）
-- **Kenney Sci-Fi RTS**（CC0）— `https://kenney.nl/assets/sci-fi-rts`，120+ sprites：
-  单位、建筑、地形、环境物件。
-- 备选（同样 CC0）：**Kenney Tower Defense Top-Down**、**Screaming Brain Studios Sci-Fi Essentials Kit**。
-- 落地位置：`client/public/assets/kenney-scifi-rts/`（原始 PNG）+ `client/public/assets/atlas/`
-  （生成的图集 PNG + JSON）。**原始包里的 License.txt 必须一并复制保留。**
+### 2.1 主素材包（唯一允许的默认来源，已验证可下载）
+
+**Kenney Sci-Fi RTS — CC0**，2.0 MB，279 个文件，直接下载地址（opengameart 镜像，2026-11-19 实测 200）：
+
+```
+https://opengameart.org/sites/default/files/kenney_rtssci-fi.zip
+```
+
+包内结构（`scripts/fetch-assets.sh` 按这个路径解压，不要猜目录名）：
+
+```
+PNG/Retina/Unit/        49 个   scifiUnit_01..49.png      128×128（= 32×32 的 4 倍）
+PNG/Retina/Structure/   17 个   scifiStructure_01..17.png  128×128
+PNG/Retina/Tile/        43 个   scifiTile_01..43.png       128×128
+PNG/Retina/Environment/ 21 个   scifiEnvironment_01..21.png
+PNG/Default size/       同名的 1 倍尺寸版本（32×32 基准，运行时用这套）
+```
+
+落地位置：
+- 原始包（含 License）：`client/public/assets/kenney-scifi-rts/`
+- 生成的图集：`client/public/assets/atlas/{units,buildings,terrain}.png` + 同名 `.json`
+
+**贴图到游戏概念的映射（写死在 `render/sprites.ts` 的 MAP 表里，不许散落在绘制代码）**：
+
+| 概念 | 贴图 |
+|---|---|
+| 步兵 | `scifiUnit_01..04`（4 帧走路，按朝向选帧） |
+| 矿车 | `scifiUnit_05..06` |
+| 坦克 | `scifiUnit_07..09` |
+| 建筑：主基地 | `scifiStructure_01`（2×2 格） |
+| 建筑：兵营 | `scifiStructure_02` |
+| 建筑：电厂 | `scifiStructure_03` |
+| 建筑：矿厂 | `scifiStructure_04` |
+| 地形：草地 / 矿脉 / 水 | `scifiTile_01..12` / `scifiTile_13..20` / `scifiTile_21..28` |
+| 装饰：碎石 / 集装箱 | `scifiEnvironment_01..09` |
+
+备选包（同样 CC0，只有主包不够用时才考虑）：Kenney Tower Defense Top-Down、Screaming Brain Studios Sci-Fi Essentials Kit。
 
 ### 2.2 贴图规格
 - 统一 tile 基准：**32×32 px**，单位 24×24 或 32×32，建筑按 32 的整数倍。
