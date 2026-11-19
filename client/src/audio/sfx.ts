@@ -51,9 +51,78 @@ export interface SpatialParams {
 export const DEFAULT_SPATIAL: SpatialParams = {
   refDistance: 260,
   maxDistance: 1500,
-  minGain: 0.06,
+  // Far sources keep a 0.2x floor: audible but clearly distant.
+  minGain: 0.2,
   panRange: 0.8,
 };
+
+/** localStorage-shaped store; injectable so tests can run DOM-less. */
+export interface AudioStorageLike {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+}
+
+/**
+ * Persisted mixer state shared by the sfx and music buses: three
+ * independent 0..1 levels (master / sfx / music) whose gains multiply,
+ * plus the mute flag. One JSON blob so both modules stay in sync.
+ */
+export interface AudioBusState {
+  master: number;
+  sfx: number;
+  music: number;
+  muted: boolean;
+}
+
+export const AUDIO_STORAGE_KEY = 'redalert.audio';
+
+export const DEFAULT_AUDIO_STATE: AudioBusState = {
+  master: 0.5,
+  sfx: 1,
+  music: 0.25,
+  muted: false,
+};
+
+function clamp01(v: number): number {
+  return Math.min(1, Math.max(0, v));
+}
+
+function numOr(v: unknown, dflt: number): number {
+  return typeof v === 'number' && Number.isFinite(v) ? clamp01(v) : dflt;
+}
+
+/** Read the persisted mixer state; falls back to defaults on any error. */
+export function loadAudioState(storage?: AudioStorageLike): AudioBusState {
+  const s = { ...DEFAULT_AUDIO_STATE };
+  try {
+    const raw = storage?.getItem(AUDIO_STORAGE_KEY);
+    if (raw) {
+      const p = JSON.parse(raw) as Partial<AudioBusState>;
+      s.master = numOr(p.master, s.master);
+      s.sfx = numOr(p.sfx, s.sfx);
+      s.music = numOr(p.music, s.music);
+      if (typeof p.muted === 'boolean') s.muted = p.muted;
+    }
+  } catch {
+    /* corrupt blob or unavailable storage — keep defaults */
+  }
+  return s;
+}
+
+/** Merge `patch` into the stored blob; never throws. */
+export function saveAudioState(
+  storage: AudioStorageLike | undefined,
+  patch: Partial<AudioBusState>,
+): void {
+  try {
+    storage?.setItem(
+      AUDIO_STORAGE_KEY,
+      JSON.stringify({ ...loadAudioState(storage), ...patch }),
+    );
+  } catch {
+    /* storage unavailable — mixer settings just won't persist */
+  }
+}
 
 /**
  * Map a world-space point to a gain/pan pair relative to the camera view
@@ -81,10 +150,27 @@ export function spatialMix(
   return { gain, pan };
 }
 
+/** Optional injections for createSfx: clock + persistent mixer storage. */
+export interface SfxOptions {
+  /** Millisecond clock used for rate limiting; defaults to performance.now. */
+  now?: () => number;
+  /** Mixer-state persistence; defaults to window.localStorage when present. */
+  storage?: AudioStorageLike;
+}
+
 export interface Sfx {
   readonly enabled: boolean;
+  /** Master bus level 0..1 — multiplies the sfx and group buses. */
   masterVolume: number;
+  /** Sfx bus level 0..1 — sits between master and the group buses. */
+  sfxVolume: number;
+  readonly muted: boolean;
   setEnabled(on: boolean): void;
+  /** Mute toggle; equivalent to setEnabled(!m) and persisted. */
+  setMuted(m: boolean): void;
+  /** Persisted master/sfx bus levels, 0..1. */
+  setMasterVolume(v: number): void;
+  setSfxVolume(v: number): void;
   /**
    * Play a named effect. `opts.gain` (0..1) and `opts.pan` (-1..1) scale
    * loudness/stereo position for off-screen or distance-attenuated
@@ -115,19 +201,46 @@ export interface Sfx {
   dispose(): void;
 }
 
-const RATE_LIMIT_MS = 80;
+const RATE_LIMIT_MS = 40;
 const VOICE_RATE_LIMIT_MS = 90;
+/** Concurrent voice cap — extra triggers steal the oldest voice. */
+const MAX_VOICES = 8;
+/** Upper bound on a shot's tail; voices older than this are reapable. */
+const VOICE_TTL_MS = 2000;
 const GROUPS: readonly SfxGroup[] = ['ui', 'combat', 'voice'];
 const hasWindow = typeof window !== 'undefined';
 
-export function createSfx(): Sfx {
+function defaultClock(): () => number {
+  return typeof performance !== 'undefined'
+    ? () => performance.now()
+    : () => Date.now();
+}
+
+/** window.localStorage when reachable, else undefined — never throws. */
+export function defaultAudioStorage(): AudioStorageLike | undefined {
+  try {
+    return hasWindow ? window.localStorage : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function createSfx(options: SfxOptions = {}): Sfx {
+  const now = options.now ?? defaultClock();
+  const storage =
+    options.storage !== undefined ? options.storage : defaultAudioStorage();
+  const persisted = loadAudioState(storage);
   let ctx: AudioContext | null = null;
   let master: GainNode | null = null;
-  let enabled = true;
-  let volume = 0.5;
+  let sfxBus: GainNode | null = null;
+  let enabled = !persisted.muted;
+  let volume = persisted.master;
+  let sfxVol = persisted.sfx;
   const groupVol: Record<SfxGroup, number> = { ui: 1, combat: 1, voice: 1 };
   const buses = {} as Record<SfxGroup, GainNode>;
   const lastPlay = new Map<string, number>();
+  /** Live voices, oldest first — capped at MAX_VOICES by stealing. */
+  const voices: { t: number; gain: GainNode }[] = [];
   const spatial: SpatialParams = { ...DEFAULT_SPATIAL };
 
   function ensureCtx(): AudioContext | null {
@@ -142,13 +255,17 @@ export function createSfx(): Sfx {
         .webkitAudioContext;
     if (!AC) return null;
     ctx = new AC();
+    // Three-level bus: master -> sfx -> per-group -> voice gains.
     master = ctx.createGain();
     master.gain.value = volume;
     master.connect(ctx.destination);
+    sfxBus = ctx.createGain();
+    sfxBus.gain.value = sfxVol;
+    sfxBus.connect(master);
     for (const g of GROUPS) {
       const bus = ctx.createGain();
       bus.gain.value = groupVol[g];
-      bus.connect(master);
+      bus.connect(sfxBus);
       buses[g] = bus;
     }
     if (ctx.state === 'suspended') void ctx.resume();
@@ -173,10 +290,10 @@ export function createSfx(): Sfx {
   }
 
   function rateOk(key: string, ms: number): boolean {
-    const now = performance.now();
+    const t = now();
     const last = lastPlay.get(key) ?? -Infinity;
-    if (now - last < ms) return false;
-    lastPlay.set(key, now);
+    if (t - last < ms) return false;
+    lastPlay.set(key, t);
     return true;
   }
 
@@ -605,11 +722,33 @@ export function createSfx(): Sfx {
       return volume;
     },
     set masterVolume(v: number) {
-      volume = Math.min(1, Math.max(0, v));
-      if (master && ctx) master.gain.setTargetAtTime(volume, ctx.currentTime, 0.02);
+      api.setMasterVolume(v);
+    },
+    get sfxVolume(): number {
+      return sfxVol;
+    },
+    set sfxVolume(v: number) {
+      api.setSfxVolume(v);
+    },
+    get muted(): boolean {
+      return !enabled;
     },
     setEnabled(on: boolean): void {
       enabled = on;
+      saveAudioState(storage, { muted: !on });
+    },
+    setMuted(m: boolean): void {
+      api.setEnabled(!m);
+    },
+    setMasterVolume(v: number): void {
+      volume = clamp01(v);
+      if (master && ctx) master.gain.setTargetAtTime(volume, ctx.currentTime, 0.02);
+      saveAudioState(storage, { master: volume });
+    },
+    setSfxVolume(v: number): void {
+      sfxVol = clamp01(v);
+      if (sfxBus && ctx) sfxBus.gain.setTargetAtTime(sfxVol, ctx.currentTime, 0.02);
+      saveAudioState(storage, { sfx: sfxVol });
     },
     play(name, opts): void {
       if (!enabled) return;
@@ -617,7 +756,7 @@ export function createSfx(): Sfx {
       const c = readyCtx();
       if (!c) return;
       const s = shots[name];
-      let bus: AudioNode = buses[s.group] ?? master!;
+      let bus: AudioNode = buses[s.group] ?? sfxBus ?? master!;
       // Distance/off-screen attenuation + stereo position: throwaway nodes
       // staged before the group bus so group/master volumes still apply.
       let gain = opts?.gain;
@@ -632,6 +771,34 @@ export function createSfx(): Sfx {
         g.gain.value = Math.min(1, Math.max(0, gain));
         g.connect(bus);
         bus = g;
+      }
+      // Per-voice staging node so the concurrency cap can fade and drop
+      // the oldest voice instead of letting stacked shots clip.
+      {
+        const t = now();
+        while (voices.length > 0 && t - voices[0]!.t > VOICE_TTL_MS) {
+          const dead = voices.shift()!;
+          try {
+            dead.gain.disconnect();
+          } catch {
+            /* already disconnected */
+          }
+        }
+        if (voices.length >= MAX_VOICES) {
+          const old = voices.shift()!;
+          old.gain.gain.setTargetAtTime(0, c.currentTime, 0.015);
+          setTimeout(() => {
+            try {
+              old.gain.disconnect();
+            } catch {
+              /* already disconnected */
+            }
+          }, 60);
+        }
+        const vg = c.createGain();
+        vg.connect(bus);
+        bus = vg;
+        voices.push({ t, gain: vg });
       }
       if (
         pan !== undefined &&
@@ -675,7 +842,9 @@ export function createSfx(): Sfx {
         void ctx.close();
         ctx = null;
         master = null;
+        sfxBus = null;
       }
+      voices.length = 0;
       lastPlay.clear();
     },
   };
