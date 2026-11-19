@@ -9,7 +9,15 @@ export type StatsEvent =
   | { type: 'buildingLost'; building: string; time?: number }
   | { type: 'mined'; amount: number; time?: number }
   | { type: 'waveCleared'; wave: number; time?: number }
+  | { type: 'action'; time?: number }
+  | { type: 'funds'; amount: number; time?: number }
   | { type: 'gameOver'; victory: boolean; elapsed: number };
+
+/** 资金曲线上的一个采样点（t 为秒）。 */
+export interface FundsSample {
+  t: number;
+  credits: number;
+}
 
 export interface Stats {
   unitsTrained: number;
@@ -22,6 +30,16 @@ export interface Stats {
   elapsed: number; // seconds survived
   over: boolean;
   victory: boolean;
+  /** 玩家指令数（APM 近似的分子）。 */
+  actions: number;
+  /** 己方单位损失按兵种细分。 */
+  unitsLostByKind: Record<string, number>;
+  /** 己方建筑损失按类型细分。 */
+  buildingsLostByKind: Record<string, number>;
+  /** 击杀数按目标兵种细分。 */
+  killsByKind: Record<string, number>;
+  /** 资金曲线采样点（时间升序，超出上限后抽稀）。 */
+  funds: FundsSample[];
 }
 
 export function createStats(): Stats {
@@ -36,6 +54,11 @@ export function createStats(): Stats {
     elapsed: 0,
     over: false,
     victory: false,
+    actions: 0,
+    unitsLostByKind: {},
+    buildingsLostByKind: {},
+    killsByKind: {},
+    funds: [],
   };
 }
 
@@ -51,10 +74,12 @@ export function record(s: Stats, e: StatsEvent): void {
       break;
     case 'unitLost':
       s.unitsLost++;
+      s.unitsLostByKind[e.unit] = (s.unitsLostByKind[e.unit] ?? 0) + 1;
       bump(s, e.time);
       break;
     case 'kill':
       s.kills++;
+      s.killsByKind[e.unit] = (s.killsByKind[e.unit] ?? 0) + 1;
       bump(s, e.time);
       break;
     case 'buildingBuilt':
@@ -63,6 +88,15 @@ export function record(s: Stats, e: StatsEvent): void {
       break;
     case 'buildingLost':
       s.buildingsLost++;
+      s.buildingsLostByKind[e.building] = (s.buildingsLostByKind[e.building] ?? 0) + 1;
+      bump(s, e.time);
+      break;
+    case 'action':
+      s.actions++;
+      bump(s, e.time);
+      break;
+    case 'funds':
+      pushFunds(s, e.time ?? s.elapsed, e.amount);
       bump(s, e.time);
       break;
     case 'mined':
@@ -153,6 +187,115 @@ export function reportLines(s: Stats, _locale: 'zh' | 'en' = 'zh'): string[] {
     `存活时长：${dur}`,
     `得分：${m.score}`,
     `评级：${m.grade}`,
+  ];
+}
+
+// --- debrief （复盘） ---
+
+/** 资金曲线采样点数上限；超出后按每两点取一点抽稀。 */
+export const FUNDS_MAX_SAMPLES = 120;
+
+function pushFunds(s: Stats, t: number, credits: number): void {
+  if (s.funds.length >= FUNDS_MAX_SAMPLES) {
+    // 采样率减半：保留偶数下标点，首点永不丢，最新值由随后的 push 补上。
+    s.funds = s.funds.filter((_, i) => i % 2 === 0);
+  }
+  s.funds.push({ t, credits });
+}
+
+/** APM 近似：每分钟指令数 = actions / elapsed(分钟)，四舍五入；时长为 0 时为 0。 */
+export function apm(s: Stats): number {
+  if (s.elapsed <= 0) return 0;
+  return Math.round((s.actions * 60) / s.elapsed);
+}
+
+/** 分项排行条目。 */
+export interface RankedKind {
+  kind: string;
+  count: number;
+}
+
+/**
+ * 把 {kind: count} 映射排成降序榜单；数量相同按 kind 字典序，
+ * limit 截断前 N 名。
+ */
+export function rankKinds(
+  counts: Readonly<Record<string, number>>,
+  limit = Number.POSITIVE_INFINITY,
+): RankedKind[] {
+  return Object.entries(counts)
+    .map(([kind, count]) => ({ kind, count }))
+    .sort(
+      (a, b) =>
+        b.count - a.count || (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0),
+    )
+    .slice(0, Math.max(0, limit));
+}
+
+/** 复盘页用的结构化数据：分项统计 + APM + 资金曲线 + 各类排行。 */
+export interface Debrief {
+  over: boolean;
+  victory: boolean;
+  duration: number;
+  oreMined: number;
+  kills: number;
+  unitsLost: number;
+  unitsTrained: number;
+  buildingsBuilt: number;
+  buildingsLost: number;
+  wavesCleared: number;
+  actions: number;
+  apm: number;
+  score: number;
+  grade: Grade;
+  /** 资金曲线采样点（副本，时间升序）。 */
+  funds: FundsSample[];
+  /** 单位损失按兵种排行（降序）。 */
+  unitLossRank: RankedKind[];
+  /** 建筑损失按类型排行（降序）。 */
+  buildingLossRank: RankedKind[];
+  /** 击杀按目标兵种排行（降序）。 */
+  killRank: RankedKind[];
+}
+
+export function debrief(s: Stats): Debrief {
+  const m = summary(s);
+  return {
+    over: s.over,
+    victory: s.victory,
+    duration: s.elapsed,
+    oreMined: s.oreMined,
+    kills: s.kills,
+    unitsLost: s.unitsLost,
+    unitsTrained: s.unitsTrained,
+    buildingsBuilt: s.buildingsBuilt,
+    buildingsLost: s.buildingsLost,
+    wavesCleared: s.wavesCleared,
+    actions: s.actions,
+    apm: apm(s),
+    score: m.score,
+    grade: m.grade,
+    funds: s.funds.slice(),
+    unitLossRank: rankKinds(s.unitsLostByKind),
+    buildingLossRank: rankKinds(s.buildingsLostByKind),
+    killRank: rankKinds(s.killsByKind),
+  };
+}
+
+/** 复盘页左栏「总览」文本行，行数固定（见 render/panel.ts 的 statRows）。 */
+export function debriefLines(d: Debrief): string[] {
+  const mm = Math.floor(d.duration / 60);
+  const ss = Math.floor(d.duration % 60);
+  const dur = `${mm}分${String(ss).padStart(2, '0')}秒`;
+  return [
+    `结果：${d.victory ? '胜利' : '战败'}`,
+    `用时：${dur}　评级：${d.grade}`,
+    `得分：${d.score}`,
+    `击杀：${d.kills}　损失：${d.unitsLost + d.buildingsLost}`,
+    `采矿：${d.oreMined}　训练：${d.unitsTrained}`,
+    `建造：${d.buildingsBuilt}　存留：${Math.max(0, d.buildingsBuilt - d.buildingsLost)}`,
+    `击退波次：${d.wavesCleared}`,
+    `APM：${d.apm}（${d.actions} 次操作）`,
   ];
 }
 
