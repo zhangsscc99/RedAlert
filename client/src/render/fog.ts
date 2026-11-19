@@ -9,21 +9,31 @@ import { TILE_SIZE, type Camera, type Fog } from '../game/index.ts';
 const SUB = 4;
 /** Box-blur radius in subpixels (~0.75 tile) — softens shroud edges. */
 const BLUR_R = 3;
+/** Second, tighter pass — approximates a gaussian so edges are gradient-soft. */
+const BLUR_R2 = 2;
 /** Cross-fade duration when visibility changes. */
-const FADE_MS = 150;
+const FADE_MS = 240;
 
-/** Unseen: near-black, fully opaque. */
-const UNSEEN = { r: 4, g: 6, b: 12, a: 255 };
+/** Unseen: pure black shroud, fully opaque. */
+const UNSEEN = { r: 0, g: 0, b: 0, a: 255 };
 /** Explored but not currently visible: translucent slate — dims/desaturates. */
 const DIMMED = { r: 52, g: 56, b: 66, a: 122 };
+
+/**
+ * Camera captured by the last drawFog call. Weather overlays read this to
+ * offset their particles for parallax (drawFog runs before them each frame).
+ */
+export const fogCamera: { x: number; y: number; zoom: number } = { x: 0, y: 0, zoom: 1 };
 
 export interface FogLayer {
   w: number;
   h: number;
   /** Canvas blitted this frame. */
   curr: HTMLCanvasElement;
-  /** Previous bake, kept for the cross-fade. */
+  /** Previous displayed state, kept for the cross-fade. */
   prev: HTMLCanvasElement;
+  /** Scratch canvas used to snapshot a mid-fade blend on rebake. */
+  mix: HTMLCanvasElement;
   /** True once a second bake exists to fade from. */
   hasPrev: boolean;
   img: ImageData;
@@ -42,8 +52,9 @@ export function createFogLayer(fog: Fog): FogLayer {
   const h = fog.h * SUB;
   const curr = makeCanvas(w, h);
   const prev = makeCanvas(w, h);
+  const mix = makeCanvas(w, h);
   const img = curr.getContext('2d')!.createImageData(w, h);
-  return { w: fog.w, h: fog.h, curr, prev, hasPrev: false, img, fadeStart: 0 };
+  return { w: fog.w, h: fog.h, curr, prev, mix, hasPrev: false, img, fadeStart: 0 };
 }
 
 /** Separable box blur over all 4 channels, edge-clamped. In-place. */
@@ -115,14 +126,29 @@ export function bakeFog(fog: Fog, layer: FogLayer): void {
     }
   }
   boxBlur(d, pw, fog.h * SUB, BLUR_R);
+  boxBlur(d, pw, fog.h * SUB, BLUR_R2);
 
-  // Swap curr/prev so the outgoing bake stays available for the fade.
-  const old = layer.curr;
+  // If a fade is still running, snapshot the currently displayed blend into
+  // `mix` so the new fade starts from what the player actually sees — a unit
+  // stepping tile-to-tile then produces continuous motion, not a chain of
+  // restarts from a stale bake.
+  const now = performance.now();
+  const tNow = layer.hasPrev ? Math.min(1, (now - layer.fadeStart) / FADE_MS) : 1;
+  const mctx = layer.mix.getContext('2d')!;
+  mctx.globalAlpha = 1;
+  mctx.drawImage(layer.prev, 0, 0);
+  mctx.globalAlpha = tNow;
+  mctx.drawImage(layer.curr, 0, 0);
+  mctx.globalAlpha = 1;
+
+  // Rotate: old prev becomes the new bake target, mix becomes the fade-from.
+  const oldCurr = layer.curr;
   layer.curr = layer.prev;
-  layer.prev = old;
+  layer.prev = layer.mix;
+  layer.mix = oldCurr;
   layer.curr.getContext('2d')!.putImageData(layer.img, 0, 0);
   layer.hasPrev = true;
-  layer.fadeStart = performance.now();
+  layer.fadeStart = now;
 }
 
 function blit(
@@ -157,9 +183,14 @@ export function drawFog(
   viewW: number,
   viewH: number,
 ): void {
-  const t = layer.hasPrev
+  fogCamera.x = cam.x;
+  fogCamera.y = cam.y;
+  fogCamera.zoom = cam.zoom;
+  const lin = layer.hasPrev
     ? Math.min(1, (performance.now() - layer.fadeStart) / FADE_MS)
     : 1;
+  // Smoothstep easing: slow out of the previous state, settle gently.
+  const t = lin * lin * (3 - 2 * lin);
   ctx.imageSmoothingEnabled = true;
   if (t < 1) blit(ctx, cam, layer.prev, viewW, viewH, 1 - t);
   blit(ctx, cam, layer.curr, viewW, viewH, t);
