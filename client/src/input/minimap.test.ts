@@ -7,10 +7,16 @@ import { createCamera, minimapViewRect, MIN_ZOOM, MAX_ZOOM } from '../game/camer
 import { generateMap, TILE_SIZE } from '../game/grid.js';
 import {
   minimapPointToWorld,
+  worldToMinimap,
+  minimapCameraFrame,
   minimapPanTo,
+  minimapDragPan,
+  minimapIssueOrder,
   minimapDragRect,
   minimapBoxToCamera,
   createMinimapAlerts,
+  minimapEnemyDots,
+  minimapUnitDots,
 } from './minimap.js';
 
 const map = generateMap(1337); // 64x64 tiles → 2048x2048 world px
@@ -163,4 +169,93 @@ test('minimapAlerts: respects maxDots eviction and clear()', () => {
   a.clear();
   assert.equal(a.size, 0);
   assert.deepEqual(a.active(200), []);
+});
+
+// ---------------------------------------------- F1211: command depth ----
+
+test('worldToMinimap / minimapCameraFrame: world→mm mapping + full-map frame', () => {
+  assert.deepEqual(worldToMinimap(map, mm, 0, 0), { x: mm.x, y: mm.y });
+  const c = worldToMinimap(map, mm, WORLD / 2, WORLD / 2);
+  assert.ok(close(c.x, mm.x + mm.w / 2) && close(c.y, mm.y + mm.h / 2));
+  // View larger than the whole map → frame covers the full minimap rect.
+  const cam = createCamera(map, 8192, 8192);
+  cam.zoom = MIN_ZOOM;
+  cam.x = -100;
+  cam.y = -100;
+  assert.deepEqual(minimapCameraFrame(cam, map, mm), mm);
+});
+
+test('minimapDragPan: continuous drag returns world delta and pans the camera', () => {
+  const cam = createCamera(map, 390, 844);
+  cam.x = 0;
+  cam.y = 0;
+  const a = { x: mm.x + mm.w / 2, y: mm.y + mm.h / 2 };
+  const b = { x: mm.x + mm.w / 4, y: mm.y + mm.h / 2 };
+  const d = minimapDragPan(cam, map, mm, a, b);
+  assert.ok(d && close(d.x, -WORLD / 4) && close(d.y, 0));
+  assert.ok(close(cam.x, -WORLD / 4) && close(cam.y, 0));
+  // Keep dragging — deltas accumulate per move.
+  const d2 = minimapDragPan(cam, map, mm, b, a);
+  assert.ok(d2 && close(d2.x, WORLD / 4));
+  assert.ok(close(cam.x, 0));
+  // Outside the minimap → no pan, null delta.
+  const { x, y } = cam;
+  assert.equal(minimapDragPan(cam, map, mm, { x: mm.x - 1, y: mm.y }, a), null);
+  assert.equal(cam.x, x);
+  assert.equal(cam.y, y);
+});
+
+test('minimapIssueOrder: right-click resolves world point, only orders via callback', () => {
+  let got: { x: number; y: number } | null = null;
+  const w = minimapIssueOrder(map, mm, mm.x + mm.w / 2, mm.y + mm.h / 2, (p) => (got = p));
+  assert.ok(w && close(w.x, WORLD / 2) && close(w.y, WORLD / 2));
+  assert.deepEqual(got, w);
+  // No callback → resolves the point but issues no order.
+  got = null;
+  const w2 = minimapIssueOrder(map, mm, mm.x + mm.w / 2, mm.y + mm.h / 2);
+  assert.deepEqual(w2, w);
+  assert.equal(got, null);
+  // Outside → null, callback not invoked.
+  assert.equal(minimapIssueOrder(map, mm, mm.x - 1, mm.y, (p) => (got = p)), null);
+  assert.equal(got, null);
+});
+
+test('minimapAlerts: dots fade out over the tail (deterministic on tick)', () => {
+  const a = createMinimapAlerts({ durationMs: 1000, blinkMs: 100, fadeMs: 400 });
+  a.add(10, 20, 0);
+  assert.equal(a.active(0)[0]!.alpha, 1); // fresh: full opacity
+  assert.equal(a.active(500)[0]!.alpha, 1); // fade hasn't started yet
+  assert.ok(close(a.active(800)![0]!.alpha, 0.5)); // halfway through the tail
+  assert.deepEqual(a.active(1000), []); // expired
+});
+
+test('minimapEnemyDots: one dot per enemy, no merging', () => {
+  const dots = minimapEnemyDots(map, mm, [
+    { x: 0, y: 0 },
+    { x: 1, y: 1 }, // nearly same spot — still separate dots
+    { x: WORLD, y: WORLD },
+  ]);
+  assert.equal(dots.length, 3);
+  assert.ok(dots.every((d) => d.count === 1));
+  assert.ok(close(dots[0]!.x, mm.x) && close(dots[0]!.y, mm.y));
+});
+
+test('minimapUnitDots: same-cell units merge into one counted dot', () => {
+  // cellPx=20 on a 120px minimap → 6x6 cells; cluster 4 units into one cell.
+  const units = [
+    { x: 10, y: 10 },
+    { x: 20, y: 15 },
+    { x: 15, y: 25 },
+    { x: 5, y: 30 },
+    { x: WORLD, y: WORLD }, // far corner, own cell
+  ];
+  const dots = minimapUnitDots(map, mm, units, 20);
+  assert.equal(dots.length, 2);
+  const big = dots.find((d) => d.count === 4)!;
+  const lone = dots.find((d) => d.count === 1)!;
+  // Centroid of the four world points, projected to minimap space.
+  const cx = ((10 + 20 + 15 + 5) / 4 / WORLD) * mm.w + mm.x;
+  const cy = ((10 + 15 + 25 + 30) / 4 / WORLD) * mm.h + mm.y;
+  assert.ok(close(big.x, cx) && close(big.y, cy));
+  assert.ok(close(lone.x, mm.x + mm.w) && close(lone.y, mm.y + mm.h));
 });
