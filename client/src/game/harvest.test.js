@@ -503,6 +503,7 @@ function toIdle(h) {
   h.state = "idle";
   h.target = null;
   h.replans = 0;
+  h.dropoffId = void 0;
   h.unit.path = [];
   resetWatchdog(h);
 }
@@ -591,6 +592,7 @@ function sendToRefinery(h, map, buildings, blockers, forRepair = false) {
   const uy = worldToTile(h.unit.y);
   const b = dropoffBuilding(buildings, ux, uy);
   if (!b) return false;
+  h.dropoffId = b.id;
   const def = BUILDING_DEFS[b.kind];
   const goal = { x: Math.floor(b.gx + def.w / 2), y: Math.floor(b.gy + def.h / 2) };
   const path = findPathAvoiding(map, { x: ux, y: uy }, goal, blockers);
@@ -612,12 +614,69 @@ function sendToRefinery(h, map, buildings, blockers, forRepair = false) {
 function hasDropoff(buildings) {
   return buildings.some((b) => b.done && (b.kind === "refinery" || b.kind === "hq"));
 }
+function dropoffAlive(h, buildings) {
+  if (h.dropoffId == null) return true;
+  return buildings.some(
+    (b) => b.id === h.dropoffId && b.done && (b.kind === "refinery" || b.kind === "hq")
+  );
+}
+function isReturnCommitted(h) {
+  return h.cargo > 0 && (h.state === "toRefinery" || h.state === "unloading" || h.state === "toRepair");
+}
+function planOreAssignments(hs, map) {
+  const reserves = new Float64Array(map.w * map.h);
+  const live = reservesByMap.get(map);
+  for (const t of oreTiles(map)) {
+    const i = idx(map, t.x, t.y);
+    reserves[i] = live ? live[i] : ORE_RESERVE;
+  }
+  const claims = /* @__PURE__ */ new Map();
+  for (const h of hs) {
+    if (h.unit.kind === "harvester" && (h.state === "toOre" || h.state === "mining") && h.target !== null && isOre(map, h.target.x, h.target.y)) {
+      const i = idx(map, h.target.x, h.target.y);
+      claims.set(i, (claims.get(i) ?? 0) + 1);
+    }
+  }
+  const out = /* @__PURE__ */ new Map();
+  for (const h of hs) {
+    if (h.unit.kind !== "harvester" || h.unit.hp <= 0) continue;
+    if (h.cargo >= HARVEST_CAPACITY || isReturnCommitted(h)) continue;
+    const ux = worldToTile(h.unit.x);
+    const uy = worldToTile(h.unit.y);
+    const own = (h.state === "toOre" || h.state === "mining") && h.target !== null ? idx(map, h.target.x, h.target.y) : -1;
+    if (own >= 0 && reserves[own] > 0) {
+      out.set(h, { x: h.target.x, y: h.target.y });
+      continue;
+    }
+    let best = null;
+    for (const t of oreTiles(map)) {
+      const i = idx(map, t.x, t.y);
+      const reserve = reserves[i];
+      if (reserve <= 0) continue;
+      const claimants = (claims.get(i) ?? 0) - (i === own ? 1 : 0);
+      if (claimants >= MAX_MINERS_PER_TILE) continue;
+      const d2 = (t.x - ux) ** 2 + (t.y - uy) ** 2;
+      const score = oreScore(d2, claimants, reserve);
+      if (!best || score < best.score) best = { i, t, score };
+    }
+    if (best) {
+      out.set(h, { x: best.t.x, y: best.t.y });
+      claims.set(best.i, (claims.get(best.i) ?? 0) + 1);
+    }
+  }
+  return out;
+}
 function updateHarvesters(hs, map, buildings, economy, dt, obstacles, regen) {
   const depleted = [];
   if (dt <= 0) return depleted;
   const reserves = reserveTable(map);
   const blockers = buildingBlockers(obstacles ?? buildings);
   const blocked = blockedTiles(map, blockers);
+  const occupied = blockedTiles(
+    map,
+    hs.filter((o) => o.unit.kind === "harvester").map((o) => ({ gx: worldToTile(o.unit.x), gy: worldToTile(o.unit.y), w: 1, h: 1 }))
+  );
+  const standBlocked = blocked.map((v, i) => v | occupied[i]);
   const claims = /* @__PURE__ */ new Map();
   for (const h of hs) {
     if (h.unit.kind === "harvester" && (h.state === "toOre" || h.state === "mining") && h.target !== null && isOre(map, h.target.x, h.target.y)) {
@@ -660,7 +719,7 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles, regen) {
             ok = sendToOre(h, map, reserves, claims, avoid, avoidBlocked, /* @__PURE__ */ new Set([cur]));
           }
           if (!ok) ok = sendToOre(h, map, reserves, claims, avoid, avoidBlocked);
-          if (!ok) ok = sendToOre(h, map, reserves, claims, blockers, blocked);
+          if (!ok) ok = sendToOre(h, map, reserves, claims, blockers, standBlocked);
         } else if (h.state === "toRefinery") {
           ok = sendToRefinery(h, map, buildings, avoid) || sendToRefinery(h, map, buildings, blockers);
         } else {
@@ -675,7 +734,7 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles, regen) {
         if (h.cargo > 0) {
           sendToRefinery(h, map, buildings, blockers);
         } else if (hasDropoff(buildings)) {
-          sendToOre(h, map, reserves, claims, blockers, blocked);
+          sendToOre(h, map, reserves, claims, blockers, standBlocked);
         }
         break;
       }
@@ -697,7 +756,7 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles, regen) {
         if (!isViableOre(map, reserves, h.target)) {
           if (h.cargo >= HARVEST_CAPACITY) {
             if (!sendToRefinery(h, map, buildings, blockers)) toIdle(h);
-          } else if (!sendToOre(h, map, reserves, claims, blockers, blocked)) {
+          } else if (!sendToOre(h, map, reserves, claims, blockers, standBlocked)) {
             if (h.cargo <= 0 || !sendToRefinery(h, map, buildings, blockers)) toIdle(h);
           }
           break;
@@ -718,13 +777,19 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles, regen) {
         if (h.cargo >= HARVEST_CAPACITY) {
           if (!sendToRefinery(h, map, buildings, blockers)) toIdle(h);
         } else if (reserves[i] <= 0) {
-          if (!sendToOre(h, map, reserves, claims, blockers, blocked)) {
+          if (!sendToOre(h, map, reserves, claims, blockers, standBlocked)) {
             if (!sendToRefinery(h, map, buildings, blockers)) toIdle(h);
           }
         }
         break;
       }
       case "toRefinery": {
+        if (!dropoffAlive(h, buildings)) {
+          if (!sendToRefinery(h, map, buildings, blockers)) {
+            h.unit.path = [];
+            break;
+          }
+        }
         stepAlong(h.unit, dt);
         if (h.unit.path.length === 0) h.state = "unloading";
         break;
@@ -733,10 +798,17 @@ function updateHarvesters(hs, map, buildings, economy, dt, obstacles, regen) {
         credit(economy, h.cargo);
         h.cargo = 0;
         h.target = null;
+        h.dropoffId = void 0;
         h.state = "idle";
         break;
       }
       case "toRepair": {
+        if (!dropoffAlive(h, buildings)) {
+          if (!sendToRefinery(h, map, buildings, blockers, true)) {
+            h.unit.path = [];
+            break;
+          }
+        }
         stepAlong(h.unit, dt);
         if (h.unit.path.length === 0) {
           h.state = h.cargo > 0 ? "unloading" : "repairing";
@@ -1335,4 +1407,122 @@ test("a depleted vein never regrows", () => {
   assert.equal(oreReserveAt(map, 10, 8), 0);
   drive([h], map, [refinery], econ, 200);
   assert.equal(oreReserveAt(map, 10, 8), 0);
+});
+test("regen: false keeps an abandoned vein drained", () => {
+  const map = openMap();
+  const refinery = building("refinery", 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  const h = createHarvester(unitAt("harvester", 8, 8));
+  const econ = createEconomy(0);
+  for (let i = 0; i < 50 && h.state !== "mining"; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2, void 0, false);
+  }
+  for (let i = 0; i < 5; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2, void 0, false);
+  }
+  const drained = oreReserveAt(map, 10, 8);
+  assert.ok(drained > 0 && drained < ORE_RESERVE);
+  h.unit.hp = 10;
+  for (let i = 0; i < 50; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2, void 0, false);
+  }
+  assert.equal(oreReserveAt(map, 10, 8), drained);
+});
+test("a faster regen rate refills the same vein sooner", () => {
+  const map = openMap();
+  const refinery = building("refinery", 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  const h = createHarvester(unitAt("harvester", 8, 8));
+  const econ = createEconomy(0);
+  for (let i = 0; i < 50 && h.state !== "mining"; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2);
+  }
+  for (let i = 0; i < 5; i++) updateHarvesters([h], map, [refinery], econ, 0.2);
+  const drained = oreReserveAt(map, 10, 8);
+  h.unit.hp = 10;
+  for (let i = 0; i < 50; i++) {
+    updateHarvesters([h], map, [refinery], econ, 0.2, void 0, { rate: 60 });
+  }
+  const fast = oreReserveAt(map, 10, 8);
+  assert.ok(fast > drained, `rate 60 should out-regrow default: ${drained} \u2192 ${fast}`);
+  assert.ok(fast <= ORE_RESERVE);
+});
+test("planOreAssignments picks each harvester's nearest vein, purely", () => {
+  const map = openMap();
+  setTerrain(map, 10, 8, ORE);
+  setTerrain(map, 16, 8, ORE);
+  const h1 = createHarvester(unitAt("harvester", 8, 7));
+  const h2 = createHarvester(unitAt("harvester", 14, 9));
+  h2.unit.id = 2;
+  const plan = planOreAssignments([h1, h2], map);
+  assert.deepEqual(plan.get(h1), { x: 10, y: 8 });
+  assert.deepEqual(plan.get(h2), { x: 16, y: 8 });
+  assert.equal(h1.state, "idle");
+  assert.equal(h1.target, null);
+  assert.equal(h2.state, "idle");
+  assert.equal(oreReserveAt(map, 10, 8), ORE_RESERVE);
+});
+test("planOreAssignments spreads harvesters and skips full holds", () => {
+  const map = openMap();
+  setTerrain(map, 10, 8, ORE);
+  setTerrain(map, 12, 8, ORE);
+  const h1 = createHarvester(unitAt("harvester", 8, 7));
+  const h2 = createHarvester(unitAt("harvester", 8, 9));
+  const h3 = createHarvester(unitAt("harvester", 8, 11));
+  h2.unit.id = 2;
+  h3.unit.id = 3;
+  h3.cargo = HARVEST_CAPACITY;
+  const plan = planOreAssignments([h1, h2, h3], map);
+  assert.notDeepEqual(plan.get(h1), plan.get(h2), "two miners split the veins");
+  assert.equal(plan.size, 2);
+  assert.equal(plan.has(h3), false);
+});
+test("a taken mining spot sends dispatch to the next free neighbor", () => {
+  const map = openMap();
+  const refinery = building("refinery", 2, 2);
+  setTerrain(map, 10, 8, ORE);
+  setTerrain(map, 10, 9, ORE);
+  const h1 = createHarvester(unitAt("harvester", 9, 8));
+  h1.state = "mining";
+  h1.target = { x: 10, y: 8 };
+  const h2 = createHarvester(unitAt("harvester", 7, 8));
+  h2.unit.id = 2;
+  const econ = createEconomy(0);
+  updateHarvesters([h1, h2], map, [refinery], econ, 0.2);
+  assert.equal(h2.state, "toOre");
+  assert.deepEqual(h2.target, { x: 10, y: 9 });
+  assert.ok(h2.unit.path.length > 0);
+  const last = h2.unit.path[h2.unit.path.length - 1];
+  assert.deepEqual({ x: worldToTile(last.x), y: worldToTile(last.y) }, { x: 9, y: 9 });
+});
+test("mid-haul refinery loss retargets the nearest surviving dropoff", () => {
+  const map = openMap();
+  const r1 = building("refinery", 2, 2);
+  const r2 = building("refinery", 16, 2);
+  r2.id = 2;
+  const buildings = [r1, r2];
+  const h = createHarvester(unitAt("harvester", 10, 8));
+  h.cargo = 300;
+  const econ = createEconomy(0);
+  updateHarvesters([h], map, buildings, econ, 0.2);
+  assert.equal(h.state, "toRefinery");
+  assert.equal(h.dropoffId, r1.id);
+  buildings.splice(0, 1);
+  updateHarvesters([h], map, buildings, econ, 0.2);
+  assert.equal(h.state, "toRefinery");
+  assert.equal(h.dropoffId, r2.id);
+  assert.ok(h.unit.path.length > 0, "re-routed toward the surviving refinery");
+  buildings.splice(0, 1);
+  const wx = h.unit.x;
+  const wy = h.unit.y;
+  for (let i = 0; i < 10; i++) updateHarvesters([h], map, buildings, econ, 0.2);
+  assert.equal(h.state, "toRefinery");
+  assert.equal(h.unit.x, wx);
+  assert.equal(h.unit.y, wy);
+  assert.equal(h.cargo, 300);
+  assert.equal(econ.credits, 0);
+  buildings.push(building("refinery", 12, 2));
+  updateHarvesters([h], map, buildings, econ, 0.2);
+  assert.equal(h.state, "toRefinery");
+  assert.ok(h.unit.path.length > 0);
 });

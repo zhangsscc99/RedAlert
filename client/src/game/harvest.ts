@@ -101,6 +101,8 @@ export interface Harvester {
   noOre?: boolean;
   /** Consecutive watchdog re-plans aimed at the same vein. */
   replans?: number;
+  /** Building id of the dropoff this haul/repair leg is heading to. */
+  dropoffId?: number;
   // Watchdog bookkeeping owned by updateHarvesters.
   stuckT?: number; // consecutive seconds without displacement
   lastX?: number; // position sampled on the previous tick
@@ -269,6 +271,7 @@ function toIdle(h: Harvester): void {
   h.state = 'idle';
   h.target = null;
   h.replans = 0;
+  h.dropoffId = undefined;
   h.unit.path = [];
   resetWatchdog(h);
 }
@@ -418,6 +421,7 @@ function sendToRefinery(
   const uy = worldToTile(h.unit.y);
   const b = dropoffBuilding(buildings, ux, uy);
   if (!b) return false;
+  h.dropoffId = b.id;
   const def = BUILDING_DEFS[b.kind];
   // Aim at the footprint center: findPathAvoiding snaps the goal to the
   // nearest tile outside the blocker, i.e. the refinery's doorstep.
@@ -441,6 +445,93 @@ function sendToRefinery(
 
 function hasDropoff(buildings: readonly Building[]): boolean {
   return buildings.some((b) => b.done && (b.kind === 'refinery' || b.kind === 'hq'));
+}
+
+/**
+ * Whether the building a haul/repair leg is heading to is still standing.
+ * A leg dispatched before `dropoffId` existed (or by older saves) counts
+ * as alive so it is never needlessly re-routed.
+ */
+function dropoffAlive(h: Harvester, buildings: readonly Building[]): boolean {
+  if (h.dropoffId == null) return true;
+  return buildings.some(
+    (b) => b.id === h.dropoffId && b.done && (b.kind === 'refinery' || b.kind === 'hq'),
+  );
+}
+
+/**
+ * True while a harvester is committed to bringing its load home: the
+ * return leg of a full (or partially loaded but field-dry) hold should
+ * not be interrupted by fresh work orders. Callers issuing commands can
+ * gate on this before reassigning the unit.
+ */
+export function isReturnCommitted(h: Harvester): boolean {
+  return (
+    h.cargo > 0 &&
+    (h.state === 'toRefinery' || h.state === 'unloading' || h.state === 'toRepair')
+  );
+}
+
+/**
+ * 纯函数多矿车调度：按与 updateHarvesters 相同的打分规则（距离 × 认领
+ * 拥挤度 ÷ 剩余储量）为每台矿车选出应去的矿格，不产生任何副作用 —
+ * 不改矿车状态、不写储量表。已持有有效认领的矿车保持原目标；已满载
+ * 或全灭矿场上的矿车不派出。返回的 Map 仅供调用方预览/批量执行分配。
+ */
+export function planOreAssignments(
+  hs: readonly Harvester[],
+  map: GameMap,
+): Map<Harvester, Point> {
+  // Read-only reserve snapshot: never seeds the WeakMap cache.
+  const reserves = new Float64Array(map.w * map.h);
+  const live = reservesByMap.get(map);
+  for (const t of oreTiles(map)) {
+    const i = idx(map, t.x, t.y);
+    reserves[i] = live ? live[i]! : ORE_RESERVE;
+  }
+  const claims = new Map<number, number>();
+  for (const h of hs) {
+    if (
+      h.unit.kind === 'harvester' &&
+      (h.state === 'toOre' || h.state === 'mining') &&
+      h.target !== null &&
+      isOre(map, h.target.x, h.target.y)
+    ) {
+      const i = idx(map, h.target.x, h.target.y);
+      claims.set(i, (claims.get(i) ?? 0) + 1);
+    }
+  }
+  const out = new Map<Harvester, Point>();
+  for (const h of hs) {
+    if (h.unit.kind !== 'harvester' || h.unit.hp <= 0) continue;
+    if (h.cargo >= HARVEST_CAPACITY || isReturnCommitted(h)) continue;
+    const ux = worldToTile(h.unit.x);
+    const uy = worldToTile(h.unit.y);
+    const own =
+      (h.state === 'toOre' || h.state === 'mining') && h.target !== null
+        ? idx(map, h.target.x, h.target.y)
+        : -1;
+    if (own >= 0 && reserves[own]! > 0) {
+      out.set(h, { x: h.target!.x, y: h.target!.y });
+      continue;
+    }
+    let best: { i: number; t: Point; score: number } | null = null;
+    for (const t of oreTiles(map)) {
+      const i = idx(map, t.x, t.y);
+      const reserve = reserves[i]!;
+      if (reserve <= 0) continue;
+      const claimants = (claims.get(i) ?? 0) - (i === own ? 1 : 0);
+      if (claimants >= MAX_MINERS_PER_TILE) continue;
+      const d2 = (t.x - ux) ** 2 + (t.y - uy) ** 2;
+      const score = oreScore(d2, claimants, reserve);
+      if (!best || score < best.score) best = { i, t, score };
+    }
+    if (best) {
+      out.set(h, { x: best.t.x, y: best.t.y });
+      claims.set(best.i, (claims.get(best.i) ?? 0) + 1);
+    }
+  }
+  return out;
 }
 
 /**
@@ -471,6 +562,16 @@ export function updateHarvesters(
   const reserves = reserveTable(map);
   const blockers = buildingBlockers(obstacles ?? buildings);
   const blocked = blockedTiles(map, blockers);
+  // 站位让位：其他矿车占据的格子在挑选采矿站位时视为不可用，新派出的
+  // 矿车改停最近的空位；全被占满时该矿脉本轮不可达，矿车原地排队等待。
+  // 只影响站位选择，不把矿车当成寻路障碍（看门狗拥堵绕行另有处理）。
+  const occupied = blockedTiles(
+    map,
+    hs
+      .filter((o) => o.unit.kind === 'harvester')
+      .map((o) => ({ gx: worldToTile(o.unit.x), gy: worldToTile(o.unit.y), w: 1, h: 1 })),
+  );
+  const standBlocked = blocked.map((v, i) => (v | occupied[i]!) as 0 | 1);
   // Claims per ore tile: a vein is scored down by every harvester already
   // assigned to it, and capped at MAX_MINERS_PER_TILE claimants. The map is
   // kept current as harvesters re-pick during this very tick, so two idle
@@ -542,7 +643,7 @@ export function updateHarvesters(
             ok = sendToOre(h, map, reserves, claims, avoid, avoidBlocked, new Set([cur]));
           }
           if (!ok) ok = sendToOre(h, map, reserves, claims, avoid, avoidBlocked);
-          if (!ok) ok = sendToOre(h, map, reserves, claims, blockers, blocked);
+          if (!ok) ok = sendToOre(h, map, reserves, claims, blockers, standBlocked);
         } else if (h.state === 'toRefinery') {
           ok =
             sendToRefinery(h, map, buildings, avoid) ||
@@ -562,7 +663,7 @@ export function updateHarvesters(
         if (h.cargo > 0) {
           sendToRefinery(h, map, buildings, blockers);
         } else if (hasDropoff(buildings)) {
-          sendToOre(h, map, reserves, claims, blockers, blocked);
+          sendToOre(h, map, reserves, claims, blockers, standBlocked);
         }
         break;
       }
@@ -587,7 +688,7 @@ export function updateHarvesters(
           // Vein went dry under us (the caller already wrote GRASS back).
           if (h.cargo >= HARVEST_CAPACITY) {
             if (!sendToRefinery(h, map, buildings, blockers)) toIdle(h);
-          } else if (!sendToOre(h, map, reserves, claims, blockers, blocked)) {
+          } else if (!sendToOre(h, map, reserves, claims, blockers, standBlocked)) {
             if (h.cargo <= 0 || !sendToRefinery(h, map, buildings, blockers)) toIdle(h);
           }
           break;
@@ -612,7 +713,7 @@ export function updateHarvesters(
         } else if (reserves[i]! <= 0) {
           // Tile exhausted mid-load: chase the next vein, else deliver the
           // partial cargo rather than idling on a dry patch.
-          if (!sendToOre(h, map, reserves, claims, blockers, blocked)) {
+          if (!sendToOre(h, map, reserves, claims, blockers, standBlocked)) {
             if (!sendToRefinery(h, map, buildings, blockers)) toIdle(h);
           }
         }
@@ -620,6 +721,14 @@ export function updateHarvesters(
       }
 
       case 'toRefinery': {
+        // 矿厂被毁：载货腿改投最近的可用矿厂/HQ；一个卸点都不剩时原地
+        // 等待（保留货物与状态），有新矿厂建成后下一 tick 自动改道。
+        if (!dropoffAlive(h, buildings)) {
+          if (!sendToRefinery(h, map, buildings, blockers)) {
+            h.unit.path = [];
+            break;
+          }
+        }
         stepAlong(h.unit, dt);
         if (h.unit.path.length === 0) h.state = 'unloading';
         break;
@@ -629,11 +738,19 @@ export function updateHarvesters(
         credit(economy, h.cargo);
         h.cargo = 0;
         h.target = null;
+        h.dropoffId = undefined;
         h.state = 'idle';
         break;
       }
 
       case 'toRepair': {
+        // 维修厂中途被毁：与载货腿一样改投最近卸点，全毁则原地等待。
+        if (!dropoffAlive(h, buildings)) {
+          if (!sendToRefinery(h, map, buildings, blockers, true)) {
+            h.unit.path = [];
+            break;
+          }
+        }
         stepAlong(h.unit, dt);
         if (h.unit.path.length === 0) {
           // 舱里还有矿就先卸，卸完下个 tick 从 idle 转回焊接。
