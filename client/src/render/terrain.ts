@@ -25,7 +25,7 @@ interface TerrainOverlay {
   /** Diagonal specular stripes clipped to water; blitted with a slow drift. */
   sparkle: HTMLCanvasElement;
   /** Specular twinkle points on ore crystals, in map pixel coords. */
-  glints: { x: number; y: number; phase: number }[];
+  glints: { x: number; y: number; phase: number; amp: number }[];
 }
 
 const overlays = new WeakMap<HTMLCanvasElement, TerrainOverlay>();
@@ -126,7 +126,14 @@ export function prerenderMap(map: GameMap, opts: PrerenderOptions = {}): HTMLCan
   sparkle.height = canvas.height;
   const sparkleCtx = sparkle.getContext('2d')!;
 
-  const glints: { x: number; y: number; phase: number }[] = [];
+  const glints: { x: number; y: number; phase: number; amp: number }[] = [];
+
+  // Scratch tile for ore: crystals are rendered here first, then composited
+  // scaled and dimmed by remaining reserve so rich veins grow taller and
+  // brighter while spent beds sink and darken.
+  const oreTile = document.createElement('canvas');
+  oreTile.width = oreTile.height = TILE_SIZE;
+  const oreCtx = oreTile.getContext('2d')!;
 
   // Season palette: derived from the map seed (stable per map) unless the
   // caller overrides it. Resolved up front so the grass texture itself is
@@ -173,11 +180,27 @@ export function prerenderMap(map: GameMap, opts: PrerenderOptions = {}): HTMLCan
             }
           }
         }
-        drawOreTile(ctx, x, y, density);
-        // Reserve visualization: near-depleted cells sink back toward bare
-        // cracked earth, full ones get a warm sheen so rich veins read
-        // brighter. No data → the density-based look above.
+        // Reserve visualization: crystal height/brightness scale with the
+        // remaining fraction — full veins stand tall and glossy, depleted
+        // beds shrink toward the ground and dim. The cluster is drawn to a
+        // scratch tile and composited anchored to the tile's bottom edge so
+        // shrinking reads as the vein sitting lower in the earth.
         const r = oreReserveAt(map, opts, tableMax, x, y);
+        oreCtx.clearRect(0, 0, TILE_SIZE, TILE_SIZE);
+        drawOreTile(oreCtx, 0, 0, density);
+        const scale = 0.78 + r * 0.28; // ~0.8 spent → ~1.06 full
+        const s = TILE_SIZE * scale;
+        ctx.globalAlpha = 0.68 + r * 0.32;
+        ctx.drawImage(
+          oreTile,
+          x * TILE_SIZE + (TILE_SIZE - s) / 2,
+          y * TILE_SIZE + TILE_SIZE - s,
+          s,
+          s,
+        );
+        ctx.globalAlpha = 1;
+        // Near-depleted cells sink back toward bare cracked earth, full
+        // ones get a warm sheen so rich veins read brighter.
         if (r < 0.66) {
           ctx.fillStyle = `rgba(52,42,24,${((0.66 - r) * 0.75).toFixed(3)})`;
           ctx.fillRect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE);
@@ -198,6 +221,7 @@ export function prerenderMap(map: GameMap, opts: PrerenderOptions = {}): HTMLCan
             x: x * TILE_SIZE + 4 + rand01(x, y, 200 + i) * (TILE_SIZE - 8),
             y: y * TILE_SIZE + 4 + rand01(x, y, 210 + i) * (TILE_SIZE - 8),
             phase: rand01(x, y, 220 + i) * Math.PI * 2,
+            amp: 0.35 + r * 0.65,
           });
         }
       }
@@ -366,6 +390,23 @@ export function prerenderMap(map: GameMap, opts: PrerenderOptions = {}): HTMLCan
       ctx.fillStyle = fade;
       if (horiz) ctx.fillRect(nx0, d === 2 ? ny0 : ny0 + TILE_SIZE - 4, TILE_SIZE, 4);
       else ctx.fillRect(d === 0 ? nx0 : nx0 + TILE_SIZE - 4, ny0, 4, TILE_SIZE);
+      // Dithered transition: 2px checkerboard of dirt specks straddling the
+      // seam, sparser farther from the edge, so the grass/dirt boundary is
+      // granular rather than a straight fade.
+      for (let band = 0; band < 2; band++) {
+        ctx.fillStyle = band === 0 ? 'rgba(96,76,46,0.42)' : 'rgba(96,76,46,0.22)';
+        const off0 = band * 2;
+        for (let t = 0; t < TILE_SIZE - 1; t += 4) {
+          const tt = t + ((band & 1) << 1);
+          if (horiz) {
+            const ey = d === 2 ? ny0 + off0 : ny0 + TILE_SIZE - 2 - off0;
+            ctx.fillRect(nx0 + tt, ey, 2, 2);
+          } else {
+            const ex = d === 0 ? nx0 + off0 : nx0 + TILE_SIZE - 2 - off0;
+            ctx.fillRect(ex, ny0 + tt, 2, 2);
+          }
+        }
+      }
       // Gravel: a few gritty specks kicked onto the shoulder edge.
       for (let i = 0; i < 6; i++) {
         const t = rand01(x * 4 + d, y, 350 + i) * (TILE_SIZE - 2);
@@ -418,6 +459,15 @@ export function prerenderMap(map: GameMap, opts: PrerenderOptions = {}): HTMLCan
     apron(bx, by + bh, bx, by + bh + APRON, bx - APRON, by + bh, bw + APRON * 2, APRON); // bottom
     apron(bx, by, bx - APRON, by, bx - APRON, by, APRON, bh); // left
     apron(bx + bw, by, bx + bw + APRON, by, bx + bw, by, APRON, bh); // right
+    // Seam shadow: a dark 2px rim just inside the footprint's bottom and
+    // right edges plus a faint lit rim on top/left, so the structure edge
+    // reads as seated in the ground instead of a pasted-on rectangle.
+    ctx.fillStyle = 'rgba(0,0,0,0.28)';
+    ctx.fillRect(bx, by + bh - 2, bw, 2);
+    ctx.fillRect(bx + bw - 2, by + 2, 2, bh - 2);
+    ctx.fillStyle = 'rgba(255,244,210,0.12)';
+    ctx.fillRect(bx, by, bw, 1.5);
+    ctx.fillRect(bx, by + 1.5, 1.5, bh - 1.5);
     ctx.fillStyle = 'rgba(88,70,44,0.30)';
     for (let i = 0; i < bw; i += 5) {
       ctx.fillRect(bx + i, by + bh - 3 - rand01(f.x + i, f.y, 380) * 3, 4, 4);
@@ -649,7 +699,7 @@ export function drawTerrain(
     if (g.x < cam.x || g.y < cam.y || g.x > cam.x + sw || g.y > cam.y + sh) continue;
     const s = Math.sin(t * 2.7 + g.phase);
     if (s <= 0) continue;
-    ctx.fillStyle = `rgba(255,242,190,${(s * s * 0.85).toFixed(3)})`;
+    ctx.fillStyle = `rgba(255,242,190,${(s * s * 0.85 * g.amp).toFixed(3)})`;
     ctx.fillRect((g.x - cam.x) * cam.zoom - size / 2, (g.y - cam.y) * cam.zoom - size / 2, size, size);
   }
 }
